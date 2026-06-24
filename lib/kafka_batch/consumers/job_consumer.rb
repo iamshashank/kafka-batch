@@ -19,10 +19,8 @@ module KafkaBatch
     #   redelivers the message, allowing the worker to run again (workers must
     #   be idempotent) and try event emission once more.
     class JobConsumer < Karafka::BaseConsumer
-      # Number of times to retry event emission before giving up and leaving
-      # the offset uncommitted (causing message redelivery).
-      EVENT_EMIT_RETRIES = 3
-      EVENT_EMIT_BACKOFF = 2  # seconds
+      # Event-emission retry behaviour is configured via
+      # KafkaBatch.config.event_emit_retries / .event_emit_backoff.
 
       # Cache of worker class name → Class to avoid repeated const_get lookups.
       WORKER_CACHE       = {}
@@ -52,8 +50,30 @@ module KafkaBatch
 
         job_id        = data["job_id"]
         batch_id      = data["batch_id"]
-        worker_class  = resolve_worker(data["worker_class"])
         payload       = data["payload"] || {}
+
+        # Resolve the worker class. An unknown/renamed class is a poison pill:
+        # without handling it here the ArgumentError would bubble up, the offset
+        # would never commit, and Karafka would redeliver forever (blocking the
+        # partition). Route it to the DLT and advance the batch so it can finish.
+        worker_class =
+          begin
+            resolve_worker(data["worker_class"])
+          rescue ArgumentError => e
+            KafkaBatch.logger.error(
+              "[KafkaBatch][JobConsumer] #{e.message} – forwarding to DLT"
+            )
+            emit_event_with_retry(
+              batch_id:     batch_id,
+              job_id:       job_id,
+              status:       "failed",
+              worker_class: data["worker_class"].to_s
+            )
+            publish_to_dlt(data: data, error: e, topic: message.topic)
+            mark_as_consumed!(message)
+            return
+          end
+
         attempt       = data["attempt"].to_i
         max_retries   = data.fetch("max_retries",   KafkaBatch.config.max_retries).to_i
         backoff       = data.fetch("retry_backoff",  KafkaBatch.config.retry_backoff).to_i
@@ -205,6 +225,9 @@ module KafkaBatch
       def emit_event_with_retry(batch_id:, job_id:, status:, worker_class:)
         return unless batch_id  # standalone job – no batch tracking
 
+        max_attempts = KafkaBatch.config.event_emit_retries.to_i
+        backoff      = KafkaBatch.config.event_emit_backoff.to_i
+
         attempts = 0
         begin
           KafkaBatch::Producer.produce_sync(
@@ -220,17 +243,17 @@ module KafkaBatch
           )
         rescue KafkaBatch::ProducerError => e
           attempts += 1
-          if attempts <= EVENT_EMIT_RETRIES
+          if attempts <= max_attempts
             KafkaBatch.logger.warn(
               "[KafkaBatch][JobConsumer] Event emit failed (attempt #{attempts}) – retrying: #{e.message}"
             )
-            sleep(attempts * EVENT_EMIT_BACKOFF)
+            sleep(attempts * backoff) if backoff.positive?
             retry
           end
           # All retries exhausted: re-raise so offset is NOT committed.
           # Karafka will redeliver the original job message.
           KafkaBatch.logger.error(
-            "[KafkaBatch][JobConsumer] Event emit failed after #{EVENT_EMIT_RETRIES} attempts – " \
+            "[KafkaBatch][JobConsumer] Event emit failed after #{max_attempts} attempts – " \
             "leaving offset uncommitted for redelivery (worker must be idempotent)"
           )
           raise

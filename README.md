@@ -183,7 +183,7 @@ Requires three migrations (two tables + one column addition):
 |---|---|
 | `create_kafka_batch_records` | Batch state table with counters and status |
 | `create_kafka_batch_job_completions` | Per-job completion dedup table (unique constraint on `batch_id, job_id`) |
-| `add_callback_tracking_to_kafka_batch_records` | `callback_dispatched_at` column for at-most-once callback enforcement |
+| `add_callback_tracking_to_kafka_batch_records` | `callback_dispatched_at` column for callback dispatch tracking (duplicate suppression + lost-callback reconciliation) |
 
 ```bash
 bundle exec rails db:migrate
@@ -349,11 +349,11 @@ The `batch` hash passed to callbacks:
 | `on_success` | All jobs succeeded (`failed_count == 0`) |
 | `on_complete` | All jobs finished regardless of failures |
 
-**At-most-once guarantee:** Before invoking any callback, `CallbackConsumer` performs an atomic compare-and-swap on `callback_dispatched_at` in the store. Whichever consumer process wins the claim is the only one that fires the callbacks — even if the callback message is redelivered due to a consumer crash.
+**At-least-once guarantee (callbacks must be idempotent):** `CallbackConsumer` invokes the callbacks **first**, then claims dispatch by setting `callback_dispatched_at`. Because callback messages are keyed by `batch_id`, all callbacks for a batch land on a single partition and are processed sequentially, so a duplicate message is cheaply suppressed by the pre-invocation `callback_dispatched?` check. A crash between invocation and the claim results in re-invocation on redelivery — never a silently lost callback. This matches Sidekiq Pro's "callbacks may run more than once" semantics, so **make your callbacks idempotent**.
 
 **Unresolvable class names:** If the callback class doesn't exist (typo, rename after deploy), the message is forwarded to `dead_letter_topic` with `dlt_type: "callback"` instead of being silently dropped.
 
-**Callback exceptions forwarded to DLT:** If a callback class raises `StandardError` at runtime, the error is forwarded to the DLT with `dlt_type: "callback_error"` so it is visible and replayable. The at-most-once claim is not reversed — if you need retry semantics on a callback, make the callback class a `KafkaBatch::Worker` itself.
+**Callback exceptions forwarded to DLT:** If a callback class raises `StandardError` at runtime, the error is forwarded to the DLT with `dlt_type: "callback_error"` so it is visible and replayable. Dispatch is still claimed afterwards (the failure is captured in the DLT) — if you need retry semantics on a callback, make the callback class a `KafkaBatch::Worker` itself.
 
 ---
 
@@ -460,7 +460,9 @@ The reconciler detects and recovers two classes of stuck batches:
 
 **Detection:** `status IN (success, complete)` AND `callback_dispatched_at IS NULL` AND `finished_at < now - reconciliation_interval`.
 
-**Recovery:** Re-produces the callback message to `kafka_batch.callbacks`. The `CallbackConsumer`'s atomic claim (`callback_dispatched_at` CAS) ensures the actual callback fires exactly once even if this runs multiple times.
+**Recovery:** Re-produces the callback message to `kafka_batch.callbacks`. The `CallbackConsumer`'s `callback_dispatched_at` claim suppresses duplicates in the normal path, so re-producing is safe even if this runs multiple times (callbacks must be idempotent).
+
+> **Redis store:** the running / lost-callback indexes (`kafka_batch:index:running` and `kafka_batch:index:done` sorted sets) are maintained automatically as batches move through their lifecycle, so the reconciler works on the Redis store too — no app-side bookkeeping required.
 
 **Distributed lock:** `Reconciler.run` acquires a store-level distributed lock before sweeping, so running the rake task from multiple servers concurrently is safe — only one process runs the sweep at a time. MySQL uses `GET_LOCK`/`RELEASE_LOCK`; Redis uses `SET NX EX`.
 
@@ -544,7 +546,7 @@ bundle exec rake kafka_batch:workers
 | **Job completion is idempotent** | Unique constraint on `(batch_id, job_id)` (MySQL) or `SADD` (Redis) deduplicates event messages |
 | **Counter increment is atomic** | MySQL `SELECT FOR UPDATE` + `UPDATE field = field + 1`; Redis Lua script |
 | **Redis `create_batch` is race-free** | Lua script uses `HSETNX` as existence sentinel — single atomic operation, no TOCTOU |
-| **Callback fires at most once** | `claim_callback` does `UPDATE WHERE callback_dispatched_at IS NULL` — only the winner invokes |
+| **Callback fires at least once** | Callback is invoked, then `callback_dispatched_at` is set; duplicates are suppressed and crashes lead to safe re-invocation (callbacks must be idempotent) |
 | **Lost callbacks are recovered** | Reconciler scans for `status IN (success,complete) AND callback_dispatched_at IS NULL` |
 | **Reconciler runs once per cluster** | Distributed lock (MySQL `GET_LOCK`, Redis `SET NX EX`) prevents concurrent reconciler sweeps |
 | **Retries don't block partitions** | Failed jobs go to `kafka_batch.jobs.retry`; `RetryConsumer` uses Karafka `pause()` |

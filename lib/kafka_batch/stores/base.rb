@@ -37,9 +37,25 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#claim_callback"
       end
 
+      # Whether the batch's callback has already been dispatched.
+      # Used as a cheap pre-invocation duplicate check by the CallbackConsumer.
+      # @param id [String] batch ID
+      # @return [Boolean]
+      def callback_dispatched?(id)
+        raise NotImplementedError, "#{self.class}#callback_dispatched?"
+      end
+
       # Update the batch's top-level status field.
       def update_batch_status(id, status)
         raise NotImplementedError, "#{self.class}#update_batch_status"
+      end
+
+      # Transition a batch to a terminal outcome ("success"|"complete"),
+      # stamping finished_at and registering it for lost-callback recovery.
+      # Used by the reconciler when it discovers a stuck-running batch whose
+      # jobs have all actually completed.
+      def mark_finished(id, outcome)
+        raise NotImplementedError, "#{self.class}#mark_finished"
       end
 
       # Return batches in "running" state created before +older_than+.

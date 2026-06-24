@@ -10,3 +10,4 @@ gem "rspec",        "~> 3.0"
 gem "database_cleaner-active_record"
 gem "timecop"
 gem "pry"
+gem "simplecov", require: false

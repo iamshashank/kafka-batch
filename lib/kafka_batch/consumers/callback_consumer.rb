@@ -7,15 +7,22 @@ module KafkaBatch
   module Consumers
     # Karafka consumer that fires on_success / on_complete callbacks.
     #
+    # Delivery semantics – at-least-once (callbacks must be idempotent):
+    #   The callback is invoked FIRST, then the dispatch is claimed
+    #   (claim_callback marks callback_dispatched_at).  This ordering means a
+    #   crash between invocation and claim results in re-invocation on
+    #   redelivery – never a lost callback.  This matches Sidekiq-Pro's
+    #   "callbacks may run more than once" guarantee.
+    #
+    #   Because callback messages are keyed by batch_id, all callbacks for a
+    #   given batch land on the same partition and are processed sequentially
+    #   by a single consumer, so a pre-dispatch check (callback_dispatched?)
+    #   cheaply suppresses duplicates in the normal (non-crash) path.
+    #
     # Safety guarantees:
-    #   1. At-most-once callback invocation – an atomic store claim
-    #      (claim_callback) acts as a compare-and-swap before any callback
-    #      fires.  If this consumer crashes after the callback runs but before
-    #      committing the offset, the re-delivered message will fail the claim
-    #      and be skipped.
-    #   2. Unresolvable callback classes are forwarded to the dead-letter topic
+    #   1. Unresolvable callback classes are forwarded to the dead-letter topic
     #      instead of being silently dropped.
-    #   3. Callback exceptions are also forwarded to the DLT (dlt_type:
+    #   2. Callback exceptions are also forwarded to the DLT (dlt_type:
     #      "callback_error") so they are not silently lost.
     class CallbackConsumer < Karafka::BaseConsumer
       def consume
@@ -53,12 +60,13 @@ module KafkaBatch
           return
         end
 
-        # ── Atomic claim: only one consumer process may invoke the callback ─
-        # claim_callback does UPDATE WHERE callback_dispatched_at IS NULL.
-        # If another process already won the race, rows_affected = 0 → skip.
-        unless KafkaBatch.store.claim_callback(batch_id)
+        # ── Duplicate suppression (normal path) ────────────────────────────
+        # If the dispatch was already claimed, the callback has already run.
+        # Callback messages are keyed by batch_id → same partition → processed
+        # sequentially, so this read reliably skips duplicates without a race.
+        if KafkaBatch.store.callback_dispatched?(batch_id)
           KafkaBatch.logger.debug(
-            "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} callback already claimed – skipping"
+            "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} callback already dispatched – skipping"
           )
           mark_as_consumed!(message)
           return
@@ -70,14 +78,20 @@ module KafkaBatch
         )
 
         # on_success fires only when every job succeeded
-        if outcome == "success" && data["on_success"].present_str?
+        if outcome == "success" && present?(data["on_success"])
           invoke_callback(data["on_success"], :on_success, data, message)
         end
 
         # on_complete fires for any terminal outcome
-        if data["on_complete"].present_str?
+        if present?(data["on_complete"])
           invoke_callback(data["on_complete"], :on_complete, data, message)
         end
+
+        # ── Claim AFTER invocation ─────────────────────────────────────────
+        # Marking dispatch only after the callbacks have run guarantees that a
+        # crash mid-invocation leads to re-invocation (at-least-once), never a
+        # silently lost callback.
+        KafkaBatch.store.claim_callback(batch_id)
 
         mark_as_consumed!(message)
       end
@@ -86,8 +100,26 @@ module KafkaBatch
         klass = Object.const_get(class_name)
 
         unless klass.method_defined?(method_name)
+          # Class resolves but the callback method is missing (e.g. method
+          # renamed after deploy). Forward to the DLT so it isn't silently
+          # dropped – consistent with the unresolvable-class path below.
+          error = NoMethodError.new("#{class_name} does not define ##{method_name}")
           KafkaBatch.logger.error(
-            "[KafkaBatch][CallbackConsumer] #{class_name} does not respond to ##{method_name}"
+            "[KafkaBatch][CallbackConsumer] #{error.message} – sending to DLT"
+          )
+          KafkaBatch::Instrumentation.callback_failed(
+            batch_id:        batch_summary["batch_id"],
+            callback_class:  class_name,
+            callback_method: method_name,
+            error:           error
+          )
+          publish_to_dlt(
+            original_message: original_message,
+            data:             batch_summary,
+            error:            error,
+            callback_class:   class_name,
+            callback_method:  method_name,
+            dlt_type:         "callback"
           )
           return
         end
@@ -170,13 +202,12 @@ module KafkaBatch
       rescue Oj::ParseError => e
         raise ArgumentError, "Invalid JSON in callback message: #{e.message}"
       end
-    end
-  end
-end
 
-# Minimal helper to avoid pulling in ActiveSupport for blank? checks
-class String
-  def present_str?
-    !nil? && !empty?
+      # True only for a non-empty String. Safe on nil (no monkey-patch, no
+      # ActiveSupport dependency) – callback fields are nil when not configured.
+      def present?(value)
+        value.is_a?(String) && !value.empty?
+      end
+    end
   end
 end

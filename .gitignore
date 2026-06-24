@@ -1,0 +1,11 @@
+/coverage/
+/log/
+*.log
+/pkg/
+/tmp/
+/.bundle/
+/vendor/bundle/
+# Gemspec-based libraries do not commit their lockfile
+/Gemfile.lock
+.DS_Store
+.byebug_history

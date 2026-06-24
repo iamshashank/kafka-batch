@@ -10,12 +10,22 @@ module KafkaBatch
       # Redis key layout:
       #   kafka_batch:b:{id}            – Hash of all batch fields
       #   kafka_batch:b:{id}:done_jobs  – Set of "job_id:status" (dedup)
+      #   kafka_batch:index:running     – ZSET of batch ids, score = created_at epoch
+      #   kafka_batch:index:done        – ZSET of finished-but-uncallbacked ids,
+      #                                   score = finished_at epoch
       #
-      # Both keys expire after KafkaBatch.config.batch_ttl seconds.
-      # The TTL is refreshed on every event so truly long-running batches
-      # don't expire mid-flight.
+      # The two batch-scoped keys expire after KafkaBatch.config.batch_ttl
+      # seconds.  The TTL is refreshed on every event so truly long-running
+      # batches don't expire mid-flight.
+      #
+      # The two index ZSETs power the reconciler (stale_batches /
+      # done_batches_without_callback).  Members are pruned as batches advance
+      # through their lifecycle, and the reconciler self-heals any stale members
+      # (e.g. left behind by a TTL-expired batch) by re-validating actual state.
 
-      KEY_PREFIX = "kafka_batch:b"
+      KEY_PREFIX    = "kafka_batch:b"
+      RUNNING_INDEX = "kafka_batch:index:running"
+      DONE_INDEX    = "kafka_batch:index:done"
 
       # Atomically increment job counter, extend TTL, and check for completion.
       # Returns [code, payload]:
@@ -60,9 +70,11 @@ module KafkaBatch
 
       # Atomically claim callback dispatch rights.
       # HSETNX returns 1 if field was absent (we won the race), 0 if already set.
+      # Guarded by EXISTS so a stale message for a TTL-expired batch does not
+      # recreate a partial, TTL-less hash (orphan key); returns 0 in that case.
       CLAIM_CALLBACK_LUA = <<~LUA.freeze
-        local set = redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
-        return set
+        if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+        return redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
       LUA
 
       # Atomically create a batch record only if it does not already exist.
@@ -111,8 +123,9 @@ module KafkaBatch
 
       def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {})
         key = batch_key(id)
+        now = Time.now
         with_redis do |r|
-          r.eval(CREATE_BATCH_LUA,
+          created = r.eval(CREATE_BATCH_LUA,
             keys: [key],
             argv: [
               id,
@@ -120,11 +133,14 @@ module KafkaBatch
               on_success.to_s,
               on_complete.to_s,
               serialize(meta),
-              Time.now.iso8601,
+              now.iso8601,
               @ttl.to_s
             ]
           )
           # Returns 1 if created, 0 if already existed (idempotent).
+          # Register in the running index so the reconciler can find it.
+          r.zadd(RUNNING_INDEX, now.to_f, id) if created == 1
+          created
         end
       end
 
@@ -153,7 +169,15 @@ module KafkaBatch
         code, payload = result
         case code
         when 0 then { status: payload.to_sym }   # :duplicate or :not_found
-        when 1 then { status: :done, outcome: payload, batch: find_batch(batch_id) }
+        when 1
+          # Batch just finished: move it from the running index to the
+          # done index (pending callback dispatch) so the reconciler can
+          # recover a lost callback.
+          with_redis do |r|
+            r.zrem(RUNNING_INDEX, batch_id)
+            r.zadd(DONE_INDEX, Time.now.to_f, batch_id)
+          end
+          { status: :done, outcome: payload, batch: find_batch(batch_id) }
         when 2 then { status: :continue }
         end
       end
@@ -161,43 +185,88 @@ module KafkaBatch
       def claim_callback(id)
         now = Time.now.iso8601
         result = with_redis do |r|
-          r.eval(CLAIM_CALLBACK_LUA,
+          won = r.eval(CLAIM_CALLBACK_LUA,
             keys: [batch_key(id)],
             argv: [now]
           )
+          # Once dispatched the batch no longer needs reconciliation.
+          r.zrem(DONE_INDEX, id) if won == 1
+          won
         end
         result == 1
+      end
+
+      def callback_dispatched?(id)
+        with_redis do |r|
+          !presence(r.hget(batch_key(id), "callback_dispatched_at")).nil?
+        end
       end
 
       def update_batch_status(id, status)
         with_redis do |r|
           r.hset(batch_key(id), "status", status)
+          # Terminal/cancelled batches drop out of the running index.
+          r.zrem(RUNNING_INDEX, id) if %w[success complete cancelled].include?(status)
         end
       end
 
-      def stale_batches(older_than:)
-        # Redis has no native range-scan on hash field values.
-        # Implement a batch-ID registry (sorted set keyed by created_at) in your
-        # app if you need Redis-side reconciliation of stuck running batches.
-        KafkaBatch.logger.warn(
-          "[KafkaBatch] RedisStore#stale_batches: no-op. " \
-          "Maintain a sorted set of batch IDs by created_at for Redis reconciliation."
-        )
-        []
+      def mark_finished(id, outcome)
+        now = Time.now
+        with_redis do |r|
+          r.hset(batch_key(id), "status", outcome)
+          r.hset(batch_key(id), "finished_at", now.iso8601)
+          # Move from running → done so a (re-)lost callback stays recoverable.
+          r.zrem(RUNNING_INDEX, id)
+          r.zadd(DONE_INDEX, now.to_f, id)
+        end
       end
 
+      # Batches still in the running index that were created before +older_than+.
+      # Self-heals the index by dropping members that have expired or already
+      # advanced past "running".
+      def stale_batches(older_than:)
+        ids = with_redis do |r|
+          r.zrangebyscore(RUNNING_INDEX, "-inf", older_than.to_f)
+        end
+
+        ids.each_with_object([]) do |id, acc|
+          batch = find_batch(id)
+          if batch.nil?
+            with_redis { |r| r.zrem(RUNNING_INDEX, id) }  # expired – prune
+          elsif batch[:status] != "running"
+            with_redis { |r| r.zrem(RUNNING_INDEX, id) }  # already advanced – prune
+          else
+            acc << batch
+          end
+        end
+      end
+
+      # Batches in the done index that finished before +older_than+ but whose
+      # callback was never dispatched.  Prunes expired or already-dispatched ids.
       def done_batches_without_callback(older_than:)
-        # Same limitation as stale_batches – Redis can't range-scan hash fields.
-        KafkaBatch.logger.warn(
-          "[KafkaBatch] RedisStore#done_batches_without_callback: no-op. " \
-          "Maintain a sorted set of batch IDs by finished_at for Redis reconciliation."
-        )
-        []
+        ids = with_redis do |r|
+          r.zrangebyscore(DONE_INDEX, "-inf", older_than.to_f)
+        end
+
+        ids.each_with_object([]) do |id, acc|
+          batch = find_batch(id)
+          if batch.nil?
+            with_redis { |r| r.zrem(DONE_INDEX, id) }  # expired – prune
+          elsif !batch[:callback_dispatched_at].nil?
+            with_redis { |r| r.zrem(DONE_INDEX, id) }  # already dispatched – prune
+          elsif !%w[success complete].include?(batch[:status])
+            with_redis { |r| r.zrem(DONE_INDEX, id) }  # not actually done – prune
+          else
+            acc << batch
+          end
+        end
       end
 
       def delete_batch(id)
         with_redis do |r|
           r.del(batch_key(id), "#{batch_key(id)}:done_jobs")
+          r.zrem(RUNNING_INDEX, id)
+          r.zrem(DONE_INDEX, id)
         end
       end
 
@@ -224,7 +293,10 @@ module KafkaBatch
             r.eval(RELEASE_LOCK_LUA, keys: [lock_key], argv: [token])
           end
         end
-      rescue StoreError => e
+      rescue StandardError => e
+        # Best-effort sweep: swallow + log (consistent with MysqlStore) so a
+        # reconciler error never crashes the scheduler. The lock is released
+        # by the ensure block above before we get here.
         KafkaBatch.logger.error("[KafkaBatch][RedisStore] Reconciler lock error: #{e.message}")
       end
 

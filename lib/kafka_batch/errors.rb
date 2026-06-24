@@ -13,16 +13,17 @@ module KafkaBatch
   # Raised on store read/write failures
   class StoreError < Error; end
 
-  # Raised when a job exhausts all retry attempts
+  # Raised when a job exhausts all retry attempts.
+  # Note: does not override Exception#cause – use Ruby's native exception
+  # chaining (`raise ... ` inside a rescue) to preserve the original error.
   class JobExhaustedError < Error
-    attr_reader :job_id, :batch_id, :worker_class, :payload, :cause
+    attr_reader :job_id, :batch_id, :worker_class, :payload
 
-    def initialize(msg = nil, job_id:, batch_id:, worker_class:, payload:, cause: nil)
+    def initialize(msg = nil, job_id:, batch_id:, worker_class:, payload:)
       @job_id       = job_id
       @batch_id     = batch_id
       @worker_class = worker_class
       @payload      = payload
-      @cause        = cause
       super(msg || "Job #{job_id} exhausted retries (#{worker_class})")
     end
   end

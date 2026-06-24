@@ -19,7 +19,7 @@ module KafkaBatch
     def self.run(older_than: KafkaBatch.config.reconciliation_interval)
       start_time = Time.now
 
-      KafkaBatch.store.with_reconciler_lock(ttl: older_than) do
+      KafkaBatch.store.with_reconciler_lock(ttl: KafkaBatch.config.reconciler_lock_ttl) do
         threshold = Time.now - older_than
 
         # ── 1. Stuck-running batches ─────────────────────────────────────────
@@ -63,7 +63,10 @@ module KafkaBatch
       end
 
       outcome = batch[:failed_count].to_i.positive? ? "complete" : "success"
-      KafkaBatch.store.update_batch_status(id, outcome)
+      # mark_finished stamps finished_at and registers the batch for
+      # lost-callback recovery, so even if the callback we produce below is
+      # also lost, a later sweep can still re-fire it.
+      KafkaBatch.store.mark_finished(id, outcome)
 
       KafkaBatch.logger.warn(
         "[KafkaBatch][Reconciler] batch_id=#{id} transitioned to #{outcome} – producing callback"

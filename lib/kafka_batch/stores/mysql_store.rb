@@ -58,24 +58,31 @@ module KafkaBatch
         # ── Step 2: atomic increment + completion check ───────────────────
         # FOR UPDATE: exclusive row lock prevents two processes from both
         # seeing completed+failed >= total and both firing the callback.
+        #
+        # NOTE: we never `return` from inside the transaction block – a
+        # non-local return triggers a rollback (and a deprecation warning) in
+        # modern ActiveRecord. We assign +result+ and let the block fall through.
         result = nil
 
         batch_record_class.transaction do
           record = batch_record_class.lock.find_by(id: batch_id)
 
-          return { status: :not_found } unless record
-          return { status: :duplicate } if %w[success complete cancelled].include?(record.status)
-
-          field = status == "success" ? "completed_count" : "failed_count"
-          batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
-          record.reload
-
-          if record.completed_count + record.failed_count >= record.total_jobs
-            outcome = record.failed_count.positive? ? "complete" : "success"
-            record.update!(status: outcome, finished_at: Time.now)
-            result = { status: :done, outcome: outcome, batch: record_to_hash(record) }
+          if record.nil?
+            result = { status: :not_found }
+          elsif %w[success complete cancelled].include?(record.status)
+            result = { status: :duplicate }
           else
-            result = { status: :continue }
+            field = status == "success" ? "completed_count" : "failed_count"
+            batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
+            record.reload
+
+            if record.completed_count + record.failed_count >= record.total_jobs
+              outcome = record.failed_count.positive? ? "complete" : "success"
+              record.update!(status: outcome, finished_at: Time.now)
+              result = { status: :done, outcome: outcome, batch: record_to_hash(record) }
+            else
+              result = { status: :continue }
+            end
           end
         end
 
@@ -93,8 +100,21 @@ module KafkaBatch
         rows > 0
       end
 
+      def callback_dispatched?(id)
+        batch_record_class
+          .where(id: id)
+          .where.not(callback_dispatched_at: nil)
+          .exists?
+      end
+
       def update_batch_status(id, status)
         batch_record_class.where(id: id).update_all(status: status)
+      end
+
+      def mark_finished(id, outcome)
+        batch_record_class
+          .where(id: id)
+          .update_all(status: outcome, finished_at: Time.now)
       end
 
       def stale_batches(older_than:)

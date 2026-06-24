@@ -28,6 +28,15 @@ module KafkaBatch
     attr_accessor :max_retries      # Integer – default per worker (worker can override)
     attr_accessor :retry_backoff    # Integer – seconds; linear: attempt * retry_backoff
 
+    # ── Completion-event emission retries ────────────────────────────────────
+    # After a job succeeds, the consumer produces a completion event. If that
+    # produce fails (transient Kafka issue) it is retried inline before giving
+    # up and leaving the offset uncommitted for redelivery. These tune that
+    # inline retry. NOTE: the backoff sleeps on the Karafka worker thread, so
+    # keep the product (retries * backoff) modest.
+    attr_accessor :event_emit_retries  # Integer – attempts; default 3
+    attr_accessor :event_emit_backoff  # Integer – seconds; linear: attempt * backoff
+
     # ── Redis (only when store: :redis) ─────────────────────────────────────
     attr_accessor :redis_url        # String  e.g. "redis://localhost:6379/0"
     attr_accessor :redis_pool_size  # Integer
@@ -38,6 +47,11 @@ module KafkaBatch
     # ── Reconciliation ───────────────────────────────────────────────────────
     # A periodic sweep that re-checks "running" batches that look stuck.
     attr_accessor :reconciliation_interval  # Integer – seconds; default 300
+
+    # Max time a single reconciler sweep is expected to take. Used purely as
+    # the distributed-lock TTL so a crashed reconciler eventually releases the
+    # lock. Kept independent of the staleness threshold above.
+    attr_accessor :reconciler_lock_ttl      # Integer – seconds; default 600
 
     # ── Passthrough rdkafka config ───────────────────────────────────────────
     # Merged on top of defaults for the producer.
@@ -66,10 +80,13 @@ module KafkaBatch
       @consumer_group           = "kafka-batch"
       @max_retries              = 3
       @retry_backoff            = 5
+      @event_emit_retries       = 3
+      @event_emit_backoff       = 2
       @redis_url                = "redis://localhost:6379/0"
       @redis_pool_size          = 5
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @reconciliation_interval  = 300
+      @reconciler_lock_ttl      = 600
       @producer_config          = {}
       @consumer_config          = {}
       @validate_topics_on_boot  = false
