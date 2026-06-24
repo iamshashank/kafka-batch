@@ -43,50 +43,60 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 │  Batch.create do |b|                                              │
 │    b.push(MyWorker, { id: 1 })  ──┐                              │
 │    b.push(MyWorker, { id: 2 })  ──┤──► Kafka: worker topic       │
-│    b.push(MyWorker, { id: 3 })  ──┘                              │
+│    b.push(MyWorker, { id: 3 })  ──┘   (idempotent producer)      │
 │                                                                   │
 │  BatchRecord written to MySQL/Redis BEFORE first produce          │
 └──────────────────────────────────────────────────────────────────┘
                 │ (jobs topic)
-   ┌────────────▼────────────┐
-   │    Karafka: JobConsumer  │
-   │                         │
-   │  worker.perform(payload) │
-   │    ├─ success ──────────┼──► kafka_batch.events
-   │    │                    │
-   │    └─ failure           │
-   │        ├─ retriable ────┼──► kafka_batch.jobs.retry
-   │        └─ exhausted ────┼──► kafka_batch.dead_letter
-   └─────────────────────────┘         +events (failed)
+   ┌────────────▼─────────────┐
+   │    Karafka: JobConsumer   │
+   │                          │
+   │  worker.perform(payload)  │
+   │    ├─ success ───────────┼──► kafka_batch.events
+   │    │                     │    event carries source coords
+   │    │                     │    {src_topic, src_partition,
+   │    │                     │     src_offset}; keyed by
+   │    │                     │     src_topic/src_partition
+   │    └─ failure            │
+   │        ├─ retriable ─────┼──► kafka_batch.jobs.retry
+   │        └─ exhausted ─────┼──► kafka_batch.dead_letter
+   └──────────────────────────┘         +events (failed)
                 │ (events topic)
-   ┌────────────▼────────────┐
-   │  Karafka: EventConsumer  │
-   │                         │
-   │  store.record_job_       │
-   │  completion(...)         │
-   │    ├─ running ──► skip  │
-   │    └─ done ─────────────┼──► kafka_batch.callbacks
-   └─────────────────────────┘
+   ┌────────────▼─────────────┐
+   │  Karafka: EventConsumer   │
+   │                          │
+   │  store.record_completion_ │
+   │  by_offset(...)           │   dedup: apply only if
+   │   monotonic per-partition │   src_offset > stored cursor
+   │   cursor  →  O(partitions)│   (absorbs redelivered AND
+   │    ├─ running ──► skip   │    re-produced events)
+   │    ├─ duplicate ► skip   │
+   │    └─ done ──────────────┼──► kafka_batch.callbacks
+   └──────────────────────────┘
                 │ (callbacks topic)
-   ┌────────────▼────────────┐
-   │ Karafka: CallbackConsumer│
-   │                         │
-   │  store.claim_callback() ─┼── atomic CAS; only one
-   │    ├─ won ──────────────┼──  process fires callbacks
-   │    │  on_success(batch)  │
-   │    │  on_complete(batch) │
-   │    └─ lost ──► skip     │
-   └─────────────────────────┘
+   ┌────────────▼─────────────┐
+   │ Karafka: CallbackConsumer │   at-least-once
+   │                          │   (callbacks idempotent)
+   │  callback_dispatched? ───┼── yes ─► skip (duplicate)
+   │    │ no                   │
+   │    ▼                      │
+   │  on_success(batch)        │   invoke FIRST,
+   │  on_complete(batch)       │   then claim_callback()
+   │  claim_callback()  ───────┼── mark dispatched (CAS)
+   └──────────────────────────┘
+                                  (crash before claim ⇒
+                                   re-invoke on redelivery,
+                                   never a lost callback)
 
-   ┌─────────────────────────┐
-   │  Karafka: RetryConsumer  │  ◄── kafka_batch.jobs.retry
-   │                         │
-   │  retry_after in future? │
-   │    ├─ yes ──► pause()   │  (Karafka partition pause –
-   │    │         then retry  │   zero thread blocking)
-   │    └─ no  ──► produce   │
-   │              to retry_to │──► original worker topic
-   └─────────────────────────┘
+   ┌──────────────────────────┐
+   │  Karafka: RetryConsumer   │  ◄── kafka_batch.jobs.retry
+   │                          │
+   │  retry_after in future?  │
+   │    ├─ yes ──► pause()    │  (Karafka partition pause –
+   │    │         then retry   │   zero thread blocking)
+   │    └─ no  ──► produce    │
+   │              to retry_to  │──► original worker topic
+   └──────────────────────────┘
 ```
 
 ---
