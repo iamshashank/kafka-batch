@@ -19,6 +19,14 @@ KafkaBatch.configure do |config|
   # ── Consumer group ─────────────────────────────────────────────────────────
   config.consumer_group = "kafka-batch"
 
+  # ── Cancellation ───────────────────────────────────────────────────────────
+  # When true, JobConsumer skips jobs whose batch was cancelled. Cancelled batch
+  # ids are cached per process and refreshed at most once per
+  # cancellation_cache_ttl seconds (no per-job store read), so cancellation is
+  # eventually-consistent within that window.
+  config.skip_cancelled_jobs    = true
+  config.cancellation_cache_ttl = 120  # seconds
+
   # ── Retry behaviour ────────────────────────────────────────────────────────
   config.max_retries   = 3    # global default; override per Worker class
   config.retry_backoff = 5    # seconds; linear: attempt * retry_backoff

@@ -530,7 +530,7 @@ What it shows:
 - **Batch list** — newest first, with status badge, total / done / failed / **pending** counts, a progress bar, and status filters. Paginated.
 - **Batch detail** — all fields, callbacks, meta, and progress.
 - **Actions** —
-  - **Cancel** (running batches): sets status to `cancelled`; with `skip_cancelled_jobs` the remaining jobs stop processing.
+  - **Cancel** (running batches): sets status to `cancelled`; with `skip_cancelled_jobs` the remaining jobs stop processing (eventually-consistent — within `cancellation_cache_ttl`).
   - **Delete**: removes the batch record (best used for finished batches).
 
 Routes (relative to the mount point):
@@ -656,6 +656,7 @@ bundle exec rake kafka_batch:workers
 | **Retries don't block partitions** | Failed jobs go to `kafka_batch.jobs.retry`; `RetryConsumer` uses Karafka `pause()` |
 | **Event emission failure ≠ job failure** | Separate rescue blocks; emission retried independently before leaving offset uncommitted |
 | **Malformed JSON is never silently dropped** | Unparseable messages in all consumers are forwarded to DLT before committing |
+| **Cancellation stops remaining jobs** | `JobConsumer` skips jobs of cancelled batches using a per-process cancelled-id cache (eventually-consistent within `cancellation_cache_ttl`) |
 | **Callback exceptions are not silently swallowed** | `StandardError` in callbacks → DLT with `dlt_type: "callback_error"` |
 | **Unresolvable callbacks are not silently dropped** | Forwarded to `dead_letter_topic` with `dlt_type: "callback"` |
 | **DLT publish failure causes redelivery** | If DLT produce fails, offset is left uncommitted so Karafka redelivers the message |
