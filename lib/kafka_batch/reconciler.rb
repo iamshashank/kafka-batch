@@ -32,6 +32,15 @@ module KafkaBatch
         KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{lost.size} lost-callback batch(es)")
         lost.each { |b| refire_callback(b) }
 
+        # ── 3. Sweep stale consumer heartbeats (:store liveness backend) ─────
+        if KafkaBatch.config.liveness_backend == :store
+          begin
+            KafkaBatch.store.sweep_stale_heartbeats(Time.now - KafkaBatch.config.liveness_ttl)
+          rescue => e
+            KafkaBatch.logger.warn("[KafkaBatch][Reconciler] heartbeat sweep failed: #{e.message}")
+          end
+        end
+
         duration = Time.now - start_time
         KafkaBatch::Instrumentation.reconciler_ran(
           stale_count: stale.size,

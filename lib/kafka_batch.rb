@@ -4,12 +4,14 @@ require "oj"
 require_relative "kafka_batch/version"
 require_relative "kafka_batch/errors"
 require_relative "kafka_batch/configuration"
+require_relative "kafka_batch/backoff"
 require_relative "kafka_batch/instrumentation"
 require_relative "kafka_batch/stores/base"
 require_relative "kafka_batch/stores/mysql_store"
 require_relative "kafka_batch/stores/redis_store"
 require_relative "kafka_batch/producer"
 require_relative "kafka_batch/cancellation_cache"
+require_relative "kafka_batch/liveness"
 require_relative "kafka_batch/worker"
 require_relative "kafka_batch/batch"
 require_relative "kafka_batch/reconciler"
@@ -72,43 +74,44 @@ module KafkaBatch
 
     # ── Karafka routing helper ─────────────────────────────────────────────
     #
-    # Call this inside your karafka.rb routes.draw block:
+    # Call this INSIDE your karafka.rb routes.draw block, passing `self` (the
+    # routing builder). Make sure your worker classes are loaded first so they
+    # are registered (reference them, or eager-load):
     #
     #   class KarafkaApp < Karafka::App
     #     routes.draw do
+    #       MyWorker  # ensure workers are loaded/registered
     #       KafkaBatch.draw_routes(self)
     #       # ... your own routes
     #     end
     #   end
     #
-    def draw_routes(karafka_app)
-      cfg = config
+    # It creates TWO consumer groups so the control plane (events/callbacks/
+    # retry) is isolated from job execution and isn't blocked behind long jobs:
+    #   "<consumer_group>-control" – events + callbacks + retry
+    #   "<consumer_group>-jobs"    – one topic per registered worker
+    #
+    # With config.concurrency > 1 (recommended), control messages are then
+    # worked in parallel with jobs, so progress/callbacks propagate promptly.
+    def draw_routes(builder)
+      cfg     = config
+      workers = KafkaBatch.workers
 
-      karafka_app.routes.draw do
-        # ── Internal topics ────────────────────────────────────────────────
-        topic cfg.events_topic do
-          consumer KafkaBatch::Consumers::EventConsumer
-          group_id "#{cfg.consumer_group}-events"
+      # Karafka's routing DSL methods (consumer_group/topic/consumer) are private
+      # and only resolve with implicit self, so define routes inside the builder
+      # via instance_eval. Locals (cfg/workers) remain available via closure.
+      builder.instance_eval do
+        consumer_group "#{cfg.consumer_group}-control" do
+          topic(cfg.events_topic)    { consumer KafkaBatch::Consumers::EventConsumer }
+          topic(cfg.callbacks_topic) { consumer KafkaBatch::Consumers::CallbackConsumer }
+          topic(cfg.retry_topic)     { consumer KafkaBatch::Consumers::RetryConsumer }
         end
 
-        topic cfg.callbacks_topic do
-          consumer KafkaBatch::Consumers::CallbackConsumer
-          group_id "#{cfg.consumer_group}-callbacks"
-        end
-
-        # Dedicated retry topic: RetryConsumer waits via Karafka pause()
-        # then re-enqueues to the original job topic, keeping JobConsumer
-        # partitions fully unblocked during backoff.
-        topic cfg.retry_topic do
-          consumer KafkaBatch::Consumers::RetryConsumer
-          group_id "#{cfg.consumer_group}-retry"
-        end
-
-        # ── One consumer route per registered worker ────────────────────────
-        KafkaBatch.workers.each do |worker_class|
-          topic worker_class.kafka_topic do
-            consumer KafkaBatch::Consumers::JobConsumer
-            group_id "#{cfg.consumer_group}-jobs"
+        unless workers.empty?
+          consumer_group "#{cfg.consumer_group}-jobs" do
+            workers.each do |worker_class|
+              topic(worker_class.kafka_topic) { consumer KafkaBatch::Consumers::JobConsumer }
+            end
           end
         end
       end
@@ -170,6 +173,7 @@ module KafkaBatch
       @workers_mutex = nil
       Producer.reset!
       CancellationCache.reset!
+      Liveness.reset!
     end
 
     private

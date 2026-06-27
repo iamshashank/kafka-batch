@@ -24,6 +24,23 @@ module KafkaBatch
         end
       end
 
+      def failure_class
+        @failure_class ||= begin
+          klass = Class.new(ActiveRecord::Base)
+          klass.table_name = "kafka_batch_failures"
+          klass
+        end
+      end
+
+      def heartbeat_class
+        @heartbeat_class ||= begin
+          klass = Class.new(ActiveRecord::Base)
+          klass.table_name = "kafka_batch_consumer_heartbeats"
+          klass.primary_key = "consumer_id"
+          klass
+        end
+      end
+
       # ── Public interface ──────────────────────────────────────────────────
 
       def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, locked: true)
@@ -148,6 +165,63 @@ module KafkaBatch
         batch_record_class.where(status: "cancelled").pluck(:id)
       end
 
+      def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
+        attrs = {
+          worker_class:  worker_class.to_s,
+          error_class:   error_class.to_s,
+          error_message: error_message.to_s,
+          attempt:       attempt.to_i,
+          status:        status,
+          next_retry_at: next_retry_at,
+          failed_at:     Time.now
+        }
+        # Upsert per (batch_id, job_id): reflect the latest failed attempt.
+        rec = failure_class.find_by(batch_id: batch_id, job_id: job_id)
+        if rec
+          rec.update!(attrs)
+        else
+          failure_class.create!(attrs.merge(batch_id: batch_id, job_id: job_id))
+        end
+      rescue ActiveRecord::RecordNotUnique
+        retry  # lost a create race – the row now exists, update it
+      end
+
+      def list_failures(batch_id, limit: 100, offset: 0)
+        failures_scope(failure_class.where(batch_id: batch_id), limit, offset)
+      end
+
+      def list_all_failures(limit: 100, offset: 0, status: nil)
+        scope = failure_class.all
+        scope = scope.where(status: status) if status
+        failures_scope(scope, limit, offset, include_batch_id: true)
+      end
+
+      # ── Liveness (:store backend) ────────────────────────────────────────────
+
+      def record_heartbeat(consumer_id, data)
+        attrs = data.slice(
+          :hostname, :pid, :topic, :current_job_id, :current_worker,
+          :current_batch_id, :current_topic, :current_partition, :jobs_done
+        ).merge(last_seen: Time.now)
+
+        rec = heartbeat_class.find_by(consumer_id: consumer_id)
+        if rec
+          rec.update!(attrs)
+        else
+          heartbeat_class.create!(attrs.merge(consumer_id: consumer_id))
+        end
+      rescue ActiveRecord::RecordNotUnique
+        retry
+      end
+
+      def list_heartbeats(since)
+        heartbeat_class.where("last_seen >= ?", since).order(last_seen: :desc).map { |r| heartbeat_to_hash(r) }
+      end
+
+      def sweep_stale_heartbeats(older_than)
+        heartbeat_class.where("last_seen < ?", older_than).delete_all
+      end
+
       def list_batches(status: nil, limit: 50, offset: 0)
         scope = batch_record_class.order(created_at: :desc)
         scope = scope.where(status: status) if status
@@ -182,7 +256,10 @@ module KafkaBatch
       end
 
       def delete_batch(id)
-        batch_record_class.where(id: id).delete_all
+        batch_record_class.transaction do
+          failure_class.where(batch_id: id).delete_all
+          batch_record_class.where(id: id).delete_all
+        end
       end
 
       # Distributed lock using MySQL advisory locks (GET_LOCK / RELEASE_LOCK).
@@ -205,6 +282,39 @@ module KafkaBatch
       end
 
       private
+
+      def heartbeat_to_hash(r)
+        {
+          consumer_id:       r.consumer_id,
+          hostname:          r.hostname,
+          pid:               r.pid,
+          topic:             r.topic,
+          current_job_id:    r.current_job_id,
+          current_worker:    r.current_worker,
+          current_batch_id:  r.current_batch_id,
+          current_topic:     r.current_topic,
+          current_partition: r.current_partition,
+          jobs_done:         r.jobs_done,
+          last_seen:         r.last_seen
+        }
+      end
+
+      def failures_scope(scope, limit, offset, include_batch_id: false)
+        scope.order(failed_at: :desc).limit(limit).offset(offset).map do |r|
+          h = {
+            job_id:        r.job_id,
+            worker_class:  r.worker_class,
+            error_class:   r.error_class,
+            error_message: r.error_message,
+            attempt:       r.attempt,
+            status:        r.status,
+            next_retry_at: r.next_retry_at,
+            failed_at:     r.failed_at
+          }
+          h[:batch_id] = r.batch_id if include_batch_id
+          h
+        end
+      end
 
       # Increment the batch counter and detect completion. MUST be called from
       # within a transaction. FOR UPDATE locks the row so two processes can't

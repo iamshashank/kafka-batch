@@ -33,9 +33,25 @@ module KafkaBatch
     attr_accessor :skip_cancelled_jobs   # Boolean – default true
     attr_accessor :cancellation_cache_ttl  # Integer – seconds; default 120
 
+    # ── Liveness (running jobs / consumers dashboard) ─────────────────────────
+    # Visibility into currently-running jobs and live consumer processes.
+    #   :redis – (default) full per-job tracking in Redis (config.redis_url),
+    #            short TTL, best-effort. Most detailed; needs Redis.
+    #   :store – consumer heartbeat + sampled "current job" in the configured
+    #            store (e.g. MySQL). Bounded, low-impact (writes scale with
+    #            consumers, NOT job throughput); reliable via last_seen + sweep.
+    #   :off   – disabled.
+    attr_accessor :liveness_backend            # Symbol – default :redis
+    attr_accessor :track_running_jobs          # Boolean – default true (gates :redis writes)
+    attr_accessor :liveness_ttl                # Integer – seconds; default 30 (staleness window)
+    attr_accessor :liveness_heartbeat_interval # Integer – seconds; default 5 (:store write throttle)
+
     # ── Retry behaviour ──────────────────────────────────────────────────────
-    attr_accessor :max_retries      # Integer – default per worker (worker can override)
-    attr_accessor :retry_backoff    # Integer – seconds; linear: attempt * retry_backoff
+    # Retries use exponential (geometric) backoff: delays grow from retry_backoff
+    # (first retry) up to retry_max_backoff (the LAST retry, default 24h).
+    attr_accessor :max_retries        # Integer – default per worker (worker can override)
+    attr_accessor :retry_backoff      # Integer – seconds; first-retry delay (base)
+    attr_accessor :retry_max_backoff  # Integer – seconds; last-retry delay cap (default 24h)
 
     # ── Completion-event emission retries ────────────────────────────────────
     # After a job succeeds, the consumer produces a completion event. If that
@@ -82,6 +98,10 @@ module KafkaBatch
       @store                    = :mysql
       @skip_cancelled_jobs      = true
       @cancellation_cache_ttl   = 120
+      @liveness_backend            = :redis
+      @track_running_jobs          = true
+      @liveness_ttl                = 30
+      @liveness_heartbeat_interval = 5
       @brokers                  = ["localhost:9092"]
       @jobs_topic               = "kafka_batch.jobs"
       @events_topic             = "kafka_batch.events"
@@ -91,6 +111,7 @@ module KafkaBatch
       @consumer_group           = "kafka-batch"
       @max_retries              = 3
       @retry_backoff            = 5
+      @retry_max_backoff        = 24 * 3600  # 24 hours
       @event_emit_retries       = 3
       @event_emit_backoff       = 2
       @redis_url                = "redis://localhost:6379/0"
@@ -107,6 +128,10 @@ module KafkaBatch
     def validate!
       raise ConfigurationError, "store must be :mysql or :redis" unless %i[mysql redis].include?(@store)
       raise ConfigurationError, "brokers must not be empty"       if Array(@brokers).empty?
+
+      unless %i[redis store off].include?(@liveness_backend)
+        raise ConfigurationError, "liveness_backend must be :redis, :store, or :off"
+      end
 
       if @store == :redis
         raise ConfigurationError, "redis_url must be set for :redis store" if @redis_url.nil? || @redis_url.empty?

@@ -151,6 +151,86 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     end
   end
 
+  describe "failure tracking (#record_failure / #list_failures)" do
+    it "records and lists failures (newest first)" do
+      id = new_batch
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "RuntimeError", error_message: "boom1")
+      store.record_failure(batch_id: id, job_id: "j2", worker_class: "W", error_class: "ArgumentError", error_message: "boom2")
+
+      failures = store.list_failures(id)
+      expect(failures.size).to eq(2)
+      expect(failures.map { |f| f[:job_id] }).to contain_exactly("j1", "j2")
+      expect(failures.first[:error_class]).to be_a(String)
+    end
+
+    it "upserts per (batch_id, job_id), updating status retrying -> failed" do
+      id = new_batch
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x", attempt: 0, status: "retrying")
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E2", error_message: "y", attempt: 2, status: "failed")
+
+      failures = store.list_failures(id)
+      expect(failures.size).to eq(1)
+      expect(failures.first[:status]).to eq("failed")
+      expect(failures.first[:attempt]).to eq(2)
+      expect(failures.first[:error_class]).to eq("E2")
+    end
+
+    it "paginates" do
+      id = new_batch
+      5.times { |i| store.record_failure(batch_id: id, job_id: "j#{i}", worker_class: "W", error_class: "E", error_message: "x") }
+      expect(store.list_failures(id, limit: 2).size).to eq(2)
+      expect(store.list_failures(id, limit: 2, offset: 4).size).to eq(1)
+    end
+
+    it "is removed with the batch" do
+      id = new_batch
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x")
+      store.delete_batch(id)
+      expect(store.list_failures(id)).to be_empty
+    end
+
+    it "#list_all_failures aggregates across batches, with batch_id and status filter" do
+      a = new_batch
+      b = new_batch
+      store.record_failure(batch_id: a, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x", status: "retrying")
+      store.record_failure(batch_id: b, job_id: "j2", worker_class: "W", error_class: "E", error_message: "y", status: "failed")
+
+      all = store.list_all_failures
+      expect(all.map { |f| f[:batch_id] }).to contain_exactly(a, b)
+      expect(all.first).to have_key(:batch_id)
+
+      expect(store.list_all_failures(status: "failed").map { |f| f[:job_id] }).to eq(["j2"])
+    end
+  end
+
+  describe "liveness heartbeats (:store backend)" do
+    it "upserts, lists active, and sweeps stale heartbeats" do
+      store.record_heartbeat("c1", hostname: "h1", pid: 11, topic: "t",
+                             current_job_id: "j1", current_worker: "W", jobs_done: 2)
+
+      active = store.list_heartbeats(Time.now - 60)
+      expect(active.map { |h| h[:consumer_id] }).to eq(["c1"])
+      expect(active.first[:current_job_id]).to eq("j1")
+      expect(active.first[:jobs_done]).to eq(2)
+
+      # upsert same consumer (no duplicate row)
+      store.record_heartbeat("c1", hostname: "h1", pid: 11, topic: "t2", current_job_id: nil, jobs_done: 3)
+      reread = store.list_heartbeats(Time.now - 60)
+      expect(reread.size).to eq(1)
+      expect(reread.first[:current_job_id]).to be_nil
+      expect(reread.first[:jobs_done]).to eq(3)
+
+      # sweep everything
+      store.sweep_stale_heartbeats(Time.now + 60)
+      expect(store.list_heartbeats(Time.now - 60)).to be_empty
+    end
+
+    it "excludes heartbeats older than the since cutoff" do
+      store.record_heartbeat("c1", hostname: "h", pid: 1, jobs_done: 0)
+      expect(store.list_heartbeats(Time.now + 60)).to be_empty  # nothing newer than the future
+    end
+  end
+
   describe "admin UI queries" do
     it "#batch_status returns the status (or nil when unknown)" do
       id = new_batch

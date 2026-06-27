@@ -31,6 +31,7 @@ module KafkaBatch
       # SET of cancelled batch ids, read periodically by the cancellation cache.
       CANCELLED_INDEX = "kafka_batch:index:cancelled"
       OFFSETS_KEY   = "kafka_batch:offsets"
+      HEARTBEATS_KEY = "kafka_batch:heartbeats"
 
       # Atomically apply a completion, deduplicating by a monotonic per-partition
       # cursor over the job message's source offset, then check for completion.
@@ -298,6 +299,70 @@ module KafkaBatch
         with_redis { |r| r.smembers(CANCELLED_INDEX) }
       end
 
+      def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
+        entry = Oj.dump({
+          "job_id"        => job_id,
+          "worker_class"  => worker_class.to_s,
+          "error_class"   => error_class.to_s,
+          "error_message" => error_message.to_s,
+          "attempt"       => attempt.to_i,
+          "status"        => status,
+          "next_retry_at" => (next_retry_at.respond_to?(:iso8601) ? next_retry_at.iso8601 : next_retry_at),
+          "failed_at"     => Time.now.iso8601
+        }, mode: :compat)
+
+        with_redis do |r|
+          r.hset(failures_key(batch_id), job_id, entry)  # upsert per job_id
+          r.expire(failures_key(batch_id), @ttl)
+        end
+      end
+
+      def list_failures(batch_id, limit: 100, offset: 0)
+        raw = with_redis { |r| r.hvals(failures_key(batch_id)) }
+        entries = raw.map { |v| failure_hash(deserialize(v)) }
+        sort_paginate(entries, limit, offset)
+      end
+
+      # ── Liveness (:store backend) ────────────────────────────────────────────
+
+      def record_heartbeat(consumer_id, data)
+        entry = Oj.dump(data.merge(consumer_id: consumer_id, last_seen: Time.now.iso8601).transform_keys(&:to_s), mode: :compat)
+        with_redis { |r| r.hset(HEARTBEATS_KEY, consumer_id, entry) }
+      end
+
+      def list_heartbeats(since)
+        raw = with_redis { |r| r.hvals(HEARTBEATS_KEY) }
+        raw.map { |v| deserialize(v) }
+           .select { |h| h["last_seen"] && Time.parse(h["last_seen"]) >= since rescue false }
+           .map { |h| symbolize_heartbeat(h) }
+      end
+
+      def sweep_stale_heartbeats(older_than)
+        with_redis do |r|
+          r.hgetall(HEARTBEATS_KEY).each do |cid, v|
+            h = deserialize(v)
+            ts = (Time.parse(h["last_seen"]) rescue nil)
+            r.hdel(HEARTBEATS_KEY, cid) if ts.nil? || ts < older_than
+          end
+        end
+      end
+
+      # Aggregate failures across all (non-expired) batches via the all-index.
+      def list_all_failures(limit: 100, offset: 0, status: nil)
+        ids = with_redis { |r| r.zrevrange(ALL_INDEX, 0, -1) }
+        entries = []
+        ids.each do |bid|
+          vals = with_redis { |r| r.hvals(failures_key(bid)) }
+          next if vals.empty?
+          vals.each do |v|
+            h = deserialize(v)
+            next if status && h["status"] != status
+            entries << failure_hash(h, batch_id: bid)
+          end
+        end
+        sort_paginate(entries, limit, offset)
+      end
+
       def list_batches(status: nil, limit: 50, offset: 0)
         ids = with_redis { |r| r.zrevrange(ALL_INDEX, 0, -1) }
         result  = []
@@ -393,7 +458,7 @@ module KafkaBatch
 
       def delete_batch(id)
         with_redis do |r|
-          r.del(batch_key(id))
+          r.del(batch_key(id), failures_key(id))
           r.zrem(RUNNING_INDEX, id)
           r.zrem(DONE_INDEX, id)
           r.zrem(ALL_INDEX, id)
@@ -435,6 +500,45 @@ module KafkaBatch
 
       def batch_key(id)
         "#{KEY_PREFIX}:#{id}"
+      end
+
+      def failures_key(id)
+        "#{batch_key(id)}:failures"
+      end
+
+      def failure_hash(h, batch_id: nil)
+        out = {
+          job_id:        h["job_id"],
+          worker_class:  h["worker_class"],
+          error_class:   h["error_class"],
+          error_message: h["error_message"],
+          attempt:       h["attempt"].to_i,
+          status:        h["status"],
+          next_retry_at: h["next_retry_at"],
+          failed_at:     h["failed_at"]
+        }
+        out[:batch_id] = batch_id if batch_id
+        out
+      end
+
+      def sort_paginate(entries, limit, offset)
+        entries.sort_by { |e| e[:failed_at].to_s }.reverse.drop(offset).first(limit)
+      end
+
+      def symbolize_heartbeat(h)
+        {
+          consumer_id:       h["consumer_id"],
+          hostname:          h["hostname"],
+          pid:               h["pid"],
+          topic:             h["topic"],
+          current_job_id:    h["current_job_id"],
+          current_worker:    h["current_worker"],
+          current_batch_id:  h["current_batch_id"],
+          current_topic:     h["current_topic"],
+          current_partition: h["current_partition"],
+          jobs_done:         h["jobs_done"],
+          last_seen:         h["last_seen"]
+        }
       end
 
       def with_redis(&block)

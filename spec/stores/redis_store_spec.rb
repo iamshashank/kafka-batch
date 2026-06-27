@@ -174,6 +174,36 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     end
   end
 
+  describe "failure tracking (#record_failure / #list_failures)" do
+    it "records and lists failures, idempotent per job_id" do
+      id = new_batch
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "RuntimeError", error_message: "boom")
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "RuntimeError", error_message: "boom")
+      store.record_failure(batch_id: id, job_id: "j2", worker_class: "W", error_class: "ArgumentError", error_message: "boom2")
+
+      failures = store.list_failures(id)
+      expect(failures.map { |f| f[:job_id] }).to contain_exactly("j1", "j2")
+      expect(failures.first[:error_class]).to be_a(String)
+    end
+
+    it "is removed with the batch" do
+      id = new_batch
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x")
+      store.delete_batch(id)
+      expect(store.list_failures(id)).to be_empty
+    end
+
+    it "#list_all_failures aggregates across batches with status filter" do
+      a = new_batch
+      b = new_batch
+      store.record_failure(batch_id: a, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x", status: "retrying")
+      store.record_failure(batch_id: b, job_id: "j2", worker_class: "W", error_class: "E", error_message: "y", status: "failed")
+
+      expect(store.list_all_failures.map { |f| f[:batch_id] }).to contain_exactly(a, b)
+      expect(store.list_all_failures(status: "failed").map { |f| f[:job_id] }).to eq(["j2"])
+    end
+  end
+
   describe "admin UI queries" do
     it "#batch_status returns the status (or nil when unknown)" do
       id = new_batch

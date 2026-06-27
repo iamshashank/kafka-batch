@@ -45,6 +45,23 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       expect(payload["retry_to"]).to eq("test.fail")
       expect(payload["retry_after"]).to be_a(String)
     end
+
+    it "records the failure as 'retrying' on the first failed attempt" do
+      consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 0, job_id: "jr"))
+
+      f = KafkaBatch.store.list_failures("b1").first
+      expect(f).not_to be_nil
+      expect(f[:status]).to eq("retrying")
+      expect(f[:job_id]).to eq("jr")
+      expect(f[:error_class]).to eq("RuntimeError")
+      expect(f[:next_retry_at]).not_to be_nil  # exponential backoff schedule
+    end
+
+    it "schedules the retry with an exponential (geometric) delay in the future" do
+      consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 0, job_id: "jr2"))
+      msg = FakeProducer.for_topic(KafkaBatch.config.retry_topic).first
+      expect(Time.parse(msg.payload["retry_after"])).to be > Time.now
+    end
   end
 
   describe "failing job that has exhausted retries" do
@@ -58,6 +75,15 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
       expect(dlt.first.payload["dlt_type"]).to eq("job")
       expect(FakeProducer.for_topic(KafkaBatch.config.retry_topic)).to be_empty
+    end
+
+    it "records the failure for the batch (always-on failure tracking)" do
+      consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 2, job_id: "jx"))
+
+      failures = KafkaBatch.store.list_failures("b1")
+      expect(failures.size).to eq(1)
+      expect(failures.first[:job_id]).to eq("jx")
+      expect(failures.first[:error_class]).to eq("RuntimeError")
     end
   end
 

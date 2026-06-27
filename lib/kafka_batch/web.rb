@@ -1,5 +1,6 @@
 require "erb"
 require "cgi"
+require "time"
 
 module KafkaBatch
   # A minimal, dependency-free Rack application for inspecting batches –
@@ -35,6 +36,10 @@ module KafkaBatch
 
       if method == "GET" && path == "/"
         html(render_index(params))
+      elsif method == "GET" && path == "/failures"
+        html(render_failures(params))
+      elsif method == "GET" && path == "/live"
+        html(render_live)
       elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
         batch = KafkaBatch.store.find_batch(m[1])
         batch ? html(render_show(batch)) : not_found
@@ -49,7 +54,7 @@ module KafkaBatch
       end
     rescue StandardError => e
       KafkaBatch.logger.error("[KafkaBatch::Web] #{e.class}: #{e.message}")
-      [500, { "content-type" => "text/html; charset=utf-8" },
+      [500, html_headers,
        [layout("Error", "<div class='card'><h2>500</h2><pre>#{h(e.message)}</pre></div>")]]
     end
 
@@ -57,19 +62,24 @@ module KafkaBatch
 
     # ── Responses ──────────────────────────────────────────────────────────
 
+    # Dashboard data is always live; never let a browser/proxy cache it (also
+    # prevents Rails' Rack::ETag from issuing 304s that mask counter updates).
+    def html_headers
+      { "content-type" => "text/html; charset=utf-8", "cache-control" => "no-store" }
+    end
+
     # Wrap an HTML body string in the layout; pass through ready-made responses.
     def html(body_or_response)
       return body_or_response if body_or_response.is_a?(Array)
-      [200, { "content-type" => "text/html; charset=utf-8" }, [layout("Batches", body_or_response)]]
+      [200, html_headers, [layout("Batches", body_or_response)]]
     end
 
     def not_found
-      [404, { "content-type" => "text/html; charset=utf-8" },
-       [layout("Not found", "<div class='card'><h2>404</h2><p>Not found.</p></div>")]]
+      [404, html_headers, [layout("Not found", "<div class='card'><h2>404</h2><p>Not found.</p></div>")]]
     end
 
     def redirect_to_index
-      [302, { "location" => index_path, "content-type" => "text/html" }, []]
+      [302, { "location" => index_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
     end
 
     # ── Pages ──────────────────────────────────────────────────────────────
@@ -92,6 +102,7 @@ module KafkaBatch
 
       <<~HTML
         #{summary}
+        <div class="toolbar"><a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a></div>
         #{filters}
         <div class="card">
           <table>
@@ -108,6 +119,115 @@ module KafkaBatch
       HTML
     end
 
+    def render_failures(params)
+      status   = non_empty(params["status"])
+      page     = [params["page"].to_i, 1].max
+      offset   = (page - 1) * PER_PAGE
+      failures = KafkaBatch.store.list_all_failures(limit: PER_PAGE + 1, offset: offset, status: status)
+      has_next = failures.size > PER_PAGE
+      failures = failures.first(PER_PAGE)
+
+      filter_links = [["All", nil], ["Retrying", "retrying"], ["Failed", "failed"]].map do |label, s|
+        cls  = (status == s || (s.nil? && status.nil?)) ? "chip active" : "chip"
+        href = s ? "#{failures_path}?status=#{s}" : failures_path
+        "<a class='#{cls}' href='#{href}'>#{label}</a>"
+      end.join
+
+      rows = failures.map do |f|
+        color = f[:status] == "retrying" ? "#f59e0b" : "#ef4444"
+        <<~ROW.gsub(/\n\s*/, "")
+          <tr>
+            <td><a class="mono" href="#{show_path(f[:batch_id])}">#{h(short_id(f[:batch_id]))}</a></td>
+            <td class="mono">#{h(short_id(f[:job_id]))}</td>
+            <td>#{h(f[:worker_class])}</td>
+            <td><span class="badge" style="background:#{color}">#{h(f[:status])}</span></td>
+            <td>#{f[:attempt].to_i + 1}</td>
+            <td>#{next_retry_cell(f)}</td>
+            <td class="danger">#{h(f[:error_class])}</td>
+            <td>#{h(f[:error_message])}</td>
+            <td>#{fmt_time(f[:failed_at])}</td>
+          </tr>
+        ROW
+      end.join
+      rows = "<tr><td colspan='9' class='empty'>No failures recorded.</td></tr>" if failures.empty?
+
+      qs        = status ? "&status=#{status}" : ""
+      prev_link = page > 1 ? "<a class='btn' href='#{failures_path}?page=#{page - 1}#{qs}'>← Prev</a>" : ""
+      next_link = has_next ? "<a class='btn' href='#{failures_path}?page=#{page + 1}#{qs}'>Next →</a>" : ""
+      pager     = (prev_link.empty? && next_link.empty?) ? "" : "<div class='pager'>#{prev_link}<span class='page'>Page #{page}</span>#{next_link}</div>"
+
+      <<~HTML
+        <p><a class="back" href="#{index_path}">← All batches</a></p>
+        <div class="chips">#{filter_links}</div>
+        <div class="card">
+          <h2>Failures across all batches</h2>
+          <table>
+            <thead><tr><th>Batch</th><th>Job</th><th>Worker</th><th>Status</th><th>Attempt</th><th>Next retry</th><th>Error</th><th>Message</th><th>Failed at</th></tr></thead>
+            <tbody>#{rows}</tbody>
+          </table>
+        </div>
+        #{pager}
+      HTML
+    end
+
+    def render_live
+      unless KafkaBatch::Liveness.available?
+        msg = if KafkaBatch::Liveness.backend == :off
+          "Live activity is disabled (<code>config.liveness_backend = :off</code>)."
+        else
+          "This feature requires Redis (<code>config.redis_url</code>) and it is not currently reachable, so running-job and consumer info is unavailable."
+        end
+        return <<~HTML
+          <p><a class="back" href="#{index_path}">← All batches</a></p>
+          <div class="card">
+            <h2>Live activity</h2>
+            <p class="muted">#{msg}</p>
+          </div>
+        HTML
+      end
+
+      consumers = KafkaBatch::Liveness.consumers
+      jobs      = KafkaBatch::Liveness.running_jobs
+
+      consumer_rows = consumers.map do |c|
+        "<tr><td class='mono'>#{h(c['consumer_id'])}</td><td>#{h(c['hostname'])}</td>" \
+        "<td>#{h(c['pid'])}</td><td>#{h(c['topic'])}</td><td>#{fmt_time(c['last_seen'])}</td></tr>"
+      end.join
+      consumer_rows = "<tr><td colspan='5' class='empty'>No active consumers seen.</td></tr>" if consumers.empty?
+
+      job_rows = jobs.map do |j|
+        batch = j["batch_id"] ? "<a class='mono' href='#{show_path(j['batch_id'])}'>#{h(short_id(j['batch_id']))}</a>" : "<span class='muted'>—</span>"
+        "<tr><td class='mono'>#{h(short_id(j['job_id']))}</td><td>#{batch}</td>" \
+        "<td>#{h(j['worker_class'])}</td><td class='mono'>#{h(j['consumer_id'])}</td>" \
+        "<td>#{h(j['topic'])}/#{h(j['partition'])}</td><td>#{fmt_time(j['started_at'])}</td></tr>"
+      end.join
+      job_rows = "<tr><td colspan='6' class='empty'>No jobs currently running.</td></tr>" if jobs.empty?
+
+      <<~HTML
+        <p><a class="back" href="#{index_path}">← All batches</a></p>
+        <div class="metrics">
+          <div class="metric"><div class="metric-value">#{consumers.size}</div><div class="metric-label">Consumers</div></div>
+          <div class="metric"><div class="metric-value">#{jobs.size}</div><div class="metric-label">Running jobs</div></div>
+        </div>
+        <div class="card">
+          <h3>Active consumers</h3>
+          <table>
+            <thead><tr><th>Consumer</th><th>Host</th><th>PID</th><th>Topic</th><th>Last seen</th></tr></thead>
+            <tbody>#{consumer_rows}</tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Running jobs</h3>
+          <p class="muted">Backend: <code>#{h(KafkaBatch::Liveness.backend)}</code>. Approximate snapshot#{KafkaBatch::Liveness.backend == :store ? ' (sampled per consumer at heartbeat)' : ''} — short-lived jobs may not always appear. Auto-refreshing every 5s.</p>
+          <table>
+            <thead><tr><th>Job</th><th>Batch</th><th>Worker</th><th>Consumer</th><th>Topic/Part</th><th>Started</th></tr></thead>
+            <tbody>#{job_rows}</tbody>
+          </table>
+        </div>
+        <script>setTimeout(function(){ location.reload(); }, 5000);</script>
+      HTML
+    end
+
     def render_show(b)
       pend = pending(b)
       meta = b[:meta].nil? || b[:meta].empty? ? "—" : "<pre>#{h(b[:meta].inspect)}</pre>"
@@ -121,9 +241,9 @@ module KafkaBatch
         "Pending"        => pend,
         "on_success"     => h(b[:on_success] || "—"),
         "on_complete"    => h(b[:on_complete] || "—"),
-        "Created at"     => h(b[:created_at].to_s),
-        "Finished at"    => h(b[:finished_at].to_s.empty? ? "—" : b[:finished_at].to_s),
-        "Callback fired" => h(b[:callback_dispatched_at].to_s.empty? ? "no" : b[:callback_dispatched_at].to_s),
+        "Created at"     => fmt_time(b[:created_at]),
+        "Finished at"    => fmt_time(b[:finished_at]),
+        "Callback fired" => (b[:callback_dispatched_at].to_s.empty? ? "no" : fmt_time(b[:callback_dispatched_at])),
         "Meta"           => meta
       }.map { |k, v| "<tr><th>#{k}</th><td>#{v}</td></tr>" }.join
 
@@ -135,7 +255,46 @@ module KafkaBatch
           <table class="detail"><tbody>#{rows}</tbody></table>
           <div class="actions">#{actions_for(b)}</div>
         </div>
+        #{failures_section(b)}
       HTML
+    end
+
+    def failures_section(b)
+      failures = KafkaBatch.store.list_failures(b[:id], limit: 100)
+      return "" if failures.empty?
+
+      rows = failures.map do |f|
+        color = f[:status] == "retrying" ? "#f59e0b" : "#ef4444"
+        <<~ROW.gsub(/\n\s*/, "")
+          <tr>
+            <td class="mono">#{h(short_id(f[:job_id]))}</td>
+            <td>#{h(f[:worker_class])}</td>
+            <td><span class="badge" style="background:#{color}">#{h(f[:status])}</span></td>
+            <td>#{f[:attempt].to_i + 1}</td>
+            <td>#{next_retry_cell(f)}</td>
+            <td class="danger">#{h(f[:error_class])}</td>
+            <td>#{h(f[:error_message])}</td>
+            <td>#{fmt_time(f[:failed_at])}</td>
+          </tr>
+        ROW
+      end.join
+
+      more = failures.size >= 100 ? "<p class='muted'>Showing the first 100 failing jobs.</p>" : ""
+
+      <<~HTML
+        <div class="card">
+          <h3>Job failures (#{failures.size})</h3>
+          <p class="muted">Recorded on the first failed attempt — <span class="badge" style="background:#f59e0b">retrying</span> while retries remain, <span class="badge" style="background:#ef4444">failed</span> once exhausted.</p>
+          <table>
+            <thead><tr><th>Job</th><th>Worker</th><th>Status</th><th>Attempt</th><th>Next retry</th><th>Error</th><th>Message</th><th>Failed at</th></tr></thead>
+            <tbody>#{rows}</tbody>
+          </table>
+          #{more}
+        </div>
+      HTML
+    rescue StandardError => e
+      KafkaBatch.logger.warn("[KafkaBatch::Web] list_failures failed: #{e.message}")
+      ""
     end
 
     # ── Partials ───────────────────────────────────────────────────────────
@@ -246,6 +405,14 @@ module KafkaBatch
       @script_name.empty? ? "/" : "#{@script_name}/"
     end
 
+    def failures_path
+      "#{@script_name}/failures"
+    end
+
+    def live_path
+      "#{@script_name}/live"
+    end
+
     def show_path(id)
       "#{@script_name}/batches/#{CGI.escape(id.to_s)}"
     end
@@ -268,6 +435,48 @@ module KafkaBatch
 
     def h(text)
       CGI.escapeHTML(text.to_s)
+    end
+
+    # Human "time until" a future timestamp, e.g. "in 23h 59m" / "in 5m 3s".
+    def fmt_eta(value)
+      return "—" if value.nil? || (value.respond_to?(:empty?) && value.empty?)
+      t = value.respond_to?(:to_time) ? value.to_time : Time.parse(value.to_s)
+      secs = (t - Time.now).round
+      return "due now" if secs <= 0
+
+      d = secs / 86_400; secs %= 86_400
+      hh = secs / 3_600; secs %= 3_600
+      mm = secs / 60;    ss = secs % 60
+      parts = []
+      parts << "#{d}d"  if d.positive?
+      parts << "#{hh}h" if hh.positive?
+      parts << "#{mm}m" if mm.positive?
+      parts << "#{ss}s" if ss.positive?
+      "in #{parts.first(2).join(' ')}"
+    rescue StandardError
+      "—"
+    end
+
+    # Table cell for a failure's next retry (ETA + absolute UTC), or "—".
+    def next_retry_cell(failure)
+      return "—" unless failure[:status] == "retrying" && failure[:next_retry_at]
+      "#{fmt_eta(failure[:next_retry_at])}<br><span class='muted'>#{fmt_time(failure[:next_retry_at])}</span>"
+    end
+
+    # Render any timestamp (Time, ActiveRecord time, or ISO8601 string) as
+    # UTC in 24-hour format with an explicit suffix: "2026-06-27 20:19:44 UTC".
+    def fmt_time(value)
+      return "—" if value.nil? || (value.respond_to?(:empty?) && value.empty?)
+
+      t =
+        if value.respond_to?(:to_time)
+          value.to_time
+        else
+          Time.parse(value.to_s)
+        end
+      t.utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    rescue StandardError
+      h(value.to_s)
     end
 
     def layout(title, body)
@@ -306,6 +515,7 @@ module KafkaBatch
       .metric { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; min-width: 110px; }
       .metric-value { font-size: 26px; font-weight: 700; }
       .metric-label { color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+      .toolbar { margin-bottom: 12px; }
       .chips { margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
       .chip { text-decoration: none; color: #374151; background: #fff; border: 1px solid #e5e7eb;
               padding: 5px 12px; border-radius: 999px; font-size: 13px; }

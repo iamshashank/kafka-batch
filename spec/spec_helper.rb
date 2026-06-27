@@ -33,6 +33,9 @@ RSpec.configure do |config|
     KafkaBatch.configure do |c|
       c.brokers = ["localhost:9092"]
       c.logger  = Logger.new(ENV["KAFKA_BATCH_TEST_LOG"])
+      # Liveness writes to Redis; keep it off for the bulk of specs and enable
+      # explicitly in the liveness/web specs that exercise it.
+      c.track_running_jobs = false
     end
 
     # Every spec gets a clean SQLite schema + a recording producer by default.

@@ -85,6 +85,46 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#cancelled_batch_ids"
       end
 
+      # Record that a job failed (always-on failure tracking). Called on EVERY
+      # failed attempt – status "retrying" while retries remain, "failed" once
+      # exhausted – so problems surface immediately, not hours later. Upserted
+      # per (batch_id, job_id); bounded by the number of failing jobs.
+      def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
+        raise NotImplementedError, "#{self.class}#record_failure"
+      end
+
+      # List recorded failures for a batch, newest-first.
+      # @return [Array<Hash>] each: { job_id:, worker_class:, error_class:, error_message:, attempt:, status:, failed_at: }
+      def list_failures(batch_id, limit: 100, offset: 0)
+        raise NotImplementedError, "#{self.class}#list_failures"
+      end
+
+      # List failures across ALL batches, newest-first (for the global view).
+      # Each hash additionally includes :batch_id.
+      # @return [Array<Hash>]
+      def list_all_failures(limit: 100, offset: 0, status: nil)
+        raise NotImplementedError, "#{self.class}#list_all_failures"
+      end
+
+      # ── Liveness (:store backend) ────────────────────────────────────────────
+      # Upsert a consumer process heartbeat (one row per consumer_id). +data+ is
+      # a hash of: hostname, pid, topic, current_job_id, current_worker,
+      # current_batch_id, current_topic, current_partition, jobs_done.
+      def record_heartbeat(consumer_id, data)
+        raise NotImplementedError, "#{self.class}#record_heartbeat"
+      end
+
+      # Active consumer heartbeats with last_seen >= +since+ (a Time).
+      # @return [Array<Hash>]
+      def list_heartbeats(since)
+        raise NotImplementedError, "#{self.class}#list_heartbeats"
+      end
+
+      # Delete heartbeats older than +older_than+ (a Time). Returns count.
+      def sweep_stale_heartbeats(older_than)
+        raise NotImplementedError, "#{self.class}#sweep_stale_heartbeats"
+      end
+
       # List batches newest-first for the admin UI.
       # @param status [String, nil] optional status filter
       # @param limit  [Integer]

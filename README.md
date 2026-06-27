@@ -173,8 +173,12 @@ KafkaBatch.configure do |config|
   config.cancellation_cache_ttl = 120  # seconds
 
   # ── Retry behaviour (global defaults; override per Worker class) ────
-  config.max_retries   = 3   # max attempts before dead letter
-  config.retry_backoff = 5   # seconds; sleep = attempt × retry_backoff
+  # Exponential (geometric) backoff: delays grow from retry_backoff (first retry)
+  # up to retry_max_backoff (the LAST retry). The ratio is derived from
+  # max_retries so the final retry always lands at the cap.
+  config.max_retries      = 3        # attempts before dead letter
+  config.retry_backoff    = 5        # seconds; first-retry delay (base)
+  config.retry_max_backoff = 24*3600 # seconds; last-retry delay cap (24h)
 
   # ── Completion-event emission retries (inline; blocks the worker thread) ─
   config.event_emit_retries = 3
@@ -209,6 +213,8 @@ Requires these migrations:
 | `add_callback_tracking_to_kafka_batch_records` | `callback_dispatched_at` column for callback dispatch tracking (duplicate suppression + lost-callback reconciliation) |
 | `create_kafka_batch_consumer_offsets` | Per-partition monotonic completion cursor (one row per `source_topic, source_partition`) |
 | `add_locked_at_to_kafka_batch_records` | `locked_at` column for open/streaming batches (callbacks gated until lock) |
+| `create_kafka_batch_failures` | Always-on per-batch failure log (upserted per failing job from the first failed attempt; bounded by failures, not total jobs) |
+| `create_kafka_batch_consumer_heartbeats` | Consumer heartbeats for the `:store` live-activity backend (one row per consumer; only needed if `liveness_backend = :store`) |
 
 ```bash
 bundle exec rails db:migrate
@@ -222,13 +228,16 @@ No migrations needed. Batch state is stored as a Redis Hash at `kafka_batch:b:{b
 
 ### Karafka routing
 
-Wire up KafkaBatch routes inside your `karafka.rb`. Call `KafkaBatch.draw_routes` **after** all worker classes are loaded so the registry is fully populated:
+Wire up KafkaBatch routes inside your `karafka.rb`. Call `KafkaBatch.draw_routes(self)` from **inside** `routes.draw`, and make sure your worker classes are **loaded first** (reference them or eager-load) so the registry is populated:
 
 ```ruby
 class KarafkaApp < Karafka::App
   setup do |config|
     config.kafka = { "bootstrap.servers" => ENV["KAFKA_BROKERS"] }
     config.client_id = "my-app"
+    # Recommended: >1 so control-plane messages (events/callbacks) are worked
+    # in parallel with jobs and don't queue behind a long-running job.
+    config.concurrency = 5
   end
 
   routes.draw do
@@ -237,20 +246,22 @@ class KarafkaApp < Karafka::App
       consumer MyEventsConsumer
     end
 
-    # KafkaBatch: registers internal topics + one job route per worker
+    # Ensure worker classes are registered before drawing routes:
+    ProcessOrderWorker
+    # KafkaBatch: control-plane group + jobs group
     KafkaBatch.draw_routes(self)
   end
 end
 ```
 
-`draw_routes` registers four consumer groups:
+`draw_routes` registers **two consumer groups**, deliberately isolating the control plane from job execution so progress/callbacks aren't blocked behind long jobs:
 
-| Group | Topic(s) | Consumer |
+| Group | Topic(s) | Consumer(s) |
 |---|---|---|
-| `kafka-batch-jobs` | Each worker's `kafka_topic` | `JobConsumer` |
-| `kafka-batch-retry` | `kafka_batch.jobs.retry` | `RetryConsumer` |
-| `kafka-batch-events` | `kafka_batch.events` | `EventConsumer` |
-| `kafka-batch-callbacks` | `kafka_batch.callbacks` | `CallbackConsumer` |
+| `<consumer_group>-control` | `events`, `callbacks`, `jobs.retry` | `EventConsumer`, `CallbackConsumer`, `RetryConsumer` |
+| `<consumer_group>-jobs` | each worker's `kafka_topic` | `JobConsumer` |
+
+> **Tip:** keep `config.concurrency > 1` (and/or run a separate `karafka server` process for the control group) so the control plane is processed in parallel with jobs. With `concurrency = 1`, a long-running job can delay (not starve) event/callback processing.
 
 ---
 
@@ -476,7 +487,7 @@ When a job raises an exception, `JobConsumer` catches it and takes one of two pa
 
 **Retriable (attempt < max_retries):**
 The message is produced to `kafka_batch.jobs.retry` with two extra fields:
-- `retry_after` — ISO8601 timestamp of when to re-enqueue (now + `attempt × retry_backoff` seconds)
+- `retry_after` — ISO8601 timestamp of when to re-enqueue (exponential backoff; see below)
 - `retry_to` — the original worker topic to re-enqueue to
 
 The `JobConsumer` partition is immediately freed for the next message. No thread blocking occurs.
@@ -486,7 +497,7 @@ The `JobConsumer` partition is immediately freed for the next message. No thread
 **Exhausted (attempt == max_retries):**
 A `failed` event is emitted to the events topic (so the batch counter is updated) and the message is forwarded to the dead-letter topic.
 
-Backoff is linear: `sleep = attempt × retry_backoff`.
+Backoff is **exponential (geometric)**: delays grow from `retry_backoff` (the first retry) up to `retry_max_backoff` (the **last** retry, default **24h**). The growth ratio is derived from the worker's `max_retries` so the final retry always lands at the cap — e.g. `retry_backoff: 5`, `max_retries: 3`, cap 24h ⇒ retries at ~5s, ~11m, 24h. The **time until the next retry** is recorded on each retrying failure and shown in the dashboard's *Job failures* "Next retry" column (e.g. `in 23h 59m`).
 With `max_retries: 3, retry_backoff: 5` — delays are 5s, 10s, 15s.
 
 Override per worker:
@@ -582,7 +593,12 @@ What it shows:
 
 - **Summary metrics** — total batches and counts by status (running / success / complete / cancelled).
 - **Batch list** — newest first, with status badge, total / done / failed / **pending** counts, a progress bar, and status filters. Paginated.
-- **Batch detail** — all fields, callbacks, meta, and progress.
+- **Batch detail** — all fields, callbacks, meta, progress, and a **Job failures** list. Failures are recorded on the **first failed attempt** (status `retrying` while retries remain, `failed` once exhausted) so problems surface immediately rather than after hours of retries. Each row shows the worker, attempt #, error class/message, and time. Upserted per job and bounded by the number of failing jobs, so it's cheap even for huge batches.
+- **All failures** (`/failures`) — a cross-batch view of every failure in one place (linked from the dashboard), filterable by `retrying` / `failed`, each row linking back to its batch.
+- **Live activity** (`/live`) — currently-running jobs (job, batch, worker, which consumer process, topic/partition, start time) and the live consumer processes (host, PID, last-seen), auto-refreshing every 5s. It's **approximate** (very short-lived jobs may not appear between snapshots). Choose a backend with `config.liveness_backend`:
+  - **`:redis`** (default) — full per-job tracking in Redis (`config.redis_url`) with a short TTL (`config.liveness_ttl`, default 30s), best-effort behind a circuit breaker so it never slows jobs; crashed entries expire on their own. If Redis isn't reachable, the page says the feature is unavailable. (`config.track_running_jobs = false` disables the per-job writes.)
+  - **`:store`** — consumer **heartbeat + sampled current job** in the configured store (e.g. MySQL). Writes scale with the **number of consumers, not job throughput** (throttled to once per `config.liveness_heartbeat_interval`, default 5s), so it's reliable and low-impact — no per-job row churn. Staleness is handled by `last_seen` + a sweep in the reconciler. You see consumer count + what each is working on (sampled), rather than every individual in-flight job. Requires the `create_kafka_batch_consumer_heartbeats` migration on MySQL.
+  - **`:off`** — disabled.
 - **Actions** —
   - **Cancel** (running batches): sets status to `cancelled`; with `skip_cancelled_jobs` the remaining jobs stop processing (eventually-consistent — within `cancellation_cache_ttl`).
   - **Delete**: removes the batch record (best used for finished batches).

@@ -45,6 +45,36 @@ module KafkaBatchSpec
           t.datetime :updated_at
         end
         add_index :kafka_batch_consumer_offsets, %i[source_topic source_partition], unique: true
+
+        create_table :kafka_batch_failures, force: true do |t|
+          t.string   :batch_id,      null: false
+          t.string   :job_id,        null: false
+          t.string   :worker_class
+          t.string   :error_class
+          t.text     :error_message
+          t.integer  :attempt,       null: false, default: 0
+          t.string   :status,        null: false, default: "failed"
+          t.datetime :next_retry_at
+          t.datetime :failed_at,     null: false
+        end
+        add_index :kafka_batch_failures, %i[batch_id job_id], unique: true
+        add_index :kafka_batch_failures, :batch_id
+
+        create_table :kafka_batch_consumer_heartbeats, id: false, force: true do |t|
+          t.string   :consumer_id,      null: false
+          t.string   :hostname
+          t.integer  :pid
+          t.string   :topic
+          t.string   :current_job_id
+          t.string   :current_worker
+          t.string   :current_batch_id
+          t.string   :current_topic
+          t.integer  :current_partition
+          t.integer  :jobs_done,  null: false, default: 0
+          t.datetime :last_seen,  null: false
+        end
+        add_index :kafka_batch_consumer_heartbeats, :consumer_id, unique: true
+        add_index :kafka_batch_consumer_heartbeats, :last_seen
       end
     end
 
@@ -53,6 +83,8 @@ module KafkaBatchSpec
       conn = ActiveRecord::Base.connection
       conn.execute("DELETE FROM kafka_batch_records")
       conn.execute("DELETE FROM kafka_batch_consumer_offsets")
+      conn.execute("DELETE FROM kafka_batch_failures")
+      conn.execute("DELETE FROM kafka_batch_consumer_heartbeats")
     end
   end
 end

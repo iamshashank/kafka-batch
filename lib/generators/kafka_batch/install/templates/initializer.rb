@@ -27,9 +27,23 @@ KafkaBatch.configure do |config|
   config.skip_cancelled_jobs    = true
   config.cancellation_cache_ttl = 120  # seconds
 
+  # ── Live activity (running jobs / consumers dashboard) ───────────────────────
+  # Backend for the /live page:
+  #   :redis – (default) full per-job tracking in Redis (config.redis_url), TTL'd.
+  #   :store – consumer heartbeat + sampled current job in the configured store
+  #            (low-impact; needs the consumer_heartbeats migration on MySQL).
+  #   :off   – disabled.
+  config.liveness_backend = :redis
+  config.track_running_jobs = true   # gates the per-job :redis writes
+  config.liveness_ttl       = 30     # seconds (staleness window)
+  config.liveness_heartbeat_interval = 5  # seconds (:store write throttle)
+
   # ── Retry behaviour ────────────────────────────────────────────────────────
-  config.max_retries   = 3    # global default; override per Worker class
-  config.retry_backoff = 5    # seconds; linear: attempt * retry_backoff
+  # Exponential (geometric) backoff from retry_backoff (first retry) up to
+  # retry_max_backoff (last retry). Override max_retries/retry_backoff per Worker.
+  config.max_retries       = 3        # attempts before dead letter
+  config.retry_backoff     = 5        # seconds; first-retry delay (base)
+  config.retry_max_backoff = 24*3600  # seconds; last-retry delay cap (24h)
 
   # ── Completion-event emission retries ──────────────────────────────────────
   # Inline retries when producing the post-job completion event fails. The

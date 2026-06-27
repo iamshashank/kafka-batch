@@ -11,6 +11,7 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.retry_topic).to eq("kafka_batch.jobs.retry")
       expect(config.max_retries).to eq(3)
       expect(config.retry_backoff).to eq(5)
+      expect(config.retry_max_backoff).to eq(24 * 3600)
     end
 
     it "decouples the reconciler lock TTL from the staleness threshold" do
