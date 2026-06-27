@@ -173,12 +173,12 @@ KafkaBatch.configure do |config|
   config.cancellation_cache_ttl = 120  # seconds
 
   # ── Retry behaviour (global defaults; override per Worker class) ────
-  # Exponential (geometric) backoff: delays grow from retry_backoff (first retry)
-  # up to retry_max_backoff (the LAST retry). The ratio is derived from
-  # max_retries so the final retry always lands at the cap.
-  config.max_retries      = 3        # attempts before dead letter
-  config.retry_backoff    = 5        # seconds; first-retry delay (base)
-  config.retry_max_backoff = 24*3600 # seconds; last-retry delay cap (24h)
+  # Fixed, short retry schedule (Kafka-friendly): 1st retry after
+  # retry_first_delay, later retries after retry_delay, with +/- retry_jitter.
+  config.max_retries       = 3   # attempts before dead letter
+  config.retry_first_delay = 10  # seconds before the 1st retry
+  config.retry_delay       = 180 # seconds before each later retry (3 min)
+  config.retry_jitter      = 0.1 # +/- 10% randomization
 
   # ── Completion-event emission retries (inline; blocks the worker thread) ─
   config.event_emit_retries = 3
@@ -212,7 +212,7 @@ Requires these migrations:
 | `create_kafka_batch_records` | Batch state table with counters and status |
 | `add_callback_tracking_to_kafka_batch_records` | `callback_dispatched_at` column for callback dispatch tracking (duplicate suppression + lost-callback reconciliation) |
 | `create_kafka_batch_consumer_offsets` | Per-partition monotonic completion cursor (one row per `source_topic, source_partition`) |
-| `add_locked_at_to_kafka_batch_records` | `locked_at` column for open/streaming batches (callbacks gated until lock) |
+| `add_locked_at_to_kafka_batch_records` | `locked_at` column (the batch "sealed" marker that gates completion during block-form population) |
 | `create_kafka_batch_failures` | Always-on per-batch failure log (upserted per failing job from the first failed attempt; bounded by failures, not total jobs) |
 | `create_kafka_batch_consumer_heartbeats` | Consumer heartbeats for the `:store` live-activity backend (one row per consumer; only needed if `liveness_backend = :store`) |
 
@@ -304,7 +304,6 @@ class ProcessOrderWorker
 
   kafka_topic   "orders.process"   # required – Kafka topic to consume from
   max_retries   5                  # optional – overrides config.max_retries
-  retry_backoff 10                 # optional – overrides config.retry_backoff (seconds)
 
   # payload is the Hash passed to Batch#push or Batch.enqueue
   def perform(payload)
@@ -331,10 +330,12 @@ batch_id = KafkaBatch::Batch.create(
   end
 end
 
-puts batch_id  # => "550e8400-e29b-41d4-a716-446655440000"
+puts batch.id  # => "550e8400-e29b-41d4-a716-446655440000"
 ```
 
-Batches are **open**: each `push` atomically grows the batch's `total_jobs` and produces the job immediately. The block form above auto-calls `lock` when the block returns, so callbacks fire once everything finishes.
+There is **no lock step**. A batch stays **open** and accepts more jobs — from anywhere, including from jobs that belong to it — until it **completes** (all jobs done → callback fires) or is cancelled. The completion callback fires automatically the moment the batch drains (`completed + failed >= total_jobs`).
+
+The **block form is recommended** for one-shot population: the batch is held open for the duration of the block, so it cannot complete mid-population even if early jobs finish before later ones are pushed. When the block returns it is sealed and finalizes once everything is done.
 
 An optional explicit `job_id` can be passed for tracing:
 
@@ -342,36 +343,9 @@ An optional explicit `job_id` can be passed for tracing:
 b.push(ProcessOrderWorker, { order_id: 1 }, job_id: "order-1-#{Time.now.to_i}")
 ```
 
-### Open batches: add jobs over time, anywhere (and `lock`)
+### Adding jobs over time
 
-You don't have to push all jobs at creation. Skip the block to get an **open** batch you can add to incrementally — from the same process or a different one — and `lock` it when you're done. **Callbacks never fire until the batch is locked**, and pushing after `lock` raises `KafkaBatch::BatchLockedError`.
-
-```ruby
-# 1) Create an open batch and remember its id
-batch = KafkaBatch::Batch.create(on_complete: "BatchCompleteCallback")
-batch_id = batch.id            # persist / enqueue this somewhere
-
-# 2) Add jobs whenever/wherever — total_jobs grows with each push.
-#    Re-attach to the batch by id with Batch.open:
-KafkaBatch::Batch.open(batch_id).tap do |b|
-  users.each_slice(1_000) do |slice|
-    slice.each { |u| b.push(ProcessUserWorker, "user_id" => u.id) }
-  end
-end
-
-# 3) When everything has been pushed, lock it. From then on callbacks can fire
-#    and no more jobs may be added.
-KafkaBatch::Batch.open(batch_id).lock
-```
-
-**Push many at once** — grows `total_jobs` with a single store write, then produces each job:
-
-```ruby
-batch.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
-# => ["job-uuid-1", "job-uuid-2", ...]
-```
-
-**Add jobs from inside a running job** — a worker can fan out into its *own* batch without threading the id around, via `batch` (nil for standalone jobs). Keep the batch open until the fan-out is done, then `lock`:
+**Add jobs from inside a running job** (the main reason there's no lock) — a worker can fan out into its *own* batch via `batch` (nil for standalone jobs). This is always safe: a running job is itself a pending unit, so the batch can't drain while it runs, and its children are counted before its own completion is recorded.
 
 ```ruby
 class CrawlPageWorker
@@ -387,13 +361,26 @@ class CrawlPageWorker
 end
 ```
 
-- `Batch.create` **without a block** returns a `Batch` instance (open).
-- `Batch.open(id)` re-attaches to an existing batch so you can `push`/`push_many`/`lock` from anywhere (raises `BatchNotFoundError` if unknown).
+**Push many at once** — grows `total_jobs` with a single store write, then produces each job:
+
+```ruby
+batch.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
+# => ["job-uuid-1", "job-uuid-2", ...]
+```
+
+**Re-attach from another process** with `Batch.open(id)`:
+
+```ruby
+KafkaBatch::Batch.open(batch_id).push(ProcessUserWorker, "user_id" => 7)
+```
+
+- `Batch.create` **without a block** returns a `Batch` that is sealed immediately, so it completes as soon as it drains. If every pushed job can finish before you push more, prefer the block form — otherwise the callback may fire early and further pushes raise `KafkaBatch::BatchClosedError`.
+- `Batch.open(id)` re-attaches to an existing batch so you can `push`/`push_many` from anywhere (raises `BatchNotFoundError` if unknown).
 - `total_jobs` updates live as you push (visible in `Batch.find` and the [Web UI](#web-ui)).
-- While open, even if `completed + failed` reaches `total_jobs`, the batch will **not** complete — it waits for `lock` (which finalizes immediately if everything is already done).
+- Pushing into a **completed** or **cancelled** batch raises `KafkaBatch::BatchClosedError`.
 - If a `push` fails to produce, the job count is rolled back so the total stays accurate.
 
-> The reconciler skips open (never-locked) batches, so an in-progress open batch is never mistaken for a stuck one.
+> The reconciler skips held (block-form, not-yet-sealed) batches, so an in-progress population is never mistaken for a stuck one.
 
 ### Standalone jobs (no batch)
 
@@ -497,19 +484,13 @@ The `JobConsumer` partition is immediately freed for the next message. No thread
 **Exhausted (attempt == max_retries):**
 A `failed` event is emitted to the events topic (so the batch counter is updated) and the message is forwarded to the dead-letter topic.
 
-Backoff is **exponential (geometric)**: delays grow from `retry_backoff` (the first retry) up to `retry_max_backoff` (the **last** retry, default **24h**). The growth ratio is derived from the worker's `max_retries` so the final retry always lands at the cap — e.g. `retry_backoff: 5`, `max_retries: 3`, cap 24h ⇒ retries at ~5s, ~11m, 24h. The **time until the next retry** is recorded on each retrying failure and shown in the dashboard's *Job failures* "Next retry" column (e.g. `in 23h 59m`).
-With `max_retries: 3, retry_backoff: 5` — delays are 5s, 10s, 15s.
+Backoff is a **fixed, short schedule** (deliberately Kafka-friendly): the **1st** retry after `retry_first_delay` (default **10s**), and **every subsequent** retry after `retry_delay` (default **180s / 3 min**), each with `±retry_jitter` (default 10%) randomization to avoid synchronized retry storms. e.g. `max_retries: 4` ⇒ retries at ~10s, ~3m, ~6m, ~9m.
 
-Override per worker:
+Short delays keep the `RetryConsumer`'s `pause()` head-of-line wait negligible (≤ `retry_delay`), so no scheduler/re-queue machinery is needed. The **time until the next retry** is recorded on each retrying failure and shown in the dashboard's *Job failures* "Next retry" column (e.g. `in 2m 47s`).
 
-```ruby
-class CriticalWorker
-  include KafkaBatch::Worker
-  kafka_topic   "critical.jobs"
-  max_retries   10
-  retry_backoff 30   # 30s, 60s, 90s, ...
-end
-```
+> For long downstream outages this exhausts retries within ~`max_retries × retry_delay`; raise `max_retries` (cheap, since each retry is short) or replay from the DLT.
+
+Override attempts per worker with `max_retries`.
 
 **Event emission retries:** If `perform` succeeds but the subsequent produce to `kafka_batch.events` fails (transient Kafka issue), the gem retries emission up to `EVENT_EMIT_RETRIES` (3) times with a short backoff. If all retries fail, the offset is left uncommitted so Karafka redelivers the job message and `perform` runs again. This is why workers must be idempotent.
 
@@ -790,7 +771,7 @@ With a single `rescue`, a transient Kafka error on `emit_event` looks identical 
 
 ### Why a dedicated retry topic instead of `sleep`?
 
-A `sleep` inside `JobConsumer` blocks the entire Kafka partition for the duration. With `max_retries: 3, retry_backoff: 5`, a single exhausted job stalls its partition for 30 seconds. Under load, multiple failing jobs on the same partition compound this. The retry topic approach forwards the message immediately and suspends only the *retry partition* (via Karafka `pause()`) — the job partition is fully unblocked.
+A `sleep` inside `JobConsumer` blocks the entire Kafka partition for the backoff duration. The retry topic approach forwards the message immediately and suspends only the *retry partition* (via Karafka `pause()`) — the job partition is fully unblocked. Because the backoff schedule is short and bounded (`retry_delay`, default 3 min), the retry partition's head-of-line pause stays small.
 
 ### Why invoke the callback first, then claim?
 

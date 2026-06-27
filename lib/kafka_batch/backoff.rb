@@ -1,30 +1,25 @@
 module KafkaBatch
-  # Exponential (geometric) retry backoff.
+  # Fixed retry schedule (Kafka-friendly – short, bounded delays):
+  #   first retry  -> first_delay   (default 10s)
+  #   later retries -> interval      (default 180s / 3 min)
+  # plus optional +/- jitter to avoid synchronized retry storms.
   #
-  # Delays grow geometrically from +base+ (the first retry) up to +cap+ (the
-  # LAST retry), so the final retry lands at the cap (default 24h). The ratio is
-  # derived from the worker's max_retries so the schedule always ends at the cap
-  # regardless of how many retries are configured.
-  #
-  #   base=5s, max_retries=3, cap=24h  =>  ~5s, ~11m, 24h
+  # Short delays keep the RetryConsumer's pause() head-of-line wait negligible
+  # (<= interval), so no scheduler/re-queue machinery is needed.
   module Backoff
     module_function
 
-    # @param next_attempt [Integer] 1-based index of the upcoming retry (1..max_retries)
-    # @param max_retries  [Integer] total retries configured for the worker
-    # @param base         [Numeric] first-retry delay in seconds
-    # @param cap          [Numeric] last-retry delay in seconds (the maximum)
-    # @return [Float] delay in seconds before this retry
-    def delay(next_attempt:, max_retries:, base:, cap:)
-      base = base.to_f
-      cap  = cap.to_f
-      base = 1.0 if base <= 0
-      return cap if cap <= base          # misconfig / degenerate – just use the cap
-      return cap if max_retries.to_i <= 1
+    # @param next_attempt [Integer] 1-based index of the upcoming retry
+    # @param first_delay  [Numeric] seconds before the 1st retry
+    # @param interval     [Numeric] seconds before every subsequent retry
+    # @param jitter       [Float]   fraction (0..1) of +/- randomization
+    # @return [Float] delay in seconds
+    def delay(next_attempt:, first_delay:, interval:, jitter: 0.0)
+      base = (next_attempt.to_i <= 1 ? first_delay : interval).to_f
+      j    = jitter.to_f
+      return base if j <= 0
 
-      ratio = (cap / base)**(1.0 / (max_retries - 1))
-      delay = base * (ratio**(next_attempt - 1))
-      [delay, cap].min
+      base * (1 + ((rand * 2) - 1) * j)  # base * (1 ± jitter)
     end
   end
 end

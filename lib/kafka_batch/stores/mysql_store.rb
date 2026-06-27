@@ -43,7 +43,7 @@ module KafkaBatch
 
       # ── Public interface ──────────────────────────────────────────────────
 
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, locked: true)
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, sealed: true)
         batch_record_class.create!(
           id:               id,
           total_jobs:       total_jobs,
@@ -53,7 +53,7 @@ module KafkaBatch
           on_success:       on_success,
           on_complete:      on_complete,
           meta:             serialize(meta),
-          locked_at:        locked ? Time.now : nil
+          locked_at:        sealed ? Time.now : nil  # locked_at == "sealed_at"
         )
       rescue ActiveRecord::RecordNotUnique
         nil  # idempotent – already created
@@ -67,8 +67,10 @@ module KafkaBatch
             result = :not_found
           elsif record.status == "cancelled"
             result = :cancelled
-          elsif record.locked_at
-            result = :locked
+          elsif %w[success complete].include?(record.status) || record.callback_dispatched_at
+            # Completed/closed – cannot accept more jobs. An open batch (even one
+            # that is sealed and currently running jobs) always accepts more.
+            result = :closed
           else
             batch_record_class.where(id: id).update_all("total_jobs = total_jobs + #{count.to_i}")
             result = :ok
@@ -77,7 +79,7 @@ module KafkaBatch
         result
       end
 
-      def lock_batch(id)
+      def seal_batch(id)
         result = nil
         batch_record_class.transaction do
           record = batch_record_class.lock.find_by(id: id)
@@ -92,7 +94,7 @@ module KafkaBatch
               record.update!(status: outcome, finished_at: Time.now)
               result = { status: :done, outcome: outcome, batch: record_to_hash(record) }
             else
-              result = { status: :locked }
+              result = { status: :sealed }
             end
           end
         end
@@ -184,6 +186,10 @@ module KafkaBatch
         end
       rescue ActiveRecord::RecordNotUnique
         retry  # lost a create race – the row now exists, update it
+      end
+
+      def clear_failure(batch_id, job_id)
+        failure_class.where(batch_id: batch_id, job_id: job_id).delete_all
       end
 
       def list_failures(batch_id, limit: 100, offset: 0)
@@ -330,8 +336,9 @@ module KafkaBatch
         batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
         record.reload
 
-        # Only finalize (and fire callbacks) once the batch is locked – an open
-        # batch may still receive more jobs even if currently at its total.
+        # Only finalize (and fire callbacks) once the batch is sealed – a held
+        # (block-form, not-yet-sealed) batch may still receive more jobs even if
+        # currently at its total. locked_at doubles as the "sealed_at" marker.
         if record.locked_at && record.completed_count + record.failed_count >= record.total_jobs
           outcome = record.failed_count.positive? ? "complete" : "success"
           record.update!(status: outcome, finished_at: Time.now)

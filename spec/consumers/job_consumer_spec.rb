@@ -10,8 +10,7 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
         "worker_class"  => worker.name,
         "payload"       => { "x" => 1 },
         "attempt"       => attempt,
-        "max_retries"   => max_retries || worker.max_retries,
-        "retry_backoff" => worker.retry_backoff
+        "max_retries"   => max_retries || worker.max_retries
       }
     )
   end
@@ -57,10 +56,12 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       expect(f[:next_retry_at]).not_to be_nil  # exponential backoff schedule
     end
 
-    it "schedules the retry with an exponential (geometric) delay in the future" do
+    it "schedules the first retry ~retry_first_delay in the future" do
       consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 0, job_id: "jr2"))
       msg = FakeProducer.for_topic(KafkaBatch.config.retry_topic).first
-      expect(Time.parse(msg.payload["retry_after"])).to be > Time.now
+      retry_after = Time.parse(msg.payload["retry_after"])
+      expect(retry_after).to be > Time.now
+      expect(retry_after).to be < Time.now + 60  # ~10s, not hours
     end
   end
 
@@ -125,6 +126,21 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
 
       consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: id))
       expect(KafkaBatchSpec::WorkerRuns.runs.size).to eq(1)
+    end
+  end
+
+  describe "clearing failures on a successful retry" do
+    it "removes a prior 'retrying' failure record once the job succeeds" do
+      KafkaBatch.store.record_failure(
+        batch_id: "b1", job_id: "jx", worker_class: "SuccessfulWorker",
+        error_class: "RuntimeError", error_message: "transient", attempt: 0, status: "retrying"
+      )
+      expect(KafkaBatch.store.list_failures("b1").size).to eq(1)
+
+      # re-run (attempt 1) succeeds → failure record should be cleared
+      consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: "b1", attempt: 1, job_id: "jx"))
+
+      expect(KafkaBatch.store.list_failures("b1")).to be_empty
     end
   end
 

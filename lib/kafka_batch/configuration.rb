@@ -47,11 +47,13 @@ module KafkaBatch
     attr_accessor :liveness_heartbeat_interval # Integer – seconds; default 5 (:store write throttle)
 
     # ── Retry behaviour ──────────────────────────────────────────────────────
-    # Retries use exponential (geometric) backoff: delays grow from retry_backoff
-    # (first retry) up to retry_max_backoff (the LAST retry, default 24h).
-    attr_accessor :max_retries        # Integer – default per worker (worker can override)
-    attr_accessor :retry_backoff      # Integer – seconds; first-retry delay (base)
-    attr_accessor :retry_max_backoff  # Integer – seconds; last-retry delay cap (default 24h)
+    # Fixed, short retry schedule (Kafka-friendly): the 1st retry after
+    # retry_first_delay, every subsequent retry after retry_delay, with optional
+    # +/- retry_jitter to avoid synchronized retry storms.
+    attr_accessor :max_retries        # Integer – attempts before dead letter (worker can override)
+    attr_accessor :retry_first_delay  # Integer – seconds before the 1st retry (default 10)
+    attr_accessor :retry_delay        # Integer – seconds before each later retry (default 180)
+    attr_accessor :retry_jitter       # Float   – +/- fraction of randomization (default 0.1)
 
     # ── Completion-event emission retries ────────────────────────────────────
     # After a job succeeds, the consumer produces a completion event. If that
@@ -110,8 +112,9 @@ module KafkaBatch
       @retry_topic              = "kafka_batch.jobs.retry"
       @consumer_group           = "kafka-batch"
       @max_retries              = 3
-      @retry_backoff            = 5
-      @retry_max_backoff        = 24 * 3600  # 24 hours
+      @retry_first_delay        = 10   # seconds
+      @retry_delay              = 180  # seconds (3 minutes)
+      @retry_jitter             = 0.1  # +/- 10%
       @event_emit_retries       = 3
       @event_emit_backoff       = 2
       @redis_url                = "redis://localhost:6379/0"

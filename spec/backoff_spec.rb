@@ -1,32 +1,19 @@
 RSpec.describe KafkaBatch::Backoff do
-  it "starts at base and ends at the cap (last retry lands at 24h)" do
-    base = 5
-    cap  = 24 * 3600
-    max  = 4
-
-    first = described_class.delay(next_attempt: 1,   max_retries: max, base: base, cap: cap)
-    last  = described_class.delay(next_attempt: max, max_retries: max, base: base, cap: cap)
-
-    expect(first).to be_within(0.001).of(5)
-    expect(last).to be_within(0.001).of(cap)
+  it "uses first_delay for the first retry and interval thereafter (no jitter)" do
+    expect(described_class.delay(next_attempt: 1, first_delay: 10, interval: 180, jitter: 0)).to eq(10.0)
+    expect(described_class.delay(next_attempt: 2, first_delay: 10, interval: 180, jitter: 0)).to eq(180.0)
+    expect(described_class.delay(next_attempt: 5, first_delay: 10, interval: 180, jitter: 0)).to eq(180.0)
   end
 
-  it "grows monotonically and stays within [base, cap]" do
-    delays = (1..5).map do |n|
-      described_class.delay(next_attempt: n, max_retries: 5, base: 10, cap: 24 * 3600)
+  it "applies +/- jitter within bounds" do
+    50.times do
+      d = described_class.delay(next_attempt: 2, first_delay: 10, interval: 180, jitter: 0.1)
+      expect(d).to be_between(180 * 0.9, 180 * 1.1)
     end
-
-    expect(delays).to eq(delays.sort)            # increasing
-    expect(delays.first).to be_within(0.001).of(10)
-    expect(delays.last).to be_within(0.001).of(24 * 3600)
-    expect(delays).to all(be <= 24 * 3600)
   end
 
-  it "never exceeds the cap, even past the last attempt" do
-    expect(described_class.delay(next_attempt: 99, max_retries: 3, base: 5, cap: 24 * 3600)).to be <= 24 * 3600
-  end
-
-  it "uses the cap for a single-retry worker" do
-    expect(described_class.delay(next_attempt: 1, max_retries: 1, base: 5, cap: 24 * 3600)).to eq((24 * 3600).to_f)
+  it "treats zero/negative jitter as exact" do
+    expect(described_class.delay(next_attempt: 2, first_delay: 10, interval: 180, jitter: 0)).to eq(180.0)
+    expect(described_class.delay(next_attempt: 1, first_delay: 7, interval: 180, jitter: 0)).to eq(7.0)
   end
 end

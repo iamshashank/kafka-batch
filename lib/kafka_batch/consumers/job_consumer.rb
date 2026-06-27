@@ -79,7 +79,6 @@ module KafkaBatch
 
         attempt       = data["attempt"].to_i
         max_retries   = data.fetch("max_retries",   KafkaBatch.config.max_retries).to_i
-        backoff       = data.fetch("retry_backoff",  KafkaBatch.config.retry_backoff).to_i
 
         KafkaBatch.logger.debug(
           "[KafkaBatch][JobConsumer] #{worker_class}#perform " \
@@ -124,11 +123,14 @@ module KafkaBatch
               batch_id:     batch_id,
               worker_class: worker_class,
               attempt:      attempt,
-              max_retries:  max_retries,
-              backoff:      backoff
+              max_retries:  max_retries
             )
             return  # offset committed inside handle_failure
           end
+
+          # Succeeded (possibly on a retry): drop any prior "retrying" failure
+          # record so it no longer shows as retrying in the dashboard.
+          clear_failure(batch_id, job_id) if batch_id && attempt.positive?
 
           # ── Step 2: emit completion event ──────────────────────────────
           # Separate rescue: a Kafka error here must NOT be treated as a job
@@ -160,7 +162,7 @@ module KafkaBatch
       # ── Failure handling ─────────────────────────────────────────────────
 
       def handle_failure(message:, data:, error:, job_id:, batch_id:,
-                         worker_class:, attempt:, max_retries:, backoff:)
+                         worker_class:, attempt:, max_retries:)
         KafkaBatch.logger.error(
           "[KafkaBatch][JobConsumer] job_id=#{job_id} attempt=#{attempt} " \
           "#{error.class}: #{error.message}"
@@ -169,8 +171,10 @@ module KafkaBatch
         if attempt < max_retries
           next_attempt = attempt + 1
           delay        = KafkaBatch::Backoff.delay(
-            next_attempt: next_attempt, max_retries: max_retries,
-            base: backoff, cap: KafkaBatch.config.retry_max_backoff
+            next_attempt: next_attempt,
+            first_delay:  KafkaBatch.config.retry_first_delay,
+            interval:     KafkaBatch.config.retry_delay,
+            jitter:       KafkaBatch.config.retry_jitter
           )
           retry_after  = Time.now + delay
 
@@ -359,6 +363,15 @@ module KafkaBatch
       rescue StandardError => e
         KafkaBatch.logger.warn(
           "[KafkaBatch][JobConsumer] failed to record failure for job_id=#{job_id}: #{e.message}"
+        )
+      end
+
+      # Drop a prior failure record after a successful (re)run. Best-effort.
+      def clear_failure(batch_id, job_id)
+        KafkaBatch.store.clear_failure(batch_id, job_id)
+      rescue StandardError => e
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][JobConsumer] failed to clear failure for job_id=#{job_id}: #{e.message}"
         )
       end
 

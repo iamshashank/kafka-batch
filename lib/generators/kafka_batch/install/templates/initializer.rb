@@ -39,11 +39,12 @@ KafkaBatch.configure do |config|
   config.liveness_heartbeat_interval = 5  # seconds (:store write throttle)
 
   # ── Retry behaviour ────────────────────────────────────────────────────────
-  # Exponential (geometric) backoff from retry_backoff (first retry) up to
-  # retry_max_backoff (last retry). Override max_retries/retry_backoff per Worker.
-  config.max_retries       = 3        # attempts before dead letter
-  config.retry_backoff     = 5        # seconds; first-retry delay (base)
-  config.retry_max_backoff = 24*3600  # seconds; last-retry delay cap (24h)
+  # Fixed, short schedule (Kafka-friendly): 1st retry after retry_first_delay,
+  # every later retry after retry_delay, with +/- retry_jitter randomization.
+  config.max_retries      = 3    # attempts before dead letter (override per Worker)
+  config.retry_first_delay = 10  # seconds before the 1st retry
+  config.retry_delay       = 180 # seconds before each later retry (3 min)
+  config.retry_jitter      = 0.1 # +/- 10% to avoid retry storms
 
   # ── Completion-event emission retries ──────────────────────────────────────
   # Inline retries when producing the post-job completion event fails. The

@@ -7,8 +7,7 @@ module KafkaBatch
   #     include KafkaBatch::Worker
   #
   #     kafka_topic "orders.process"
-  #     max_retries 5
-  #     retry_backoff 10   # seconds (optional, overrides global default)
+  #     max_retries 5      # optional, overrides global default
   #
   #     def perform(payload)
   #       Order.find(payload["order_id"]).process!
@@ -40,16 +39,6 @@ module KafkaBatch
           @max_retries = n.to_i
         else
           @max_retries || KafkaBatch.config.max_retries
-        end
-      end
-
-      # Per-retry backoff in seconds.
-      # Defaults to KafkaBatch.config.retry_backoff.
-      def retry_backoff(n = nil)
-        if n
-          @retry_backoff = n.to_i
-        else
-          @retry_backoff || KafkaBatch.config.retry_backoff
         end
       end
     end

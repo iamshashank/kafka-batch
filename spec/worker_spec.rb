@@ -4,16 +4,13 @@ RSpec.describe KafkaBatch::Worker do
       expect(SuccessfulWorker.kafka_topic).to eq("test.success")
     end
 
-    it "supports per-worker retry overrides" do
+    it "supports a per-worker max_retries override" do
       expect(FailingWorker.max_retries).to eq(2)
-      expect(FailingWorker.retry_backoff).to eq(7)
     end
 
-    it "falls back to the global defaults when not overridden" do
-      KafkaBatch.config.max_retries   = 9
-      KafkaBatch.config.retry_backoff = 11
+    it "falls back to the global max_retries default when not overridden" do
+      KafkaBatch.config.max_retries = 9
       expect(SuccessfulWorker.max_retries).to eq(9)
-      expect(SuccessfulWorker.retry_backoff).to eq(11)
     end
 
     it "raises if the topic was never set" do

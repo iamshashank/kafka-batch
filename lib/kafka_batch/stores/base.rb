@@ -5,27 +5,30 @@ module KafkaBatch
     # multiple processes / threads.
     class Base
       # Create a new batch record.
-      # @param locked [Boolean] when false the batch is "open" – it accepts more
-      #   jobs (via #add_jobs) and will NOT finalize/fire callbacks until #lock_batch
-      #   is called. When true (default) the batch behaves as a fixed-size batch
-      #   that finalizes as soon as completed+failed reaches total_jobs.
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, locked: true)
+      # @param sealed [Boolean] when true (default) the completion gate is open
+      #   immediately, so the batch finalizes as soon as completed+failed reaches
+      #   total_jobs. When false the batch is "held" – it accepts jobs but will
+      #   NOT finalize until #seal_batch is called (used by the block form to
+      #   bracket initial population). Either way an open batch always accepts
+      #   more jobs until it completes or is cancelled.
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, sealed: true)
         raise NotImplementedError, "#{self.class}#create_batch"
       end
 
-      # Atomically grow an open batch's total_jobs by +count+.
-      # @return [Symbol] :ok | :locked | :cancelled | :not_found
+      # Atomically grow a batch's total_jobs by +count+. Only completed or
+      # cancelled batches reject the push.
+      # @return [Symbol] :ok | :closed | :cancelled | :not_found
       def add_jobs(id, count)
         raise NotImplementedError, "#{self.class}#add_jobs"
       end
 
-      # Lock an open batch so no more jobs may be added, then evaluate completion.
+      # Seal a held batch (open its completion gate), then evaluate completion.
       # @return [Hash]
       #   { status: :done, outcome: "success"|"complete", batch: <hash> } – just finalized
-      #   { status: :locked }     – locked, still has outstanding jobs
+      #   { status: :sealed }     – sealed, still has outstanding jobs
       #   { status: :not_found }
-      def lock_batch(id)
-        raise NotImplementedError, "#{self.class}#lock_batch"
+      def seal_batch(id)
+        raise NotImplementedError, "#{self.class}#seal_batch"
       end
 
       # Fetch a batch by id.
@@ -91,6 +94,12 @@ module KafkaBatch
       # per (batch_id, job_id); bounded by the number of failing jobs.
       def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
         raise NotImplementedError, "#{self.class}#record_failure"
+      end
+
+      # Remove a recorded failure for a job (called when a retry finally
+      # succeeds, so it no longer shows as "retrying"). No-op if none exists.
+      def clear_failure(batch_id, job_id)
+        raise NotImplementedError, "#{self.class}#clear_failure"
       end
 
       # List recorded failures for a batch, newest-first.

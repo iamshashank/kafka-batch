@@ -5,31 +5,33 @@ require "time"
 module KafkaBatch
   # Entry point for creating and enqueueing batches of jobs.
   #
-  # Batches are OPEN by default: you may push jobs into them at any time and from
-  # anywhere (even in a different process after Batch.find/open). Each push
-  # atomically grows the batch's total_jobs and produces the job immediately.
-  # Completion callbacks DO NOT fire until you call #lock, after which no further
-  # jobs may be pushed (push raises BatchLockedError).
+  # There is NO explicit lock step. A batch stays OPEN and accepts more jobs –
+  # from anywhere, including from jobs that belong to the batch – until it
+  # COMPLETES (all jobs done → on_complete fires) or is cancelled. Pushing into a
+  # completed or cancelled batch raises BatchClosedError.
   #
-  # Incremental usage (push 1000 at a time, across processes):
+  # The completion callback fires automatically the moment the batch drains
+  # (completed + failed >= total_jobs). This is safe for the common patterns:
   #
-  #   batch = KafkaBatch::Batch.create(on_complete: "MyCallback")
-  #   batch.id  # => persist/pass this around
+  # 1) Block form (recommended) – the batch can't complete mid-population because
+  #    it is held open until the block returns:
   #
-  #   # ...later / elsewhere...
-  #   batch = KafkaBatch::Batch.open(batch_id)
-  #   users.each_slice(1000) do |slice|
-  #     slice.each { |u| batch.push(ProcessUserWorker, "user_id" => u.id) }
-  #   end
+  #      KafkaBatch::Batch.create(on_complete: "MyCallback") do |b|
+  #        User.find_each { |u| b.push(ProcessUserWorker, "user_id" => u.id) }
+  #      end
   #
-  #   # when everything has been pushed:
-  #   KafkaBatch::Batch.open(batch_id).lock
+  # 2) Jobs adding jobs – a running job is itself a pending unit, so the batch
+  #    cannot drain while it runs. It may push children into its own batch and
+  #    they are counted before the parent's completion is recorded:
   #
-  # Convenience block form (auto-locks when the block returns):
+  #      def perform(payload)
+  #        batch.push(ChildWorker, ...) if more_work?   # batch == this job's batch
+  #      end
   #
-  #   KafkaBatch::Batch.create(on_complete: "MyCallback") do |b|
-  #     User.find_each { |u| b.push(ProcessUserWorker, "user_id" => u.id) }
-  #   end
+  # Bare create without a block returns the Batch so you can push incrementally,
+  # but note it can complete as soon as it drains – if every pushed job finishes
+  # before you push more, the callback fires and further pushes raise
+  # BatchClosedError. Prefer the block form for one-shot population.
   #
   # Standalone jobs (no batch context):
   #
@@ -45,10 +47,14 @@ module KafkaBatch
       @meta        = meta
     end
 
-    # Create a new OPEN batch (persisted immediately with total_jobs = 0).
-    # Without a block: returns the Batch instance for incremental pushing.
-    # With a block: yields the batch, then locks it, and returns the batch id
-    # (backwards-compatible convenience form).
+    # Create a new batch (persisted immediately with total_jobs = 0).
+    #
+    # With a block (recommended): the batch is held open for the duration of the
+    # block so it cannot complete mid-population; when the block returns the
+    # batch is sealed and finalizes if already drained. Returns the Batch.
+    #
+    # Without a block: the batch is sealed immediately and will complete as soon
+    # as it drains. Returns the Batch for incremental pushing.
     def self.create(on_success: nil, on_complete: nil, meta: {})
       batch = new(on_success: on_success, on_complete: on_complete, meta: meta)
       KafkaBatch.store.create_batch(
@@ -57,21 +63,21 @@ module KafkaBatch
         on_success:  on_success,
         on_complete: on_complete,
         meta:        meta,
-        locked:      false
+        # Block form: hold the completion gate shut until population finishes.
+        sealed:      !block_given?
       )
 
       if block_given?
         yield batch
-        batch.lock
-        batch.id
-      else
-        batch
+        batch.send(:seal!)  # population done – open the completion gate
       end
+
+      batch
     end
 
-    # Re-attach to an existing batch (e.g. in another process) so you can push
-    # more jobs or lock it. Raises BatchNotFoundError if it doesn't exist.
-    # @return [Batch]
+    # Re-attach to an existing (open) batch, e.g. in another process or from a
+    # running job, so you can push more jobs. Raises BatchNotFoundError if it
+    # doesn't exist. @return [Batch]
     def self.open(id)
       data = KafkaBatch.store.find_batch(id)
       raise BatchNotFoundError, "Batch #{id} not found" unless data
@@ -85,8 +91,8 @@ module KafkaBatch
     end
 
     # Push a job into this (open) batch: atomically grows total_jobs and produces
-    # the job. Raises BatchLockedError if the batch is already locked/cancelled.
-    # @return [String] job_id
+    # the job. Raises BatchClosedError if the batch has completed or been
+    # cancelled. @return [String] job_id
     def push(worker_class, payload = {}, job_id: SecureRandom.uuid)
       validate_worker!(worker_class)
       reserve!(1)
@@ -103,7 +109,7 @@ module KafkaBatch
 
     # Push many jobs (same worker class) into this open batch in one call.
     # total_jobs is grown by payloads.size with a single atomic store write, then
-    # each job is produced. Raises BatchLockedError if locked/cancelled.
+    # each job is produced. Raises BatchClosedError if completed/cancelled.
     #
     #   batch.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
     #
@@ -133,20 +139,6 @@ module KafkaBatch
       end
 
       job_ids
-    end
-
-    # Lock the batch: no further jobs may be pushed. If all pushed jobs have
-    # already finished, the batch finalizes now and its callback is dispatched.
-    # @return [self]
-    def lock
-      result = KafkaBatch.store.lock_batch(@id)
-      case result[:status]
-      when :not_found
-        raise BatchNotFoundError, "Batch #{@id} not found"
-      when :done
-        produce_callback(result[:batch], result[:outcome])
-      end
-      self
     end
 
     # Look up an existing batch by id. @return [Hash, nil]
@@ -192,7 +184,6 @@ module KafkaBatch
         "payload"       => payload,
         "attempt"       => attempt,
         "max_retries"   => worker_class.max_retries,
-        "retry_backoff" => worker_class.retry_backoff,
         "enqueued_at"   => Time.now.iso8601
       }
     end
@@ -207,13 +198,27 @@ module KafkaBatch
     # Atomically grow total_jobs by +count+, raising if the batch can't accept jobs.
     def reserve!(count)
       case KafkaBatch.store.add_jobs(@id, count)
-      when :locked
-        raise BatchLockedError, "Batch #{@id} is locked – no new jobs may be pushed"
+      when :closed
+        raise BatchClosedError, "Batch #{@id} has already completed – no new jobs may be pushed"
       when :cancelled
-        raise BatchLockedError, "Batch #{@id} is cancelled – no new jobs may be pushed"
+        raise BatchClosedError, "Batch #{@id} is cancelled – no new jobs may be pushed"
       when :not_found
         raise BatchNotFoundError, "Batch #{@id} not found"
       end
+    end
+
+    # Open the completion gate after block-form population finishes. If the batch
+    # already drained while the block ran, this finalizes it and fires the
+    # callback now. Internal – there is no public lock step.
+    def seal!
+      result = KafkaBatch.store.seal_batch(@id)
+      case result[:status]
+      when :not_found
+        raise BatchNotFoundError, "Batch #{@id} not found"
+      when :done
+        produce_callback(result[:batch], result[:outcome])
+      end
+      self
     end
 
     def produce_job(worker_class, payload, job_id)

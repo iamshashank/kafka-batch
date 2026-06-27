@@ -29,7 +29,6 @@ class FailingWorker
   include KafkaBatch::Worker
   kafka_topic "test.fail"
   max_retries 2
-  retry_backoff 7
 
   def perform(_payload)
     raise "always fails"

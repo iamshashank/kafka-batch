@@ -63,10 +63,11 @@ module KafkaBatch
         local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
         local completed = tonumber(redis.call('HGET', KEYS[1], 'completed_count')) or 0
         local failed    = tonumber(redis.call('HGET', KEYS[1], 'failed_count'))    or 0
-        local locked    = redis.call('HGET', KEYS[1], 'locked_at')
+        local sealed    = redis.call('HGET', KEYS[1], 'locked_at')
 
-        -- Only finalize once the batch is locked; an open batch may still grow.
-        if (completed + failed) >= total and locked and locked ~= '' then
+        -- Only finalize once the batch is sealed (block-form population finished,
+        -- or created bare). A still-held batch may keep growing, so don't fire.
+        if (completed + failed) >= total and sealed and sealed ~= '' then
           local outcome = (failed > 0) and 'complete' or 'success'
           redis.call('HSET', KEYS[1], 'status',      outcome)
           redis.call('HSET', KEYS[1], 'finished_at', ARGV[5])
@@ -107,27 +108,29 @@ module KafkaBatch
         return 1
       LUA
 
-      # Grow an open batch's total_jobs. Returns:
-      #   0 not_found | 1 ok | 2 cancelled | 3 locked
+      # Grow an open batch's total_jobs. An open batch accepts jobs regardless of
+      # whether it is sealed – only completed/cancelled batches are closed.
+      # Returns: 0 not_found | 1 ok | 2 cancelled | 3 closed (finalized)
       ADD_JOBS_LUA = <<~LUA.freeze
         if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
         local status = redis.call('HGET', KEYS[1], 'status')
         if status == 'cancelled' then return 2 end
-        local locked = redis.call('HGET', KEYS[1], 'locked_at')
-        if locked and locked ~= '' then return 3 end
+        if status == 'success' or status == 'complete' then return 3 end
+        local dispatched = redis.call('HGET', KEYS[1], 'callback_dispatched_at')
+        if dispatched and dispatched ~= '' then return 3 end
         redis.call('HINCRBY', KEYS[1], 'total_jobs', tonumber(ARGV[1]))
         redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
         return 1
       LUA
 
-      # Lock a batch and finalize if already complete.
+      # Seal a batch (open its completion gate) and finalize if already drained.
       #   ARGV[1] = now (iso8601), ARGV[2] = ttl
-      # Returns [0,'not_found'] | [1,outcome] (just finalized) | [2,'locked']
-      LOCK_BATCH_LUA = <<~LUA.freeze
+      # Returns [0,'not_found'] | [1,outcome] (just finalized) | [2,'sealed']
+      SEAL_BATCH_LUA = <<~LUA.freeze
         if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
         local status = redis.call('HGET', KEYS[1], 'status')
-        local locked = redis.call('HGET', KEYS[1], 'locked_at')
-        if not locked or locked == '' then
+        local sealed = redis.call('HGET', KEYS[1], 'locked_at')
+        if not sealed or sealed == '' then
           redis.call('HSET', KEYS[1], 'locked_at', ARGV[1])
         end
         redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
@@ -143,7 +146,7 @@ module KafkaBatch
             return {1, outcome}
           end
         end
-        return {2, 'locked'}
+        return {2, 'sealed'}
       LUA
 
       # Distributed reconciler lock via SET NX EX.
@@ -170,7 +173,7 @@ module KafkaBatch
 
       # ── Public interface ──────────────────────────────────────────────────
 
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, locked: true)
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, sealed: true)
         key = batch_key(id)
         now = Time.now
         with_redis do |r|
@@ -184,7 +187,7 @@ module KafkaBatch
               serialize(meta),
               now.iso8601,
               @ttl.to_s,
-              locked ? now.iso8601 : ""
+              sealed ? now.iso8601 : ""
             ]
           )
           # Returns 1 if created, 0 if already existed (idempotent).
@@ -239,14 +242,14 @@ module KafkaBatch
         when 0 then :not_found
         when 1 then :ok
         when 2 then :cancelled
-        when 3 then :locked
+        when 3 then :closed
         end
       end
 
-      def lock_batch(id)
+      def seal_batch(id)
         now = Time.now.iso8601
         result = with_redis do |r|
-          r.eval(LOCK_BATCH_LUA, keys: [batch_key(id)], argv: [now, @ttl.to_s])
+          r.eval(SEAL_BATCH_LUA, keys: [batch_key(id)], argv: [now, @ttl.to_s])
         end
         code, payload = result
         case code
@@ -257,7 +260,7 @@ module KafkaBatch
             r.zadd(DONE_INDEX, Time.now.to_f, id)
           end
           { status: :done, outcome: payload, batch: find_batch(id) }
-        when 2 then { status: :locked }
+        when 2 then { status: :sealed }
         end
       end
 
@@ -315,6 +318,10 @@ module KafkaBatch
           r.hset(failures_key(batch_id), job_id, entry)  # upsert per job_id
           r.expire(failures_key(batch_id), @ttl)
         end
+      end
+
+      def clear_failure(batch_id, job_id)
+        with_redis { |r| r.hdel(failures_key(batch_id), job_id) }
       end
 
       def list_failures(batch_id, limit: 100, offset: 0)

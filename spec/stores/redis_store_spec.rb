@@ -31,32 +31,41 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     end
   end
 
-  describe "open batches (add_jobs / lock_batch)" do
-    it "add_jobs grows total_jobs while open and is gated once locked" do
+  describe "open batches (add_jobs / seal_batch)" do
+    it "add_jobs grows total_jobs while held (block-form) and does not finalize" do
       id = SecureRandom.uuid
-      store.create_batch(id: id, total_jobs: 0, locked: false)
+      store.create_batch(id: id, total_jobs: 0, sealed: false)
       expect(store.add_jobs(id, 4)).to eq(:ok)
       expect(store.find_batch(id)[:total_jobs]).to eq(4)
       expect(store.find_batch(id)[:locked_at]).to be_nil
     end
 
-    it "does not finalize an open batch even when complete, then finalizes on lock" do
+    it "does not finalize a held batch even when complete, then finalizes on seal" do
       id = SecureRandom.uuid
-      store.create_batch(id: id, total_jobs: 1, locked: false)
+      store.create_batch(id: id, total_jobs: 1, sealed: false)
       r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
       expect(r[:status]).to eq(:continue)
       expect(store.find_batch(id)[:status]).to eq("running")
 
-      res = store.lock_batch(id)
+      res = store.seal_batch(id)
       expect(res[:status]).to eq(:done)
       expect(res[:outcome]).to eq("success")
-      expect(store.add_jobs(id, 1)).to eq(:locked)
+      expect(store.add_jobs(id, 1)).to eq(:closed)  # completed → no more jobs
+    end
+
+    it "a sealed but still-running batch keeps accepting jobs (jobs adding jobs)" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 1, sealed: true)  # bare create
+      expect(store.find_batch(id)[:locked_at]).not_to be_nil
+      # one job still outstanding → batch open → can add more
+      expect(store.add_jobs(id, 2)).to eq(:ok)
+      expect(store.find_batch(id)[:total_jobs]).to eq(3)
     end
 
     it "add_jobs reports :not_found and :cancelled" do
       expect(store.add_jobs(SecureRandom.uuid, 1)).to eq(:not_found)
       id = SecureRandom.uuid
-      store.create_batch(id: id, total_jobs: 0, locked: false)
+      store.create_batch(id: id, total_jobs: 0, sealed: false)
       store.update_batch_status(id, "cancelled")
       expect(store.add_jobs(id, 1)).to eq(:cancelled)
     end
@@ -190,6 +199,13 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
       id = new_batch
       store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x")
       store.delete_batch(id)
+      expect(store.list_failures(id)).to be_empty
+    end
+
+    it "#clear_failure removes a single job's failure" do
+      id = new_batch
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x", status: "retrying")
+      store.clear_failure(id, "j1")
       expect(store.list_failures(id)).to be_empty
     end
 

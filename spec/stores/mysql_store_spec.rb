@@ -24,45 +24,52 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     end
   end
 
-  describe "open batches (add_jobs / lock_batch)" do
-    it "add_jobs grows total_jobs while the batch is open" do
+  describe "open batches (add_jobs / seal_batch)" do
+    it "add_jobs grows total_jobs while the batch is held (block-form)" do
       id = SecureRandom.uuid
-      store.create_batch(id: id, total_jobs: 0, locked: false)
+      store.create_batch(id: id, total_jobs: 0, sealed: false)
       expect(store.add_jobs(id, 5)).to eq(:ok)
       expect(store.find_batch(id)[:total_jobs]).to eq(5)
       expect(store.find_batch(id)[:locked_at]).to be_nil
     end
 
-    it "does not finalize an open batch even when complete" do
+    it "does not finalize a held batch even when complete" do
       id = SecureRandom.uuid
-      store.create_batch(id: id, total_jobs: 1, locked: false)
+      store.create_batch(id: id, total_jobs: 1, sealed: false)
       r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
       expect(r[:status]).to eq(:continue)
       expect(store.find_batch(id)[:status]).to eq("running")
     end
 
-    it "lock_batch finalizes an already-complete batch and blocks further add_jobs" do
+    it "seal_batch finalizes an already-complete batch and then closes it to add_jobs" do
       id = SecureRandom.uuid
-      store.create_batch(id: id, total_jobs: 1, locked: false)
+      store.create_batch(id: id, total_jobs: 1, sealed: false)
       store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success")
 
-      res = store.lock_batch(id)
+      res = store.seal_batch(id)
       expect(res[:status]).to eq(:done)
       expect(res[:outcome]).to eq("success")
-      expect(store.add_jobs(id, 1)).to eq(:locked)
+      expect(store.add_jobs(id, 1)).to eq(:closed)
     end
 
-    it "lock_batch on an incomplete open batch just locks it" do
+    it "seal_batch on an incomplete batch just seals it" do
       id = SecureRandom.uuid
-      store.create_batch(id: id, total_jobs: 3, locked: false)
-      expect(store.lock_batch(id)[:status]).to eq(:locked)
+      store.create_batch(id: id, total_jobs: 3, sealed: false)
+      expect(store.seal_batch(id)[:status]).to eq(:sealed)
       expect(store.find_batch(id)[:locked_at]).not_to be_nil
+    end
+
+    it "a sealed but still-running batch keeps accepting jobs (jobs adding jobs)" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 1, sealed: true)
+      expect(store.add_jobs(id, 2)).to eq(:ok)
+      expect(store.find_batch(id)[:total_jobs]).to eq(3)
     end
 
     it "add_jobs reports :not_found and :cancelled" do
       expect(store.add_jobs("nope", 1)).to eq(:not_found)
       id = SecureRandom.uuid
-      store.create_batch(id: id, total_jobs: 0, locked: false)
+      store.create_batch(id: id, total_jobs: 0, sealed: false)
       store.update_batch_status(id, "cancelled")
       expect(store.add_jobs(id, 1)).to eq(:cancelled)
     end
@@ -187,6 +194,14 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
       store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x")
       store.delete_batch(id)
       expect(store.list_failures(id)).to be_empty
+    end
+
+    it "#clear_failure removes a single job's failure (e.g. on a successful retry)" do
+      id = new_batch
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "E", error_message: "x", status: "retrying")
+      store.record_failure(batch_id: id, job_id: "j2", worker_class: "W", error_class: "E", error_message: "y", status: "retrying")
+      store.clear_failure(id, "j1")
+      expect(store.list_failures(id).map { |f| f[:job_id] }).to eq(["j2"])
     end
 
     it "#list_all_failures aggregates across batches, with batch_id and status filter" do
