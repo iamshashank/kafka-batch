@@ -25,6 +25,11 @@ module KafkaBatch
       KEY_PREFIX    = "kafka_batch:b"
       RUNNING_INDEX = "kafka_batch:index:running"
       DONE_INDEX    = "kafka_batch:index:done"
+      # ZSET of every batch id (score = created_at epoch) powering the admin UI
+      # listing. Members are pruned lazily when their (TTL-expired) hash is gone.
+      ALL_INDEX     = "kafka_batch:index:all"
+      # SET of cancelled batch ids, read periodically by the cancellation cache.
+      CANCELLED_INDEX = "kafka_batch:index:cancelled"
       OFFSETS_KEY   = "kafka_batch:offsets"
 
       # Atomically apply a completion, deduplicating by a monotonic per-partition
@@ -139,8 +144,11 @@ module KafkaBatch
             ]
           )
           # Returns 1 if created, 0 if already existed (idempotent).
-          # Register in the running index so the reconciler can find it.
-          r.zadd(RUNNING_INDEX, now.to_f, id) if created == 1
+          if created == 1
+            # Register in the running index (reconciler) and the all index (UI).
+            r.zadd(RUNNING_INDEX, now.to_f, id)
+            r.zadd(ALL_INDEX, now.to_f, id)
+          end
           created
         end
       end
@@ -204,7 +212,58 @@ module KafkaBatch
           r.hset(batch_key(id), "status", status)
           # Terminal/cancelled batches drop out of the running index.
           r.zrem(RUNNING_INDEX, id) if %w[success complete cancelled].include?(status)
+          # Track cancellations for the cancellation cache.
+          r.sadd(CANCELLED_INDEX, id) if status == "cancelled"
         end
+      end
+
+      def batch_status(id)
+        with_redis { |r| presence(r.hget(batch_key(id), "status")) }
+      end
+
+      def cancelled_batch_ids
+        with_redis { |r| r.smembers(CANCELLED_INDEX) }
+      end
+
+      def list_batches(status: nil, limit: 50, offset: 0)
+        ids = with_redis { |r| r.zrevrange(ALL_INDEX, 0, -1) }
+        result  = []
+        skipped = 0
+
+        ids.each do |id|
+          batch = find_batch(id)
+          if batch.nil?
+            with_redis { |r| r.zrem(ALL_INDEX, id) }  # expired – prune
+            next
+          end
+          next if status && batch[:status] != status
+
+          if skipped < offset
+            skipped += 1
+            next
+          end
+
+          result << batch
+          break if result.size >= limit
+        end
+
+        result
+      end
+
+      def batch_counts
+        ids    = with_redis { |r| r.zrange(ALL_INDEX, 0, -1) }
+        counts = Hash.new(0)
+
+        ids.each do |id|
+          st = batch_status(id)
+          if st.nil?
+            with_redis { |r| r.zrem(ALL_INDEX, id) }  # expired – prune
+          else
+            counts[st] += 1
+          end
+        end
+
+        counts
       end
 
       def mark_finished(id, outcome)
@@ -264,6 +323,8 @@ module KafkaBatch
           r.del(batch_key(id))
           r.zrem(RUNNING_INDEX, id)
           r.zrem(DONE_INDEX, id)
+          r.zrem(ALL_INDEX, id)
+          r.srem(CANCELLED_INDEX, id)
         end
       end
 

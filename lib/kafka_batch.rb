@@ -9,6 +9,7 @@ require_relative "kafka_batch/stores/base"
 require_relative "kafka_batch/stores/mysql_store"
 require_relative "kafka_batch/stores/redis_store"
 require_relative "kafka_batch/producer"
+require_relative "kafka_batch/cancellation_cache"
 require_relative "kafka_batch/worker"
 require_relative "kafka_batch/batch"
 require_relative "kafka_batch/reconciler"
@@ -16,6 +17,7 @@ require_relative "kafka_batch/consumers/job_consumer"
 require_relative "kafka_batch/consumers/retry_consumer"
 require_relative "kafka_batch/consumers/event_consumer"
 require_relative "kafka_batch/consumers/callback_consumer"
+require_relative "kafka_batch/web"
 
 module KafkaBatch
   class << self
@@ -167,6 +169,7 @@ module KafkaBatch
       @store_mutex   = nil
       @workers_mutex = nil
       Producer.reset!
+      CancellationCache.reset!
     end
 
     private

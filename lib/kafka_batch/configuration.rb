@@ -24,6 +24,15 @@ module KafkaBatch
     # ── Consumer ─────────────────────────────────────────────────────────────
     attr_accessor :consumer_group   # String
 
+    # ── Cancellation ─────────────────────────────────────────────────────────
+    # When true, JobConsumer skips execution of jobs whose batch was cancelled.
+    # The set of cancelled batch ids is cached per process and refreshed at most
+    # once per cancellation_cache_ttl seconds (NOT read from the store on every
+    # job), so cancellation takes effect within that window – some already-queued
+    # jobs may still run before the next refresh, which is an accepted trade-off.
+    attr_accessor :skip_cancelled_jobs   # Boolean – default true
+    attr_accessor :cancellation_cache_ttl  # Integer – seconds; default 120
+
     # ── Retry behaviour ──────────────────────────────────────────────────────
     attr_accessor :max_retries      # Integer – default per worker (worker can override)
     attr_accessor :retry_backoff    # Integer – seconds; linear: attempt * retry_backoff
@@ -71,6 +80,8 @@ module KafkaBatch
 
     def initialize
       @store                    = :mysql
+      @skip_cancelled_jobs      = true
+      @cancellation_cache_ttl   = 120
       @brokers                  = ["localhost:9092"]
       @jobs_topic               = "kafka_batch.jobs"
       @events_topic             = "kafka_batch.events"

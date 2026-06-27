@@ -134,11 +134,49 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
   end
 
   describe "#delete_batch" do
-    it "removes the hash and both index entries" do
+    it "removes the hash and all index entries" do
       id = new_batch(total: 1)
       store.delete_batch(id)
       expect(store.find_batch(id)).to be_nil
       expect(store.stale_batches(older_than: Time.now + 60).map { |b| b[:id] }).not_to include(id)
+      expect(store.list_batches.map { |b| b[:id] }).not_to include(id)
+    end
+  end
+
+  describe "admin UI queries" do
+    it "#batch_status returns the status (or nil when unknown)" do
+      id = new_batch
+      expect(store.batch_status(id)).to eq("running")
+      expect(store.batch_status("nope")).to be_nil
+    end
+
+    it "#list_batches lists via the all-index with optional status filter" do
+      a = new_batch
+      b = new_batch
+      store.update_batch_status(b, "cancelled")
+
+      expect(store.list_batches.map { |x| x[:id] }).to include(a, b)
+      expect(store.list_batches(status: "cancelled").map { |x| x[:id] }).to eq([b])
+    end
+
+    it "#batch_counts groups by status" do
+      new_batch
+      c = new_batch
+      store.update_batch_status(c, "cancelled")
+
+      counts = store.batch_counts
+      expect(counts["running"]).to eq(1)
+      expect(counts["cancelled"]).to eq(1)
+    end
+
+    it "#cancelled_batch_ids tracks cancellations and prunes on delete" do
+      new_batch
+      c = new_batch
+      store.update_batch_status(c, "cancelled")
+      expect(store.cancelled_batch_ids).to contain_exactly(c)
+
+      store.delete_batch(c)
+      expect(store.cancelled_batch_ids).to be_empty
     end
   end
 

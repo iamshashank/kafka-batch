@@ -84,6 +84,18 @@ module KafkaBatch
           "job_id=#{job_id} batch_id=#{batch_id} attempt=#{attempt}"
         )
 
+        # ── Cancellation gate ────────────────────────────────────────────
+        # If the batch was cancelled, skip the job entirely – do not run the
+        # worker and do not emit a completion event. Remaining in-flight jobs
+        # simply drain without side effects.
+        if batch_id && KafkaBatch.config.skip_cancelled_jobs && batch_cancelled?(batch_id)
+          KafkaBatch.logger.info(
+            "[KafkaBatch][JobConsumer] batch_id=#{batch_id} cancelled – skipping job_id=#{job_id}"
+          )
+          mark_as_consumed!(message)
+          return
+        end
+
         started_at = Time.now
 
         # ── Step 1: execute the job ──────────────────────────────────────
@@ -299,6 +311,12 @@ module KafkaBatch
       rescue KafkaBatch::ProducerError => e
         KafkaBatch.logger.error("[KafkaBatch][JobConsumer] DLT publish failed: #{e.message}")
         raise  # re-raise so offset is NOT committed → redelivery
+      end
+
+      def batch_cancelled?(batch_id)
+        # Uses a process-local cache refreshed at most once per
+        # cancellation_cache_ttl seconds – no per-job store read.
+        KafkaBatch::CancellationCache.cancelled?(batch_id)
       end
 
       def resolve_worker(class_name)

@@ -71,6 +71,37 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     end
   end
 
+  describe "cancellation gate" do
+    it "skips the worker and emits no event when the batch is cancelled" do
+      id = SecureRandom.uuid
+      KafkaBatch.store.create_batch(id: id, total_jobs: 2)
+      KafkaBatch::Batch.cancel(id)
+
+      consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: id))
+
+      expect(KafkaBatchSpec::WorkerRuns.runs).to be_empty
+      expect(FakeProducer.for_topic(KafkaBatch.config.events_topic)).to be_empty
+    end
+
+    it "still runs the worker for a non-cancelled batch" do
+      id = SecureRandom.uuid
+      KafkaBatch.store.create_batch(id: id, total_jobs: 2)
+
+      consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: id))
+      expect(KafkaBatchSpec::WorkerRuns.runs.size).to eq(1)
+    end
+
+    it "does not run the cancellation check when skip_cancelled_jobs is false" do
+      KafkaBatch.config.skip_cancelled_jobs = false
+      id = SecureRandom.uuid
+      KafkaBatch.store.create_batch(id: id, total_jobs: 2)
+      KafkaBatch::Batch.cancel(id)
+
+      consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: id))
+      expect(KafkaBatchSpec::WorkerRuns.runs.size).to eq(1)
+    end
+  end
+
   describe "completion event shape" do
     it "emits source coordinates and keys the event by source partition" do
       msg = FakeMessage.new(

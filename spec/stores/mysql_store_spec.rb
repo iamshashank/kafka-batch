@@ -106,4 +106,50 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
       expect(store.find_batch(id)).to be_nil
     end
   end
+
+  describe "admin UI queries" do
+    it "#batch_status returns the status (or nil when unknown)" do
+      id = new_batch
+      expect(store.batch_status(id)).to eq("running")
+      expect(store.batch_status("nope")).to be_nil
+    end
+
+    it "#list_batches returns batches newest-first with optional status filter" do
+      a = new_batch
+      b = new_batch
+      store.update_batch_status(b, "cancelled")
+
+      all = store.list_batches
+      expect(all.map { |x| x[:id] }).to include(a, b)
+
+      cancelled = store.list_batches(status: "cancelled")
+      expect(cancelled.map { |x| x[:id] }).to eq([b])
+    end
+
+    it "#list_batches paginates" do
+      ids = Array.new(3) { new_batch }
+      page1 = store.list_batches(limit: 2, offset: 0)
+      page2 = store.list_batches(limit: 2, offset: 2)
+      expect(page1.size).to eq(2)
+      expect(page2.size).to eq(1)
+      expect((page1 + page2).map { |x| x[:id] }).to match_array(ids)
+    end
+
+    it "#batch_counts groups by status" do
+      new_batch
+      c = new_batch
+      store.update_batch_status(c, "cancelled")
+
+      counts = store.batch_counts
+      expect(counts["running"]).to eq(1)
+      expect(counts["cancelled"]).to eq(1)
+    end
+
+    it "#cancelled_batch_ids returns only cancelled batch ids" do
+      new_batch
+      c = new_batch
+      store.update_batch_status(c, "cancelled")
+      expect(store.cancelled_batch_ids).to eq([c])
+    end
+  end
 end

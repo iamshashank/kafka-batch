@@ -53,6 +53,34 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#update_batch_status"
       end
 
+      # Cheap status read for a single batch.
+      # @return [String, nil] the status, or nil if the batch is unknown
+      def batch_status(id)
+        raise NotImplementedError, "#{self.class}#batch_status"
+      end
+
+      # All currently-cancelled batch ids. Fetched periodically (not per-job) by
+      # the cancellation cache, so it should be cheap.
+      # @return [Array<String>]
+      def cancelled_batch_ids
+        raise NotImplementedError, "#{self.class}#cancelled_batch_ids"
+      end
+
+      # List batches newest-first for the admin UI.
+      # @param status [String, nil] optional status filter
+      # @param limit  [Integer]
+      # @param offset [Integer]
+      # @return [Array<Hash>]
+      def list_batches(status: nil, limit: 50, offset: 0)
+        raise NotImplementedError, "#{self.class}#list_batches"
+      end
+
+      # Count of batches grouped by status, for the UI summary.
+      # @return [Hash{String=>Integer}]
+      def batch_counts
+        raise NotImplementedError, "#{self.class}#batch_counts"
+      end
+
       # Transition a batch to a terminal outcome ("success"|"complete"),
       # stamping finished_at and registering it for lost-callback recovery.
       # Used by the reconciler when it discovers a stuck-running batch whose

@@ -98,6 +98,25 @@ module KafkaBatch
         batch_record_class.where(id: id).update_all(status: status)
       end
 
+      def batch_status(id)
+        batch_record_class.where(id: id).limit(1).pluck(:status).first
+      end
+
+      # Uses the existing index on :status.
+      def cancelled_batch_ids
+        batch_record_class.where(status: "cancelled").pluck(:id)
+      end
+
+      def list_batches(status: nil, limit: 50, offset: 0)
+        scope = batch_record_class.order(created_at: :desc)
+        scope = scope.where(status: status) if status
+        scope.limit(limit).offset(offset).map { |r| record_to_hash(r) }
+      end
+
+      def batch_counts
+        batch_record_class.group(:status).count
+      end
+
       def mark_finished(id, outcome)
         batch_record_class
           .where(id: id)

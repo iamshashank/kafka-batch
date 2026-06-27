@@ -22,6 +22,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 - [Callbacks](#callbacks)
 - [Retry behaviour](#retry-behaviour)
 - [Dead Letter Topic](#dead-letter-topic)
+- [Web UI](#web-ui)
 - [Reconciler](#reconciler)
 - [Instrumentation](#instrumentation)
 - [Rake tasks](#rake-tasks)
@@ -162,6 +163,14 @@ KafkaBatch.configure do |config|
 
   # ── Consumer group ──────────────────────────────────────────────────
   config.consumer_group = "kafka-batch"
+
+  # ── Cancellation ────────────────────────────────────────────────────
+  # When true, JobConsumer skips jobs whose batch was cancelled. The set of
+  # cancelled batch ids is cached per process and refreshed at most once per
+  # cancellation_cache_ttl seconds (no per-job store read), so cancellation
+  # takes effect within that window.
+  config.skip_cancelled_jobs    = true
+  config.cancellation_cache_ttl = 120  # seconds
 
   # ── Retry behaviour (global defaults; override per Worker class) ────
   config.max_retries   = 3   # max attempts before dead letter
@@ -336,11 +345,17 @@ The job goes through the same retry / DLT flow but no batch completion tracking 
 batch = KafkaBatch::Batch.find(batch_id)
 # => { id: "uuid", status: "running", completed_count: 42, total_jobs: 100, ... }
 
-# Cancel a batch (prevents callbacks from firing, does NOT stop in-flight jobs)
+# Cancel a batch: remaining jobs are skipped and callbacks never fire
 KafkaBatch::Batch.cancel(batch_id)
 ```
 
-`cancel` sets `status` to `"cancelled"` in the store. Any jobs already in-flight will still run but the `EventConsumer` treats a cancelled batch as a no-op — it skips the completion check and the callback is never triggered.
+`cancel` sets `status` to `"cancelled"` in the store. With `config.skip_cancelled_jobs = true` (the default), the `JobConsumer` **skips execution** of not-yet-processed jobs in that batch — so cancelling effectively stops the remaining work.
+
+To avoid a store read on every job, each consumer process caches the set of cancelled batch ids and refreshes it at most once per `config.cancellation_cache_ttl` seconds (default 120). Cancellation is therefore **eventually-consistent**: some already-queued jobs may still run until the next refresh — an accepted trade-off for throughput. The `EventConsumer` also treats a cancelled batch as a no-op, so callbacks never fire regardless.
+
+Set `config.skip_cancelled_jobs = false` to disable the cancellation gate entirely (cancel then only suppresses callbacks).
+
+You can also cancel (and delete) batches from the [Web UI](#web-ui).
 
 ---
 
@@ -483,6 +498,51 @@ topic KafkaBatch.config.dead_letter_topic do
   consumer DeadLetterConsumer
 end
 ```
+
+---
+
+## Web UI
+
+A small, dependency-free Rack dashboard (think a tiny "Sidekiq Web") for inspecting batches. It works with either store and renders self-contained HTML/CSS — no asset pipeline or extra gems.
+
+Mount it in your routes:
+
+```ruby
+# config/routes.rb
+require "kafka_batch/web"
+
+Rails.application.routes.draw do
+  mount KafkaBatch::Web => "/kafka_batch"
+end
+```
+
+> **Mount it behind authentication.** The UI exposes destructive actions (cancel / delete). Wrap the mount in your admin constraint, e.g.:
+>
+> ```ruby
+> authenticate :user, ->(u) { u.admin? } do
+>   mount KafkaBatch::Web => "/kafka_batch"
+> end
+> ```
+
+What it shows:
+
+- **Summary metrics** — total batches and counts by status (running / success / complete / cancelled).
+- **Batch list** — newest first, with status badge, total / done / failed / **pending** counts, a progress bar, and status filters. Paginated.
+- **Batch detail** — all fields, callbacks, meta, and progress.
+- **Actions** —
+  - **Cancel** (running batches): sets status to `cancelled`; with `skip_cancelled_jobs` the remaining jobs stop processing.
+  - **Delete**: removes the batch record (best used for finished batches).
+
+Routes (relative to the mount point):
+
+| Method | Path | Action |
+|---|---|---|
+| `GET` | `/` | Batch list + metrics (`?status=`, `?page=`) |
+| `GET` | `/batches/:id` | Batch detail |
+| `POST` | `/batches/:id/cancel` | Cancel batch |
+| `POST` | `/batches/:id/delete` | Delete batch |
+
+> **Redis note:** the list is backed by an `kafka_batch:index:all` sorted set. Since Redis batch keys expire after `batch_ttl`, the UI shows batches within that window (expired members are pruned lazily). MySQL-backed batches persist until deleted.
 
 ---
 
