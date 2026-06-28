@@ -74,24 +74,26 @@ KafkaBatch.configure do |config|
   config.failures_ttl           = 24 * 3600  # seconds; metadata retention
   config.max_failures_per_batch = 1000       # 0 = unlimited
 
-  # ── Multi-tenant fairness (hybrid WFQ; requires Redis) ─────────────────────
-  # Share capacity dynamically across tenants: 1 active tenant uses 100%, 2 split
-  # ~50:50, etc. (work-conserving). The backlog stays in Kafka; only a bounded
-  # ready-window per tenant lives in Redis. Tag jobs with a tenant via
+  # ── Multi-tenant fairness (Kafka-only; NO Redis required) ──────────────────
+  # Share capacity dynamically across tenants: 1 active tenant uses 100%, N split
+  # ~1/N (work-conserving, approximate). Jobs land on the ingest topic (keyed by
+  # tenant); the Dispatcher (auto-wired by draw_routes) forwards them onto the
+  # ready topic — throttled so its depth stays between the watermarks — and the
+  # normal JobConsumer swarm drains it. Tag jobs via
   # Batch.create(tenant_id: "...") / batch.push(Worker, payload, tenant_id: "...").
-  config.fairness_enabled                 = false  # opt-in
-  config.fairness_global_concurrency      = 50     # total in-flight slots (system capacity)
-  config.fairness_max_inflight_per_tenant = 0      # 0 = no per-tenant cap (rely on WFQ)
-  config.fairness_ready_window            = 500    # bounded ready jobs/tenant in Redis
-  config.fairness_default_weight          = 1.0    # per-tenant weight via Scheduler#set_weight
-  # Kafka-ready-topic wiring (jobs → ingest → [dispatcher] → ready → JobConsumer swarm):
-  config.fairness_ingest_topic            = "kafka_batch.ingest"
-  config.fairness_ready_topic             = "kafka_batch.ready"
-  config.fairness_ready_lag_high          = 5000   # dispatcher pauses forwarding above this depth
-  config.fairness_ready_lag_low           = 1000   # ...resumes below this depth
-  # No extra process: the Dispatcher (auto-wired by draw_routes) forwards
-  # ingest→ready directly. fairness_global_concurrency / _ready_window / weights
-  # only apply to the optional standalone Scheduler (strict weighted shares).
+  config.fairness_enabled        = false  # opt-in
+  config.fairness_ingest_topic   = "kafka_batch.ingest"  # per-tenant intake (durable backlog in Kafka)
+  config.fairness_ready_topic    = "kafka_batch.ready"   # throttled execution queue
+  config.fairness_ready_lag_high = 5000   # dispatcher pauses forwarding above this depth
+  config.fairness_ready_lag_low  = 1000   # ...resumes below this depth
+
+  # The settings below apply ONLY to the optional Redis-backed
+  # KafkaBatch::Fairness::Scheduler (strict weighted shares) — NOT the default
+  # dispatcher above, which needs no Redis. Leave them unless you build on it.
+  # config.fairness_global_concurrency      = 50
+  # config.fairness_max_inflight_per_tenant = 0
+  # config.fairness_ready_window            = 500
+  # config.fairness_default_weight          = 1.0
 
   # ── Reconciliation ─────────────────────────────────────────────────────────
   # Batches stuck in "running" older than this threshold are re-evaluated.

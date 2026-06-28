@@ -635,11 +635,13 @@ end
 
 ## Multi-tenant fairness (WFQ)
 
-When many tenants (businesses) push jobs into the same system, a naive Kafka topic processes them roughly FIFO — so one tenant dumping 10M jobs starves everyone behind it. KafkaBatch ships a **hybrid weighted-fair-queuing (WFQ) scheduler** that shares capacity dynamically:
+When many tenants (businesses) push jobs into the same system, a naive Kafka topic processes them roughly FIFO — so one tenant dumping 10M jobs starves everyone behind it. KafkaBatch shares capacity dynamically across tenants using **only Kafka — no Redis required**:
 
 - **1 active tenant → 100%** of capacity; **2 → ~50:50**; **N → ~1/N each** — and it's **work-conserving** (an idle tenant's share is instantly redistributed).
-- The durable backlog stays in **Kafka**; only a **bounded ready-window per tenant** lives in Redis, so memory is `O(active_tenants × window)`, not `O(total jobs)`. (Putting the whole backlog in Redis would cost orders of magnitude more RAM — keep it in Kafka.)
-- Per-tenant **weights** give proportional shares; a global **concurrency budget** and optional **per-tenant in-flight cap** bound load.
+- The durable backlog stays in **Kafka** (the ingest topic), so memory is bounded regardless of backlog size. Nothing is stored in Redis on the fairness path.
+- Fairness is **approximate** ("good enough"): it relies on Kafka's balanced per-partition fetch plus a shallow, throttled ready topic.
+
+> **Does fairness need Redis? No.** The default fairness path (ingest → dispatcher → ready → swarm) uses Kafka only. Redis is involved **only** if you opt into the standalone `KafkaBatch::Fairness::Scheduler` (a virtual-time WFQ engine for *strict weighted* shares), which is **not** wired into the default path.
 
 Tag jobs with a tenant:
 
@@ -649,15 +651,17 @@ batch.push(ProcessUserWorker, { "user_id" => 1 })          # inherits tenant "ac
 batch.push(ProcessUserWorker, { "user_id" => 2 }, tenant_id: "globex")  # override
 ```
 
-Configure (requires `config.redis_url`):
+Configure (no Redis needed):
 
 ```ruby
-config.fairness_enabled                 = true
-config.fairness_global_concurrency      = 50    # total in-flight slots = system capacity
-config.fairness_max_inflight_per_tenant = 0     # 0 = no per-tenant cap
-config.fairness_ready_window            = 500   # bounded ready jobs/tenant in Redis
-config.fairness_default_weight          = 1.0
+config.fairness_enabled        = true
+config.fairness_ingest_topic   = "kafka_batch.ingest"  # per-tenant intake (durable backlog)
+config.fairness_ready_topic    = "kafka_batch.ready"   # throttled execution queue
+config.fairness_ready_lag_high = 5000   # dispatcher pauses forwarding above this depth
+config.fairness_ready_lag_low  = 1000   # ...resumes below this depth
 ```
+
+> The `fairness_global_concurrency`, `fairness_ready_window`, `fairness_max_inflight_per_tenant`, and `fairness_default_weight` settings apply **only** to the optional Redis-backed `Scheduler` — not the default dispatcher.
 
 ### How it's wired (reuses normal Kafka consumers, no Redis on the path)
 

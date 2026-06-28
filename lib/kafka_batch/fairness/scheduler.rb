@@ -3,8 +3,11 @@ require "connection_pool"
 
 module KafkaBatch
   module Fairness
-    # Redis-backed Weighted Fair Queuing (WFQ) scheduler for multi-tenant
-    # fairness. It is the heart of the "hybrid" design:
+    # OPTIONAL Redis-backed Weighted Fair Queuing (WFQ) scheduler for STRICT
+    # weighted multi-tenant fairness. It is NOT used by the default fairness path
+    # (the Kafka-only Dispatcher needs no Redis) — it's a standalone engine to
+    # build a custom dispatcher/worker around when you need precise weighted
+    # shares. Design:
     #
     #   * the durable backlog stays in Kafka;
     #   * a dispatcher copies jobs into a BOUNDED per-tenant "ready" window here;

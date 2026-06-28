@@ -73,7 +73,9 @@ module KafkaBatch
 
     # ── Fairness scheduler (multi-tenant WFQ) ───────────────────────────────
 
-    # Shared Redis-backed WFQ scheduler used by the fairness dispatcher/forwarder.
+    # Optional Redis-backed virtual-time WFQ scheduler for STRICT weighted shares.
+    # NOT used by the default fairness path (the Dispatcher needs no Redis) — it's
+    # a standalone engine to build a custom dispatcher/worker around.
     # @return [Fairness::Scheduler]
     def fairness_scheduler
       @fairness_scheduler ||= Fairness::Scheduler.new

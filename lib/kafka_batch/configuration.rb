@@ -89,17 +89,19 @@ module KafkaBatch
     attr_accessor :failures_ttl              # Integer – seconds; default 1 day
     attr_accessor :max_failures_per_batch    # Integer – 0 = unlimited; default 1000
 
-    # ── Multi-tenant fairness (hybrid WFQ scheduler; requires Redis) ─────────
-    # When enabled, jobs are dispatched through a Redis-backed weighted-fair-queue
-    # so capacity is shared dynamically across tenants: one active tenant uses
-    # 100% of the global budget, two split ~50:50, etc. (work-conserving). The
-    # durable backlog stays in Kafka; only a bounded ready-window per tenant lives
-    # in Redis. See KafkaBatch::Fairness::Scheduler.
+    # ── Multi-tenant fairness (Kafka-only; NO Redis required) ────────────────
+    # When enabled, capacity is shared dynamically across tenants — one active
+    # tenant uses 100%, N split ~1/N (work-conserving, approximate) — using only
+    # Kafka (ingest topic → Dispatcher → ready topic → JobConsumer swarm). The
+    # durable backlog stays in Kafka; nothing is stored in Redis on this path.
     attr_accessor :fairness_enabled                 # Boolean – default false
-    attr_accessor :fairness_global_concurrency      # Integer – total in-flight slots; default 50
-    attr_accessor :fairness_max_inflight_per_tenant # Integer – per-tenant cap; 0 = none (default)
-    attr_accessor :fairness_ready_window            # Integer – bounded ready jobs/tenant in Redis; default 500
-    attr_accessor :fairness_default_weight          # Numeric – default share weight; default 1.0
+    # The four settings below apply ONLY to the optional Redis-backed
+    # KafkaBatch::Fairness::Scheduler (strict weighted shares), NOT the default
+    # dispatcher, which uses the ingest/ready topics + watermarks above.
+    attr_accessor :fairness_global_concurrency      # Integer – (Scheduler) total in-flight slots; default 50
+    attr_accessor :fairness_max_inflight_per_tenant # Integer – (Scheduler) per-tenant cap; 0 = none (default)
+    attr_accessor :fairness_ready_window            # Integer – (Scheduler) bounded ready jobs/tenant in Redis; default 500
+    attr_accessor :fairness_default_weight          # Numeric – (Scheduler) default share weight; default 1.0
 
     # Kafka-ready-topic design: jobs land on the ingest topic (keyed
     # one-tenant-per-partition); a Dispatcher forwards them onto the ready topic
