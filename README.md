@@ -147,8 +147,10 @@ Edit `config/initializers/kafka_batch.rb`:
 ```ruby
 KafkaBatch.configure do |config|
   # ── State store ────────────────────────────────────────────────────
-  # :mysql  – persistent, survives Redis restarts, queryable via SQL
-  # :redis  – lower latency, no schema migration needed
+  # Where batch counters / completion cursors / failure log live (Kafka always
+  # holds the actual jobs). See "Choosing a store" below.
+  #   :mysql  – durable on disk, queryable via SQL, needs migrations
+  #   :redis  – in-memory, lowest latency, no migrations, TTL-based retention
   config.store = :mysql
 
   # ── Kafka brokers ───────────────────────────────────────────────────
@@ -184,10 +186,25 @@ KafkaBatch.configure do |config|
   config.event_emit_retries = 3
   config.event_emit_backoff = 2  # seconds; sleep = attempt × backoff
 
-  # ── Redis (only when store: :redis) ─────────────────────────────────
+  # ── Redis (used by the :redis store AND the :redis liveness backend) ─
   config.redis_url       = ENV.fetch("REDIS_URL", "redis://localhost:6379/0")
   config.redis_pool_size = 5
-  config.batch_ttl       = 7 * 24 * 3600  # seconds until Redis keys expire
+  config.batch_ttl       = 7 * 24 * 3600  # seconds until Redis batch keys expire
+
+  # ── Failure-log retention (Redis store only) ────────────────────────
+  # Failure records are a dashboard convenience – the real job data is durable
+  # in Kafka – so they get a shorter TTL and a per-batch cap to bound RAM.
+  config.failures_ttl           = 24 * 3600  # seconds
+  config.max_failures_per_batch = 1000        # 0 = unlimited
+
+  # ── Live-activity backend (/live page; independent of config.store) ──
+  #   :redis – per-job tracking in Redis (most detail; writes scale with jobs)
+  #   :store – consumer heartbeats in config.store (sampled; writes scale with
+  #            #consumers — needs the consumer-heartbeats table on :mysql)
+  #   :off   – disable the /live page
+  config.liveness_backend            = :redis
+  config.liveness_ttl                = 30  # seconds a heartbeat/entry is "live"
+  config.liveness_heartbeat_interval = 5   # :store throttle: 1 write/consumer/N s
 
   # ── Reconciliation ───────────────────────────────────────────────────
   config.reconciliation_interval = 300  # seconds
@@ -202,6 +219,37 @@ KafkaBatch.configure do |config|
   # config.consumer_config = { "fetch.min.bytes"  => "1024"   }
 end
 ```
+
+### Choosing a store
+
+KafkaBatch makes **two independent storage choices**. Kafka is always the source of truth for the actual jobs and completion events; these only hold derived/aggregate state.
+
+#### 1. State store — `config.store` (`:mysql` | `:redis`)
+
+Holds batch counters, the per-partition completion cursors (exactly-once dedup), and the failure log. Both options implement the **same guarantees** (exactly-once counting, callbacks, reconciler, open batches) — pick based on operational fit.
+
+| | `:mysql` | `:redis` |
+|---|---|---|
+| Durability | On disk; survives restarts | In-memory (lost on flush unless Redis persistence is configured) |
+| Setup | Run migrations (tables below) | None; keys auto-expire |
+| Retention | Manual / `delete_batch` | TTL — `batch_ttl` (batches), `failures_ttl` (failures) |
+| Queryable | Yes, via SQL | Key lookups only |
+| Hot-batch counter writes | One row lock per batch (kept cheap by per-poll **batched counting**) | Atomic Lua, microsecond-fast — no row contention |
+| Best for | Auditability, durability, an existing RDBMS | Lowest latency, no schema, very high single-batch throughput |
+
+#### 2. Live-activity backend — `config.liveness_backend` (`:redis` | `:store` | `:off`)
+
+Powers **only** the `/live` dashboard page, and is **independent** of `config.store` (e.g. you can run `store = :mysql` with `liveness_backend = :redis`).
+
+| | `:redis` | `:store` | `:off` |
+|---|---|---|---|
+| Source | Per-job keys in Redis (`redis_url`) | Consumer heartbeats in `config.store` | — |
+| Detail | Every running job (most detailed) | Sampled "current job" per consumer | none |
+| Write volume | Scales with **job throughput** | Scales with **#consumers** (throttled to 1 write / `liveness_heartbeat_interval`) | none |
+| Requires | Redis reachable | the heartbeats table (on `:mysql`) | — |
+| Resilience | Best-effort behind a circuit breaker | Best-effort; stale rows filtered by `liveness_ttl` | — |
+
+> On `:store`, "running jobs" is **sampled** — very short jobs may not appear between heartbeats, but active consumers always show. Use `:redis` when you want every in-flight job listed.
 
 ### MySQL store
 
