@@ -19,78 +19,88 @@ module KafkaBatch
     #     "occurred_at" => "ISO8601"
     #   }
     class EventConsumer < Karafka::BaseConsumer
+      # Apply a whole poll's completion events in ONE store call (per-poll
+      # batching). This collapses N per-event transactions/round-trips into one,
+      # which dramatically reduces hot-batch-row lock contention on the MySQL
+      # store (and round-trips on Redis). Dedup/finalization stay exactly-once:
+      # the store deduplicates each event by its source offset, so re-delivering
+      # this whole batch (if we crash before committing the offset) never
+      # double-counts and never drops a job — protecting callback correctness.
       def consume
-        messages.each { |msg| process_event(msg) }
+        events = []
+        last   = nil
+
+        messages.each do |message|
+          last = message
+          ev = extract_event(message)  # nil when malformed/skipped (handled inline)
+          events << ev if ev
+        end
+
+        apply(events)
+
+        # Commit the whole poll only after the counters are durably applied. If
+        # anything above raised, the offset is NOT committed and Karafka redelivers
+        # the batch – the store dedups already-applied events on the replay.
+        mark_as_consumed!(last) if last
       end
 
       private
 
-      def process_event(message)
+      # Apply the deduped, aggregated counter updates and fire callbacks for any
+      # batch that just finished.
+      def apply(events)
+        return if events.empty?
+
+        KafkaBatch.store.record_completions_batch(events).each do |f|
+          trigger_callbacks(batch: f[:batch], outcome: f[:outcome])
+        end
+      end
+
+      # Decode + validate one event message. Returns a normalized event Hash, or
+      # nil after handling a malformed (→ DLT) or incomplete (→ skip) message.
+      def extract_event(message)
         data = begin
           decode(message.raw_payload)
         rescue ArgumentError => e
-          # Unparseable JSON: forward to DLT so nothing is silently dropped.
           KafkaBatch.logger.error(
             "[KafkaBatch][EventConsumer] Malformed JSON – forwarding to DLT: #{e.message}"
           )
-          publish_to_dlt(
-            raw:   message.raw_payload.to_s,
-            error: e,
-            topic: message.topic
-          )
-          mark_as_consumed!(message)
-          return
+          publish_to_dlt(raw: message.raw_payload.to_s, error: e, topic: message.topic)
+          return nil
         end
 
         batch_id = data["batch_id"]
-        job_id   = data["job_id"]
         status   = data["status"]
-
         unless batch_id && status
           KafkaBatch.logger.warn("[KafkaBatch][EventConsumer] Malformed event – skipping: #{data.inspect}")
-          mark_as_consumed!(message)
-          return
+          return nil
         end
-
-        KafkaBatch.logger.debug(
-          "[KafkaBatch][EventConsumer] batch_id=#{batch_id} job_id=#{job_id} status=#{status}"
-        )
 
         src_topic     = data["src_topic"]
         src_partition = data["src_partition"]
         src_offset    = data["src_offset"]
-
         if src_topic.nil? || src_partition.nil? || src_offset.nil?
           KafkaBatch.logger.warn(
             "[KafkaBatch][EventConsumer] Event missing source coords – skipping: #{data.inspect}"
           )
-          mark_as_consumed!(message)
-          return
+          return nil
         end
 
-        result = KafkaBatch.store.record_completion_by_offset(
+        {
           batch_id:         batch_id,
+          job_id:           data["job_id"],
+          status:           status,
           source_topic:     src_topic,
           source_partition: src_partition,
-          source_offset:    src_offset,
-          status:           status
-        )
+          source_offset:    src_offset
+        }
+      end
 
-        case result[:status]
-        when :done
-          trigger_callbacks(batch: result[:batch], outcome: result[:outcome])
-        when :duplicate
-          KafkaBatch.logger.debug(
-            "[KafkaBatch][EventConsumer] Duplicate event – job_id=#{job_id} already recorded"
-          )
-        when :not_found
-          KafkaBatch.logger.warn(
-            "[KafkaBatch][EventConsumer] Batch not found: #{batch_id} (job_id=#{job_id})"
-          )
-        when :continue
-          # nothing – batch still running
-        end
-
+      # Apply a single event immediately (used in tests and any single-message
+      # path). Mirrors the batched flow with a one-element batch.
+      def process_event(message)
+        ev = extract_event(message)
+        apply([ev].compact)
         mark_as_consumed!(message)
       end
 

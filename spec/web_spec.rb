@@ -19,6 +19,10 @@ RSpec.describe KafkaBatch::Web do
     id
   end
 
+  # By default keep the dashboard off the real Kafka cluster (lag uses
+  # Karafka::Admin). Individual lag tests opt back in with their own stubs.
+  before { allow(KafkaBatch::Lag).to receive(:available?).and_return(false) }
+
   describe "GET /" do
     it "marks dashboard responses no-store so a refresh always shows current data" do
       _s, headers, = get("/")
@@ -47,6 +51,31 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Pending")
     end
 
+    it "shows the batch description on the list and detail pages" do
+      id = seed(description: "Important nightly batch")
+      expect(get("/").last.join).to include("Important nightly batch")
+      expect(get("/batches/#{id}").last.join).to include("Important nightly batch")
+    end
+
+    it "has a search box and filters by id or description" do
+      a = seed(description: "Findable Alpha")
+      b = seed(description: "Other Beta")
+
+      expect(get("/").last.join).to include('name="q"')  # search box present
+
+      html = get("/", query: "q=Findable").last.join
+      expect(html).to include(a)
+      expect(html).not_to include(b)
+    end
+
+    it "shows which consumer ran the callback on the detail page" do
+      id = seed(total: 1)
+      KafkaBatch.store.claim_callback(id, "pod-xyz#99")
+      html = get("/batches/#{id}").last.join
+      expect(html).to include("Callback ran on")
+      expect(html).to include("pod-xyz#99")
+    end
+
     it "filters by status" do
       running = seed
       cancelled = seed
@@ -55,6 +84,38 @@ RSpec.describe KafkaBatch::Web do
       html = get("/", query: "status=cancelled").last.join
       expect(html).to include(cancelled[0, 8])
       expect(html).not_to include(running[0, 8])
+    end
+  end
+
+  describe "GET /lag" do
+    it "links to the lag page from the dashboard" do
+      expect(get("/").last.join).to include("/kafka_batch/lag")
+    end
+
+    it "shows a graceful message when the admin API is unavailable" do
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(false)
+      status, _headers, body = get("/lag")
+      html = body.join
+      expect(status).to eq(200)
+      expect(html).to include("Topic lag")
+      expect(html).to include("admin API")
+    end
+
+    it "renders per-topic and per-partition pending counts" do
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      allow(KafkaBatch::Lag).to receive(:partitions).and_return(
+        [
+          { group: "g-jobs", topic: "demo", partition: 0, committed: 10, end_offset: 17, lag: 7, never_consumed: false },
+          { group: "g-jobs", topic: "demo", partition: 1, committed: 5,  end_offset: 5,  lag: 0, never_consumed: false }
+        ]
+      )
+
+      html = get("/lag").last.join
+      expect(html).to include("Total pending")
+      expect(html).to include("Pending by topic")
+      expect(html).to include("Pending by partition")
+      expect(html).to include("demo")
+      expect(html).to include("7") # the lag value
     end
   end
 
@@ -84,6 +145,27 @@ RSpec.describe KafkaBatch::Web do
       html = get("/failures", query: "status=failed").last.join
       expect(html).to include("PermanentBoom")
       expect(html).not_to include("FlakyTimeout")
+    end
+
+    it "offers only Retrying and Failed filters (no All)" do
+      html = get("/failures").last.join
+      expect(html).to include(">Retrying<")
+      expect(html).to include(">Failed<")
+      expect(html).not_to include(">All<")
+    end
+
+    it "shows the retry topic lag (pending retries) when available" do
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      allow(KafkaBatch::Lag).to receive(:partitions).and_return(
+        [
+          { group: "g-control", topic: KafkaBatch.config.retry_topic, partition: 0, lag: 4 },
+          { group: "g-jobs",    topic: "something.else",              partition: 0, lag: 9 }
+        ]
+      )
+
+      html = get("/failures").last.join
+      expect(html).to include("Pending retries (retry topic lag)")
+      expect(html).to include(">4<") # only the retry topic's lag, not 13
     end
   end
 

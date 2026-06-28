@@ -28,10 +28,12 @@ module KafkaBatchSpec
           t.string   :status,                 null: false, default: "running"
           t.string   :on_success
           t.string   :on_complete
+          t.string   :description
           t.text     :meta
           t.datetime :created_at,             null: false
           t.datetime :finished_at
           t.datetime :callback_dispatched_at
+          t.string   :callback_dispatched_by
           t.datetime :locked_at
         end
         add_index :kafka_batch_records, :status

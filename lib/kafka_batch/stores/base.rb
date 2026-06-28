@@ -11,7 +11,7 @@ module KafkaBatch
       #   NOT finalize until #seal_batch is called (used by the block form to
       #   bracket initial population). Either way an open batch always accepts
       #   more jobs until it completes or is cancelled.
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, sealed: true)
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, sealed: true)
         raise NotImplementedError, "#{self.class}#create_batch"
       end
 
@@ -29,6 +29,22 @@ module KafkaBatch
       #   { status: :not_found }
       def seal_batch(id)
         raise NotImplementedError, "#{self.class}#seal_batch"
+      end
+
+      # Apply a batch of completion events in one go (per-poll batching), so a
+      # whole Kafka poll's worth of counter updates costs far fewer row locks /
+      # round-trips than one transaction per event.
+      #
+      # MUST be exactly-once per event: each event is deduplicated by the same
+      # monotonic per-(source_topic, source_partition) cursor used by
+      # #record_completion_by_offset, so re-delivered or re-produced events are
+      # never double-counted and none are missed.
+      #
+      # @param events [Array<Hash>] each: { batch_id:, source_topic:,
+      #   source_partition:, source_offset:, status: } in delivery (offset) order
+      # @return [Array<Hash>] batches that JUST finalized: { batch:, outcome: }
+      def record_completions_batch(events)
+        raise NotImplementedError, "#{self.class}#record_completions_batch"
       end
 
       # Fetch a batch by id.
@@ -58,7 +74,9 @@ module KafkaBatch
       #
       # @param id [String] batch ID
       # @return [Boolean] true if this caller won the claim, false if already claimed
-      def claim_callback(id)
+      # @param dispatched_by [String, nil] identifier of the pod/process that ran
+      #   the callbacks, recorded atomically with the claim for tracking.
+      def claim_callback(id, dispatched_by = nil)
         raise NotImplementedError, "#{self.class}#claim_callback"
       end
 
@@ -139,7 +157,9 @@ module KafkaBatch
       # @param limit  [Integer]
       # @param offset [Integer]
       # @return [Array<Hash>]
-      def list_batches(status: nil, limit: 50, offset: 0)
+      # @param search [String, nil] optional case-insensitive filter matching the
+      #   batch id or description.
+      def list_batches(status: nil, limit: 50, offset: 0, search: nil)
         raise NotImplementedError, "#{self.class}#list_batches"
       end
 

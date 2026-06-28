@@ -40,6 +40,8 @@ module KafkaBatch
         html(render_failures(params))
       elsif method == "GET" && path == "/live"
         html(render_live)
+      elsif method == "GET" && path == "/lag"
+        html(render_lag)
       elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
         batch = KafkaBatch.store.find_batch(m[1])
         batch ? html(render_show(batch)) : not_found
@@ -86,24 +88,26 @@ module KafkaBatch
 
     def render_index(params)
       status   = non_empty(params["status"])
+      search   = non_empty(params["q"])
       page     = [params["page"].to_i, 1].max
       offset   = (page - 1) * PER_PAGE
       counts   = safe_counts
       # Fetch one extra row to detect whether a next page exists.
-      batches  = KafkaBatch.store.list_batches(status: status, limit: PER_PAGE + 1, offset: offset)
+      batches  = KafkaBatch.store.list_batches(status: status, limit: PER_PAGE + 1, offset: offset, search: search)
       has_next = batches.size > PER_PAGE
       batches  = batches.first(PER_PAGE)
 
       summary = summary_cards(counts)
-      filters = status_filters(status, counts)
+      filters = status_filters(status, counts, search)
       rows    = batches.map { |b| batch_row(b) }.join
-      rows    = "<tr><td colspan='8' class='empty'>No batches found.</td></tr>" if batches.empty?
-      pager   = pagination(page, has_next, status)
+      empty   = search ? "No batches match “#{h(search)}”." : "No batches found."
+      rows    = "<tr><td colspan='8' class='empty'>#{empty}</td></tr>" if batches.empty?
+      pager   = pagination(page, has_next, status, search)
 
       <<~HTML
         #{summary}
-        <div class="toolbar"><a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a></div>
-        #{filters}
+        <div class="toolbar"><a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a></div>
+        <div class="filterbar">#{filters}#{search_box(search, status)}</div>
         <div class="card">
           <table>
             <thead>
@@ -127,10 +131,9 @@ module KafkaBatch
       has_next = failures.size > PER_PAGE
       failures = failures.first(PER_PAGE)
 
-      filter_links = [["All", nil], ["Retrying", "retrying"], ["Failed", "failed"]].map do |label, s|
-        cls  = (status == s || (s.nil? && status.nil?)) ? "chip active" : "chip"
-        href = s ? "#{failures_path}?status=#{s}" : failures_path
-        "<a class='#{cls}' href='#{href}'>#{label}</a>"
+      filter_links = [["Retrying", "retrying"], ["Failed", "failed"]].map do |label, s|
+        cls  = status == s ? "chip active" : "chip"
+        "<a class='#{cls}' href='#{failures_path}?status=#{s}'>#{label}</a>"
       end.join
 
       rows = failures.map do |f|
@@ -158,6 +161,7 @@ module KafkaBatch
 
       <<~HTML
         <p><a class="back" href="#{index_path}">← All batches</a></p>
+        #{retry_lag_metric}
         <div class="chips">#{filter_links}</div>
         <div class="card">
           <h2>Failures across all batches</h2>
@@ -228,12 +232,114 @@ module KafkaBatch
       HTML
     end
 
+    def render_lag
+      unless KafkaBatch::Lag.available?
+        return <<~HTML
+          <p><a class="back" href="#{index_path}">← All batches</a></p>
+          <div class="card">
+            <h2>Topic lag</h2>
+            <p class="muted">Lag requires Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p>
+          </div>
+        HTML
+      end
+
+      begin
+        rows = KafkaBatch::Lag.partitions
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch::Web] lag fetch failed: #{e.message}")
+        return <<~HTML
+          <p><a class="back" href="#{index_path}">← All batches</a></p>
+          <div class="card">
+            <h2>Topic lag</h2>
+            <p class="muted">Could not read lag from Kafka: <code>#{h(e.message)}</code></p>
+          </div>
+        HTML
+      end
+
+      total   = KafkaBatch::Lag.total(rows)
+      topics  = KafkaBatch::Lag.topics(rows)
+      groups  = rows.map { |r| r[:group] }.uniq.size
+
+      topic_rows = topics.map do |t|
+        "<tr><td class='mono'>#{h(t[:group])}</td><td class='mono'>#{h(t[:topic])}</td>" \
+        "<td>#{t[:partitions]}</td><td>#{lag_badge(t[:lag])}</td></tr>"
+      end.join
+      topic_rows = "<tr><td colspan='4' class='empty'>No consumed topics found.</td></tr>" if topics.empty?
+
+      part_rows = rows.map do |r|
+        committed = r[:never_consumed] ? "<span class='muted'>never consumed</span>" : r[:committed]
+        endoff    = r[:end_offset].nil? ? "<span class='muted'>—</span>" : r[:end_offset]
+        "<tr><td class='mono'>#{h(r[:group])}</td><td class='mono'>#{h(r[:topic])}</td>" \
+        "<td>#{r[:partition]}</td><td>#{committed}</td><td>#{endoff}</td><td>#{lag_badge(r[:lag])}</td></tr>"
+      end.join
+      part_rows = "<tr><td colspan='6' class='empty'>No partitions found.</td></tr>" if rows.empty?
+
+      <<~HTML
+        <p><a class="back" href="#{index_path}">← All batches</a></p>
+        <div class="metrics">
+          <div class="metric"><div class="metric-value">#{total}</div><div class="metric-label">Total pending</div></div>
+          <div class="metric"><div class="metric-value">#{topics.size}</div><div class="metric-label">Topics</div></div>
+          <div class="metric"><div class="metric-value">#{groups}</div><div class="metric-label">Consumer groups</div></div>
+        </div>
+        <div class="card">
+          <h3>Pending by topic</h3>
+          <p class="muted">Lag = messages produced but not yet committed by the consumer group (i.e. pending work). Auto-refreshing every 5s.</p>
+          <table>
+            <thead><tr><th>Group</th><th>Topic</th><th>Partitions</th><th>Pending (lag)</th></tr></thead>
+            <tbody>#{topic_rows}</tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Pending by partition</h3>
+          <table>
+            <thead><tr><th>Group</th><th>Topic</th><th>Partition</th><th>Committed</th><th>End offset</th><th>Pending (lag)</th></tr></thead>
+            <tbody>#{part_rows}</tbody>
+          </table>
+        </div>
+        <script>setTimeout(function(){ location.reload(); }, 5000);</script>
+      HTML
+    end
+
+    # Pending retries currently sitting on the retry topic (consumer lag),
+    # rendered as a metric on the failures page. Returns "" if lag is unavailable.
+    def retry_lag_metric
+      lag = retry_lag
+      return "" if lag.nil?
+      <<~HTML
+        <div class="metrics">
+          <div class="metric">
+            <div class="metric-value">#{lag_badge(lag)}</div>
+            <div class="metric-label">Pending retries (retry topic lag)</div>
+          </div>
+        </div>
+      HTML
+    end
+
+    # Total lag on the configured retry topic across consumer groups.
+    def retry_lag
+      return nil unless KafkaBatch::Lag.available?
+      rt = KafkaBatch.config.retry_topic
+      KafkaBatch::Lag.partitions.select { |r| r[:topic] == rt }.sum { |r| r[:lag].to_i }
+    rescue StandardError => e
+      KafkaBatch.logger.warn("[KafkaBatch::Web] retry_lag failed: #{e.message}")
+      nil
+    end
+
+    # Colour the lag number: grey at 0, amber when backed up.
+    def lag_badge(lag)
+      n = lag.to_i
+      return "<span class='muted'>0</span>" if n.zero?
+      color = n >= 1000 ? "#ef4444" : "#f59e0b"
+      "<span class='badge' style='background:#{color}'>#{n}</span>"
+    end
+
     def render_show(b)
       pend = pending(b)
       meta = b[:meta].nil? || b[:meta].empty? ? "—" : "<pre>#{h(b[:meta].inspect)}</pre>"
 
       rows = {
         "ID"             => h(b[:id]),
+        "Description"    => (non_empty(b[:description]) ? h(b[:description]) : "—"),
         "Status"         => status_badge(b[:status]),
         "Total jobs"     => b[:total_jobs],
         "Completed"      => b[:completed_count],
@@ -244,6 +350,7 @@ module KafkaBatch
         "Created at"     => fmt_time(b[:created_at]),
         "Finished at"    => fmt_time(b[:finished_at]),
         "Callback fired" => (b[:callback_dispatched_at].to_s.empty? ? "no" : fmt_time(b[:callback_dispatched_at])),
+        "Callback ran on" => (non_empty(b[:callback_dispatched_by]) ? "<span class='mono'>#{h(b[:callback_dispatched_by])}</span>" : "—"),
         "Meta"           => meta
       }.map { |k, v| "<tr><th>#{k}</th><td>#{v}</td></tr>" }.join
 
@@ -312,22 +419,38 @@ module KafkaBatch
       "<div class='metrics'>#{inner}</div>"
     end
 
-    def status_filters(active, counts)
-      links = [["All", nil]] + %w[running success complete cancelled].map { |s| [s.capitalize, s] }
-      items = links.map do |label, s|
+    def status_filters(active, counts, search = nil)
+      qparam = search ? "&q=#{CGI.escape(search)}" : ""
+      links  = [["All", nil]] + %w[running success complete cancelled].map { |s| [s.capitalize, s] }
+      items  = links.map do |label, s|
         cls  = (active == s || (s.nil? && active.nil?)) ? "chip active" : "chip"
-        href = s ? "#{index_path}?status=#{s}" : index_path
+        href = s ? "#{index_path}?status=#{s}#{qparam}" : "#{index_path}#{search ? "?q=#{CGI.escape(search)}" : ''}"
         n    = s ? " (#{counts[s].to_i})" : ""
         "<a class='#{cls}' href='#{href}'>#{label}#{n}</a>"
       end.join
       "<div class='chips'>#{items}</div>"
     end
 
+    # Search form (GET) filtering batches by id or description. Preserves the
+    # active status filter via a hidden field.
+    def search_box(search, status)
+      hidden = status ? "<input type='hidden' name='status' value='#{h(status)}'>" : ""
+      clear  = search ? "<a class='btn' href='#{index_path}#{status ? "?status=#{h(status)}" : ''}'>Clear</a>" : ""
+      <<~HTML
+        <form class="search" method="get" action="#{index_path}">
+          #{hidden}
+          <input type="text" name="q" value="#{h(search)}" placeholder="Search by batch ID or description…" autocomplete="off">
+          <button type="submit" class="btn">Search</button>#{clear}
+        </form>
+      HTML
+    end
+
     def batch_row(b)
       pend = pending(b)
+      desc = non_empty(b[:description]) ? "<div class='desc'>#{h(b[:description])}</div>" : ""
       <<~HTML
         <tr>
-          <td><a href="#{show_path(b[:id])}" class="mono">#{h(short_id(b[:id]))}</a></td>
+          <td><a href="#{show_path(b[:id])}" class="mono">#{h(short_id(b[:id]))}</a>#{desc}</td>
           <td>#{status_badge(b[:status])}</td>
           <td>#{b[:total_jobs]}</td>
           <td>#{b[:completed_count]}</td>
@@ -376,8 +499,10 @@ module KafkaBatch
       "<span class='badge' style='background:#{color}'>#{h(status)}</span>"
     end
 
-    def pagination(page, has_next, status)
-      qs = status ? "&status=#{status}" : ""
+    def pagination(page, has_next, status, search = nil)
+      qs = ""
+      qs += "&status=#{status}" if status
+      qs += "&q=#{CGI.escape(search)}" if search
       prev_link = page > 1 ? "<a class='btn' href='#{index_path}?page=#{page - 1}#{qs}'>← Prev</a>" : ""
       next_link = has_next ? "<a class='btn' href='#{index_path}?page=#{page + 1}#{qs}'>Next →</a>" : ""
       return "" if prev_link.empty? && next_link.empty?
@@ -411,6 +536,10 @@ module KafkaBatch
 
     def live_path
       "#{@script_name}/live"
+    end
+
+    def lag_path
+      "#{@script_name}/lag"
     end
 
     def show_path(id)
@@ -534,6 +663,13 @@ module KafkaBatch
       .page { color: #6b7280; font-size: 13px; }
       .back { color: #2563eb; text-decoration: none; }
       .muted { color: #9ca3af; }
+      .desc { color: #6b7280; font-size: 12px; margin-top: 3px; max-width: 320px; }
+      .filterbar { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+      .filterbar .chips { margin-bottom: 0; }
+      .filterbar .search { margin-bottom: 0; margin-left: auto; }
+      .search { display: flex; gap: 8px; margin-bottom: 12px; }
+      .search input[type=text] { width: 280px; padding: 6px 12px; border: 1px solid #d1d5db;
+                                 border-radius: 7px; font-size: 14px; }
       .detail th { width: 180px; color: #6b7280; vertical-align: top; }
       pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 12px; }
       h2 { margin-top: 0; }

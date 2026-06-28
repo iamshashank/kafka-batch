@@ -71,6 +71,16 @@ module KafkaBatch
     # ── TTL for batch metadata in Redis ─────────────────────────────────────
     attr_accessor :batch_ttl        # Integer – seconds; default 7 days
 
+    # ── Failure metadata retention (Redis store) ────────────────────────────
+    # Failure records are only a convenience view for the dashboard – the real
+    # job data is durable in Kafka (retry topic / dead-letter topic). To bound
+    # Redis RAM you can keep this metadata for less time and/or cap how many
+    # failing jobs are tracked per batch. When the cap is hit, additional NEW
+    # failing jobs are not recorded (existing ones still update); the feature
+    # keeps working, you just may not see every failure in the UI.
+    attr_accessor :failures_ttl              # Integer – seconds; default 1 day
+    attr_accessor :max_failures_per_batch    # Integer – 0 = unlimited; default 1000
+
     # ── Reconciliation ───────────────────────────────────────────────────────
     # A periodic sweep that re-checks "running" batches that look stuck.
     attr_accessor :reconciliation_interval  # Integer – seconds; default 300
@@ -120,6 +130,8 @@ module KafkaBatch
       @redis_url                = "redis://localhost:6379/0"
       @redis_pool_size          = 5
       @batch_ttl                = 7 * 24 * 3600  # 7 days
+      @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
+      @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600
       @producer_config          = {}

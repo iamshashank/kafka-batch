@@ -35,6 +35,13 @@ RSpec.describe KafkaBatch::Batch do
       expect(cb.first.payload["outcome"]).to eq("success")
     end
 
+    it "persists an optional description" do
+      batch = described_class.create(description: "Nightly report run") do |b|
+        b.push(SuccessfulWorker, {})
+      end
+      expect(KafkaBatch.store.find_batch(batch.id)[:description]).to eq("Nightly report run")
+    end
+
     it "fires the callback on seal when the (empty) batch is already complete" do
       batch = described_class.create(on_complete: "RecordingCallback") { |_b| }
 

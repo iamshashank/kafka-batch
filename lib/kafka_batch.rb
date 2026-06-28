@@ -12,6 +12,7 @@ require_relative "kafka_batch/stores/redis_store"
 require_relative "kafka_batch/producer"
 require_relative "kafka_batch/cancellation_cache"
 require_relative "kafka_batch/liveness"
+require_relative "kafka_batch/lag"
 require_relative "kafka_batch/worker"
 require_relative "kafka_batch/batch"
 require_relative "kafka_batch/reconciler"
@@ -32,6 +33,18 @@ module KafkaBatch
 
     def configure
       yield configuration
+    end
+
+    # Identifier for THIS process/pod, used to record which consumer ran a
+    # batch's callbacks. Prefers the K8s pod name (ENV["HOSTNAME"]) and falls
+    # back to the OS hostname; suffixed with the PID to disambiguate workers.
+    def node_id
+      @node_id ||= begin
+        require "socket"
+        host = ENV["HOSTNAME"]
+        host = Socket.gethostname if host.nil? || host.empty?
+        "#{host}##{Process.pid}"
+      end
     end
 
     # ── Store ──────────────────────────────────────────────────────────────

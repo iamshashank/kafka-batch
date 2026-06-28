@@ -90,8 +90,8 @@ module KafkaBatch
         # ── Claim AFTER invocation ─────────────────────────────────────────
         # Marking dispatch only after the callbacks have run guarantees that a
         # crash mid-invocation leads to re-invocation (at-least-once), never a
-        # silently lost callback.
-        KafkaBatch.store.claim_callback(batch_id)
+        # silently lost callback. Record which pod/process ran it for tracking.
+        KafkaBatch.store.claim_callback(batch_id, KafkaBatch.node_id)
 
         mark_as_consumed!(message)
       end

@@ -57,6 +57,15 @@ KafkaBatch.configure do |config|
   config.redis_pool_size = 5
   config.batch_ttl       = 7 * 24 * 3600  # 7 days; set nil to never expire
 
+  # ── Failure metadata retention (Redis) ────────────────────────────────────
+  # Failure records are only a dashboard convenience – the real job data is
+  # durable in Kafka (retry + dead-letter topics). Keep this metadata short and
+  # bounded so it can't grow Redis RAM unbounded. At the cap, new failing jobs
+  # stop being recorded (existing ones still update); you just may not see every
+  # failure in the UI.
+  config.failures_ttl           = 24 * 3600  # seconds; metadata retention
+  config.max_failures_per_batch = 1000       # 0 = unlimited
+
   # ── Reconciliation ─────────────────────────────────────────────────────────
   # Batches stuck in "running" older than this threshold are re-evaluated.
   # Trigger via: rake kafka_batch:reconcile (or a cron job)

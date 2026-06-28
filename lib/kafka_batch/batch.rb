@@ -40,11 +40,12 @@ module KafkaBatch
   class Batch
     attr_reader :id
 
-    def initialize(on_success: nil, on_complete: nil, meta: {}, id: nil)
+    def initialize(on_success: nil, on_complete: nil, meta: {}, description: nil, id: nil)
       @id          = id || SecureRandom.uuid
       @on_success  = on_success
       @on_complete = on_complete
       @meta        = meta
+      @description = description
     end
 
     # Create a new batch (persisted immediately with total_jobs = 0).
@@ -55,14 +56,15 @@ module KafkaBatch
     #
     # Without a block: the batch is sealed immediately and will complete as soon
     # as it drains. Returns the Batch for incremental pushing.
-    def self.create(on_success: nil, on_complete: nil, meta: {})
-      batch = new(on_success: on_success, on_complete: on_complete, meta: meta)
+    def self.create(on_success: nil, on_complete: nil, meta: {}, description: nil)
+      batch = new(on_success: on_success, on_complete: on_complete, meta: meta, description: description)
       KafkaBatch.store.create_batch(
         id:          batch.id,
         total_jobs:  0,
         on_success:  on_success,
         on_complete: on_complete,
         meta:        meta,
+        description: description,
         # Block form: hold the completion gate shut until population finishes.
         sealed:      !block_given?
       )
@@ -86,7 +88,8 @@ module KafkaBatch
         id:          id,
         on_success:  data[:on_success],
         on_complete: data[:on_complete],
-        meta:        data[:meta]
+        meta:        data[:meta],
+        description: data[:description]
       )
     end
 

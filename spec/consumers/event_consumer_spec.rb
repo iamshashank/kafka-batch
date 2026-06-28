@@ -32,6 +32,39 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     expect(cb.first.payload["on_complete"]).to eq("RecordingCallback")
   end
 
+  it "applies a whole poll in one batch, counting every event exactly once" do
+    id = SecureRandom.uuid
+    KafkaBatch.store.create_batch(id: id, total_jobs: 3, on_complete: "RecordingCallback")
+
+    msgs = [
+      event(id: id, status: "success", src_offset: 10),
+      event(id: id, status: "success", src_offset: 11),
+      event(id: id, status: "success", src_offset: 10),  # duplicate offset – must not double-count
+      event(id: id, status: "failed",  src_offset: 12)
+    ]
+    allow(consumer).to receive(:messages).and_return(msgs)
+
+    consumer.consume
+
+    b = KafkaBatch.store.find_batch(id)
+    expect(b[:completed_count]).to eq(2)  # offset 10 counted once
+    expect(b[:failed_count]).to eq(1)
+
+    cb = FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)
+    expect(cb.size).to eq(1)
+    expect(cb.first.payload["outcome"]).to eq("complete")
+  end
+
+  it "commits the poll exactly once (marks only the last message consumed)" do
+    id = SecureRandom.uuid
+    KafkaBatch.store.create_batch(id: id, total_jobs: 2)
+    msgs = [event(id: id, status: "success", src_offset: 1), event(id: id, status: "success", src_offset: 2)]
+    allow(consumer).to receive(:messages).and_return(msgs)
+
+    consumer.consume
+    expect(consumer).to have_received(:mark_as_consumed!).with(msgs.last).once
+  end
+
   it "produces a complete (not success) callback when a job failed" do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 2)

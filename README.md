@@ -213,6 +213,8 @@ Requires these migrations:
 | `add_callback_tracking_to_kafka_batch_records` | `callback_dispatched_at` column for callback dispatch tracking (duplicate suppression + lost-callback reconciliation) |
 | `create_kafka_batch_consumer_offsets` | Per-partition monotonic completion cursor (one row per `source_topic, source_partition`) |
 | `add_locked_at_to_kafka_batch_records` | `locked_at` column (the batch "sealed" marker that gates completion during block-form population) |
+| `add_description_to_kafka_batch_records` | optional `description` column shown in the Web UI |
+| `add_callback_dispatched_by_to_kafka_batch_records` | records which consumer pod/process ran the batch's callbacks |
 | `create_kafka_batch_failures` | Always-on per-batch failure log (upserted per failing job from the first failed attempt; bounded by failures, not total jobs) |
 | `create_kafka_batch_consumer_heartbeats` | Consumer heartbeats for the `:store` live-activity backend (one row per consumer; only needed if `liveness_backend = :store`) |
 
@@ -320,9 +322,10 @@ end
 ## Creating batches
 
 ```ruby
-batch_id = KafkaBatch::Batch.create(
+batch = KafkaBatch::Batch.create(
   on_success:  "BatchSuccessCallback",   # called if ALL jobs succeed
   on_complete: "BatchCompleteCallback",  # called when ALL jobs finish (any status)
+  description: "Nightly report rebuild",  # optional human label, shown in the Web UI
   meta: { report_id: 42, user_id: 99 }  # arbitrary data forwarded to callbacks
 ) do |b|
   Order.find_each do |order|
@@ -332,6 +335,8 @@ end
 
 puts batch.id  # => "550e8400-e29b-41d4-a716-446655440000"
 ```
+
+`description:` is an optional free-text label to help you tell batches apart in the dashboard (shown on both the list and detail pages). On the MySQL store it requires the `add_description_to_kafka_batch_records` migration; the Redis store needs nothing.
 
 There is **no lock step**. A batch stays **open** and accepts more jobs — from anywhere, including from jobs that belong to it — until it **completes** (all jobs done → callback fires) or is cancelled. The completion callback fires automatically the moment the batch drains (`completed + failed >= total_jobs`).
 

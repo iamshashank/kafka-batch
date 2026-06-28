@@ -84,7 +84,11 @@ module KafkaBatch
       # recreate a partial, TTL-less hash (orphan key); returns 0 in that case.
       CLAIM_CALLBACK_LUA = <<~LUA.freeze
         if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
-        return redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+        local won = redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
+        if won == 1 and ARGV[2] ~= '' then
+          redis.call('HSET', KEYS[1], 'callback_dispatched_by', ARGV[2])
+        end
+        return won
       LUA
 
       # Atomically create a batch record only if it does not already exist.
@@ -102,7 +106,8 @@ module KafkaBatch
           'on_complete',     ARGV[4],
           'meta',            ARGV[5],
           'created_at',      ARGV[6],
-          'locked_at',       ARGV[8]
+          'locked_at',       ARGV[8],
+          'description',     ARGV[9]
         )
         redis.call('EXPIRE', KEYS[1], tonumber(ARGV[7]))
         return 1
@@ -163,17 +168,39 @@ module KafkaBatch
         return 0
       LUA
 
+      # Record (upsert) a failure with a per-batch cap + TTL.
+      #   KEYS[1] failures hash; ARGV[1] job_id, ARGV[2] entry, ARGV[3] ttl, ARGV[4] cap
+      # Existing jobs always update (status/attempt change). A brand-new failing
+      # job is skipped once the cap is reached, bounding RAM – the real job data
+      # remains durable in Kafka, so this only trims the dashboard view.
+      # Returns 1 if stored, 0 if skipped due to the cap.
+      RECORD_FAILURE_LUA = <<~LUA.freeze
+        local cap = tonumber(ARGV[4])
+        if cap > 0 and redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then
+          if redis.call('HLEN', KEYS[1]) >= cap then
+            return 0
+          end
+        end
+        redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+        return 1
+      LUA
+
       def initialize
         cfg = KafkaBatch.config
         @pool = ConnectionPool.new(size: cfg.redis_pool_size, timeout: 5) do
           Redis.new(url: cfg.redis_url)
         end
-        @ttl = cfg.batch_ttl
+        @ttl          = cfg.batch_ttl
+        # Failure metadata is a UI convenience (real data lives in Kafka), so it
+        # gets its own shorter TTL and an optional per-batch cap to bound RAM.
+        @failures_ttl = (cfg.failures_ttl || cfg.batch_ttl).to_i
+        @failures_cap = cfg.max_failures_per_batch.to_i
       end
 
       # ── Public interface ──────────────────────────────────────────────────
 
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, sealed: true)
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, sealed: true)
         key = batch_key(id)
         now = Time.now
         with_redis do |r|
@@ -187,7 +214,8 @@ module KafkaBatch
               serialize(meta),
               now.iso8601,
               @ttl.to_s,
-              sealed ? now.iso8601 : ""
+              sealed ? now.iso8601 : "",
+              description.to_s
             ]
           )
           # Returns 1 if created, 0 if already existed (idempotent).
@@ -234,6 +262,42 @@ module KafkaBatch
         end
       end
 
+      # Batched counter application for a whole Kafka poll. Reuses the proven
+      # per-event Lua (atomic dedup + increment + finalize) but pipelines all the
+      # events in one network round-trip. Each event is still exactly-once via
+      # the per-partition offset cursor, so nothing is double-counted or missed.
+      # @return [Array<Hash>] { batch:, outcome: } for batches that just finished
+      def record_completions_batch(events)
+        return [] if events.empty?
+        now = Time.now.iso8601
+
+        results = with_redis do |r|
+          r.pipelined do |pipe|
+            events.each do |e|
+              field        = e[:status] == "success" ? "completed_count" : "failed_count"
+              offset_field = "#{e[:source_topic]}/#{e[:source_partition]}"
+              pipe.eval(BATCH_DONE_OFFSET_LUA,
+                keys: [batch_key(e[:batch_id]), OFFSETS_KEY],
+                argv: [offset_field, e[:source_offset].to_s, field, @ttl.to_s, now])
+            end
+          end
+        end
+
+        finalized = []
+        results.each_with_index do |res, i|
+          code, payload = res
+          next unless code == 1  # 1 == just finalized
+
+          batch_id = events[i][:batch_id]
+          with_redis do |r|
+            r.zrem(RUNNING_INDEX, batch_id)
+            r.zadd(DONE_INDEX, Time.now.to_f, batch_id)
+          end
+          finalized << { batch: find_batch(batch_id), outcome: payload }
+        end
+        finalized
+      end
+
       def add_jobs(id, count)
         code = with_redis do |r|
           r.eval(ADD_JOBS_LUA, keys: [batch_key(id)], argv: [count.to_i.to_s, @ttl.to_s])
@@ -264,12 +328,12 @@ module KafkaBatch
         end
       end
 
-      def claim_callback(id)
+      def claim_callback(id, dispatched_by = nil)
         now = Time.now.iso8601
         result = with_redis do |r|
           won = r.eval(CLAIM_CALLBACK_LUA,
             keys: [batch_key(id)],
-            argv: [now]
+            argv: [now, dispatched_by.to_s]
           )
           # Once dispatched the batch no longer needs reconciliation.
           r.zrem(DONE_INDEX, id) if won == 1
@@ -315,8 +379,10 @@ module KafkaBatch
         }, mode: :compat)
 
         with_redis do |r|
-          r.hset(failures_key(batch_id), job_id, entry)  # upsert per job_id
-          r.expire(failures_key(batch_id), @ttl)
+          r.eval(RECORD_FAILURE_LUA,
+            keys: [failures_key(batch_id)],
+            argv: [job_id, entry, @failures_ttl.to_s, @failures_cap.to_s]
+          )
         end
       end
 
@@ -370,10 +436,11 @@ module KafkaBatch
         sort_paginate(entries, limit, offset)
       end
 
-      def list_batches(status: nil, limit: 50, offset: 0)
+      def list_batches(status: nil, limit: 50, offset: 0, search: nil)
         ids = with_redis { |r| r.zrevrange(ALL_INDEX, 0, -1) }
         result  = []
         skipped = 0
+        q       = presence(search)&.downcase
 
         ids.each do |id|
           batch = find_batch(id)
@@ -382,6 +449,7 @@ module KafkaBatch
             next
           end
           next if status && batch[:status] != status
+          next if q && !batch_matches?(batch, q)
 
           if skipped < offset
             skipped += 1
@@ -563,12 +631,20 @@ module KafkaBatch
           status:                 h["status"],
           on_success:             presence(h["on_success"]),
           on_complete:            presence(h["on_complete"]),
+          description:            presence(h["description"]),
           meta:                   deserialize(h["meta"]),
           created_at:             h["created_at"],
           finished_at:            h["finished_at"],
           callback_dispatched_at: presence(h["callback_dispatched_at"]),
+          callback_dispatched_by: presence(h["callback_dispatched_by"]),
           locked_at:              presence(h["locked_at"])
         }
+      end
+
+      # Case-insensitive match of a batch against a search query (id or description).
+      def batch_matches?(batch, downcased_query)
+        batch[:id].to_s.downcase.include?(downcased_query) ||
+          batch[:description].to_s.downcase.include?(downcased_query)
       end
 
       def serialize(obj)

@@ -43,8 +43,8 @@ module KafkaBatch
 
       # ── Public interface ──────────────────────────────────────────────────
 
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, sealed: true)
-        batch_record_class.create!(
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, sealed: true)
+        attrs = {
           id:               id,
           total_jobs:       total_jobs,
           completed_count:  0,
@@ -54,7 +54,10 @@ module KafkaBatch
           on_complete:      on_complete,
           meta:             serialize(meta),
           locked_at:        sealed ? Time.now : nil  # locked_at == "sealed_at"
-        )
+        }
+        # Tolerate apps that haven't run the description migration yet.
+        attrs[:description] = description if batch_record_class.column_names.include?("description")
+        batch_record_class.create!(attrs)
       rescue ActiveRecord::RecordNotUnique
         nil  # idempotent – already created
       end
@@ -136,14 +139,82 @@ module KafkaBatch
         result
       end
 
+      # Batched counter application for a whole Kafka poll. One transaction:
+      #   1. dedup per source partition + advance each cursor once (to its max
+      #      new offset) — re-delivered offsets are skipped, none are missed;
+      #   2. aggregate +N per (batch, status);
+      #   3. apply one UPDATE per batch (rows locked in sorted id order to avoid
+      #      deadlocks) and finalize any batch that reached its total.
+      # @return [Array<Hash>] { batch:, outcome: } for batches that just finished
+      def record_completions_batch(events)
+        return [] if events.empty?
+
+        finalized = []
+        batch_record_class.transaction do
+          # ── Phase 1: dedup + advance cursors (sorted for stable lock order) ──
+          applicable = []
+          events.group_by { |e| [e[:source_topic], e[:source_partition]] }
+                .sort_by { |(t, p), _| [t.to_s, p.to_i] }
+                .each do |(topic, partition), evs|
+            cursor = consumer_offset_class.lock.find_by(source_topic: topic, source_partition: partition)
+            last   = cursor ? cursor.last_offset : -1
+            maxoff = last
+            seen   = {}
+            evs.each do |e|
+              off    = e[:source_offset].to_i
+              maxoff = off if off > maxoff
+              next if off <= last || seen[off]  # duplicate / already applied
+              seen[off] = true
+              applicable << e
+            end
+            if maxoff > last
+              cursor ? cursor.update!(last_offset: maxoff)
+                     : consumer_offset_class.create!(source_topic: topic, source_partition: partition, last_offset: maxoff)
+            end
+          end
+
+          # ── Phase 2: aggregate increments per batch ─────────────────────────
+          incr = Hash.new { |h, k| h[k] = [0, 0] }  # batch_id => [completed, failed]
+          applicable.each do |e|
+            idx = e[:status] == "success" ? 0 : 1
+            incr[e[:batch_id]][idx] += 1
+          end
+
+          # ── Phase 3: apply per batch + finalize (sorted id => no deadlocks) ──
+          incr.keys.sort.each do |batch_id|
+            done, failed = incr[batch_id]
+            record = batch_record_class.lock.find_by(id: batch_id)
+            next if record.nil?
+            next if %w[success complete cancelled].include?(record.status)
+
+            sets = []
+            sets << "completed_count = completed_count + #{done.to_i}" if done.positive?
+            sets << "failed_count = failed_count + #{failed.to_i}"     if failed.positive?
+            batch_record_class.where(id: batch_id).update_all(sets.join(", ")) unless sets.empty?
+            record.reload
+
+            if record.locked_at && record.completed_count + record.failed_count >= record.total_jobs
+              outcome = record.failed_count.positive? ? "complete" : "success"
+              record.update!(status: outcome, finished_at: Time.now)
+              finalized << { batch: record_to_hash(record), outcome: outcome }
+            end
+          end
+        end
+        finalized
+      end
+
       # Atomically claim callback dispatch rights.
       # Uses a conditional UPDATE (WHERE callback_dispatched_at IS NULL) as a
       # compare-and-swap.  Only the process whose UPDATE affected 1 row wins;
       # all others receive false and must skip callback invocation.
-      def claim_callback(id)
+      def claim_callback(id, dispatched_by = nil)
+        attrs = { callback_dispatched_at: Time.now }
+        if dispatched_by && batch_record_class.column_names.include?("callback_dispatched_by")
+          attrs[:callback_dispatched_by] = dispatched_by
+        end
         rows = batch_record_class
                  .where(id: id, callback_dispatched_at: nil)
-                 .update_all(callback_dispatched_at: Time.now)
+                 .update_all(attrs)
         rows > 0
       end
 
@@ -228,9 +299,17 @@ module KafkaBatch
         heartbeat_class.where("last_seen < ?", older_than).delete_all
       end
 
-      def list_batches(status: nil, limit: 50, offset: 0)
+      def list_batches(status: nil, limit: 50, offset: 0, search: nil)
         scope = batch_record_class.order(created_at: :desc)
         scope = scope.where(status: status) if status
+        if (q = presence(search))
+          like = "%#{sanitize_like(q)}%"
+          if batch_record_class.column_names.include?("description")
+            scope = scope.where("id LIKE :q OR description LIKE :q", q: like)
+          else
+            scope = scope.where("id LIKE :q", q: like)
+          end
+        end
         scope.limit(limit).offset(offset).map { |r| record_to_hash(r) }
       end
 
@@ -357,12 +436,25 @@ module KafkaBatch
           status:                 r.status,
           on_success:             r.on_success,
           on_complete:            r.on_complete,
+          description:            (r.respond_to?(:description) ? r.description : nil),
           meta:                   deserialize(r.meta),
           created_at:             r.created_at,
           finished_at:            r.respond_to?(:finished_at)            ? r.finished_at            : nil,
           callback_dispatched_at: r.respond_to?(:callback_dispatched_at) ? r.callback_dispatched_at : nil,
+          callback_dispatched_by: (r.respond_to?(:callback_dispatched_by) ? r.callback_dispatched_by : nil),
           locked_at:              r.respond_to?(:locked_at)              ? r.locked_at              : nil
         }
+      end
+
+      def presence(value)
+        return nil if value.nil?
+        s = value.to_s
+        s.empty? ? nil : s
+      end
+
+      # Escape LIKE wildcards so user input is matched literally.
+      def sanitize_like(str)
+        str.to_s.gsub(/[\\%_]/) { |c| "\\#{c}" }
       end
 
       def serialize(obj)

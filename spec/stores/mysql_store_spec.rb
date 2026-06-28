@@ -73,6 +73,63 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
       store.update_batch_status(id, "cancelled")
       expect(store.add_jobs(id, 1)).to eq(:cancelled)
     end
+
+    it "persists and returns an optional description" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 0, description: "weekly digest")
+      expect(store.find_batch(id)[:description]).to eq("weekly digest")
+    end
+
+    it "list_batches filters by id or description (case-insensitive)" do
+      a = SecureRandom.uuid
+      store.create_batch(id: a, total_jobs: 0, description: "Nightly Report")
+      b = SecureRandom.uuid
+      store.create_batch(id: b, total_jobs: 0, description: "weekly digest")
+
+      expect(store.list_batches(search: "nightly").map { |x| x[:id] }).to include(a)
+      expect(store.list_batches(search: "nightly").map { |x| x[:id] }).not_to include(b)
+      expect(store.list_batches(search: a[0, 8]).map { |x| x[:id] }).to include(a)
+    end
+  end
+
+  describe "#record_completions_batch" do
+    it "dedups by offset, aggregates per batch, and finalizes once" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 2)
+      events = [
+        { batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success" },
+        { batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success" }, # dup
+        { batch_id: id, source_topic: "wt", source_partition: 0, source_offset: 2, status: "failed" }
+      ]
+      finalized = store.record_completions_batch(events)
+
+      b = store.find_batch(id)
+      expect(b[:completed_count]).to eq(1)
+      expect(b[:failed_count]).to eq(1)
+      expect(finalized.size).to eq(1)
+      expect(finalized.first[:outcome]).to eq("complete")
+    end
+
+    it "does not double-count across calls (cursor persists)" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 5)
+      ev = ->(off, st) { { batch_id: id, source_topic: "wt", source_partition: 0, source_offset: off, status: st } }
+
+      store.record_completions_batch([ev.call(1, "success"), ev.call(2, "success")])
+      store.record_completions_batch([ev.call(2, "success"), ev.call(3, "success")]) # offset 2 replayed
+
+      b = store.find_batch(id)
+      expect(b[:completed_count]).to eq(3)  # offsets 1,2,3 — 2 not counted twice
+    end
+  end
+
+  describe "#claim_callback dispatched_by" do
+    it "records which consumer dispatched the callback" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 0)
+      store.claim_callback(id, "pod-7#123")
+      expect(store.find_batch(id)[:callback_dispatched_by]).to eq("pod-7#123")
+    end
   end
 
   describe "#record_completion_by_offset" do

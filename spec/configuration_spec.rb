@@ -24,6 +24,12 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.event_emit_retries).to eq(3)
       expect(config.event_emit_backoff).to eq(2)
     end
+
+    it "bounds failure-metadata retention separately from batch_ttl" do
+      expect(config.batch_ttl).to eq(7 * 24 * 3600)
+      expect(config.failures_ttl).to eq(24 * 3600)       # shorter than batch_ttl
+      expect(config.max_failures_per_batch).to eq(1000)
+    end
   end
 
   describe "#validate!" do
