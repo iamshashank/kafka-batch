@@ -191,6 +191,10 @@ KafkaBatch.configure do |config|
   config.retry_first_delay = 10  # seconds before the 1st retry
   config.retry_delay       = 180 # seconds before each later retry (3 min)
   config.retry_jitter      = 0.1 # +/- 10% randomization
+  # After this many retries a still-failing job counts toward on_complete while
+  # it keeps retrying in the background up to max_retries (per-Worker override).
+  # Default == max_retries default, so default behaviour is unchanged.
+  config.complete_after_retries = 3
 
   # ── Completion-event emission retries (inline; blocks the worker thread) ─
   config.event_emit_retries = 3
@@ -215,9 +219,16 @@ KafkaBatch.configure do |config|
   config.liveness_backend            = :redis
   config.liveness_ttl                = 30  # seconds a heartbeat/entry is "live"
   config.liveness_heartbeat_interval = 5   # :store throttle: 1 write/consumer/N s
+  config.track_running_jobs          = true # gate :redis per-job running-state writes
+
+  # ── Multi-tenant fairness (Kafka-only, opt-in; see the Fairness section) ─
+  config.fairness_enabled        = false
+  config.fairness_ready_lag_high = 5000 # dispatcher pauses forwarding above this depth
+  config.fairness_ready_lag_low  = 1000 # ...resumes below this depth
 
   # ── Reconciliation ───────────────────────────────────────────────────
-  config.reconciliation_interval = 300  # seconds
+  config.reconciliation_interval = 300  # seconds (re-check stuck "running" batches)
+  config.reconciler_lock_ttl     = 600  # seconds; distributed-lock TTL for one sweep
 
   # ── Topic validation at boot ─────────────────────────────────────────
   # When true, Rails boot raises if any required topics are missing in Kafka.
@@ -229,6 +240,56 @@ KafkaBatch.configure do |config|
   # config.consumer_config = { "fetch.min.bytes"  => "1024"   }
 end
 ```
+
+### Full config reference
+
+Every option on `KafkaBatch.config`:
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `store` | Symbol | `:mysql` | State store for counters/cursors/failures: `:mysql` or `:redis` |
+| `brokers` | Array&lt;String&gt; | `["localhost:9092"]` | Kafka bootstrap brokers |
+| `consumer_group` | String | `"kafka-batch"` | Base consumer-group name (suffixed `-control` / `-jobs` / `-dispatch`) |
+| `logger` | Logger | `Rails.logger` | Logger instance |
+| `jobs_topic` | String | `"kafka_batch.jobs"` | Default worker jobs topic (non-fairness) |
+| `events_topic` | String | `"kafka_batch.events"` | Completion-event topic |
+| `callbacks_topic` | String | `"kafka_batch.callbacks"` | Batch-callback topic |
+| `retry_topic` | String | `"kafka_batch.jobs.retry"` | Retry topic |
+| `dead_letter_topic` | String | `"kafka_batch.dead_letter"` | Dead-letter topic |
+| `max_retries` | Integer | `3` | Retry attempts before dead-letter (per-Worker override) |
+| `retry_first_delay` | Integer (s) | `10` | Delay before the 1st retry |
+| `retry_delay` | Integer (s) | `180` | Delay before each later retry |
+| `retry_jitter` | Float | `0.1` | ± randomization on retry delays |
+| `complete_after_retries` | Integer | `3` | Count a still-failing job toward `on_complete` after N retries (keeps retrying in bg; per-Worker override) |
+| `event_emit_retries` | Integer | `3` | Inline retries when producing a completion event |
+| `event_emit_backoff` | Integer (s) | `2` | Linear backoff for event-emit retries (`attempt × backoff`) |
+| `skip_cancelled_jobs` | Boolean | `true` | Skip jobs whose batch was cancelled |
+| `cancellation_cache_ttl` | Integer (s) | `120` | Refresh interval for the per-process cancelled-batch cache |
+| `redis_url` | String | `"redis://localhost:6379/0"` | Redis URL (used by `:redis` store and `:redis` liveness) |
+| `redis_pool_size` | Integer | `5` | Redis connection-pool size |
+| `batch_ttl` | Integer (s) | `604800` (7d) | TTL for Redis batch keys |
+| `failures_ttl` | Integer (s) | `86400` (1d) | TTL for the Redis failure log |
+| `max_failures_per_batch` | Integer | `1000` | Cap on tracked failing jobs per batch (Redis; `0` = unlimited) |
+| `liveness_backend` | Symbol | `:redis` | `/live` source: `:redis`, `:store`, or `:off` |
+| `liveness_ttl` | Integer (s) | `30` | How long a heartbeat/entry is considered live |
+| `liveness_heartbeat_interval` | Integer (s) | `5` | `:store` heartbeat write throttle |
+| `track_running_jobs` | Boolean | `true` | Gate per-job running-state writes (`:redis` liveness) |
+| `fairness_enabled` | Boolean | `false` | Enable multi-tenant fairness (Kafka-only dispatcher) |
+| `fairness_ingest_topic` | String | `"kafka_batch.ingest"` | Per-tenant intake topic (fairness) |
+| `fairness_ready_topic` | String | `"kafka_batch.ready"` | Throttled execution topic (fairness) |
+| `fairness_ready_lag_high` | Integer | `5000` | Dispatcher pauses forwarding above this ready-topic depth |
+| `fairness_ready_lag_low` | Integer | `1000` | Dispatcher resumes forwarding below this depth |
+| `fairness_global_concurrency` | Integer | `50` | **Optional `Scheduler` only** — total in-flight slots |
+| `fairness_max_inflight_per_tenant` | Integer | `0` | **Optional `Scheduler` only** — per-tenant cap (`0` = none) |
+| `fairness_ready_window` | Integer | `500` | **Optional `Scheduler` only** — bounded ready jobs/tenant in Redis |
+| `fairness_default_weight` | Float | `1.0` | **Optional `Scheduler` only** — default tenant weight |
+| `reconciliation_interval` | Integer (s) | `300` | Age after which a "running" batch is re-checked by the reconciler |
+| `reconciler_lock_ttl` | Integer (s) | `600` | Distributed-lock TTL for one reconciler sweep |
+| `producer_config` | Hash | `{}` | Raw rdkafka/WaterDrop producer overrides |
+| `consumer_config` | Hash | `{}` | Raw rdkafka consumer overrides (merged into every consumer) |
+| `validate_topics_on_boot` | Boolean | `false` | Raise at boot if required topics are missing |
+
+**Per-Worker overrides** (on the worker class, not `config`): `kafka_topic` (required), `max_retries`, `complete_after_retries`.
 
 ### Choosing a store
 
@@ -362,8 +423,9 @@ Include `KafkaBatch::Worker` and implement `#perform`:
 class ProcessOrderWorker
   include KafkaBatch::Worker
 
-  kafka_topic   "orders.process"   # required – Kafka topic to consume from
-  max_retries   5                  # optional – overrides config.max_retries
+  kafka_topic            "orders.process" # required – Kafka topic to consume from
+  max_retries            5                # optional – overrides config.max_retries
+  complete_after_retries 3                # optional – overrides config.complete_after_retries
 
   # payload is the Hash passed to Batch#push or Batch.enqueue
   def perform(payload)
