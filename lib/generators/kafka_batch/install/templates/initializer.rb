@@ -14,6 +14,7 @@ KafkaBatch.configure do |config|
   config.events_topic      = "kafka_batch.events"
   config.callbacks_topic   = "kafka_batch.callbacks"
   config.dead_letter_topic = "kafka_batch.dead_letter"
+  # Retry-topic prefix; the actual per-tier topics are <prefix>.short/.medium/.large.
   config.retry_topic       = "kafka_batch.jobs.retry"
 
   # ── Consumer group ─────────────────────────────────────────────────────────
@@ -39,12 +40,15 @@ KafkaBatch.configure do |config|
   config.liveness_heartbeat_interval = 5  # seconds (:store write throttle)
 
   # ── Retry behaviour ────────────────────────────────────────────────────────
-  # Fixed, short schedule (Kafka-friendly): 1st retry after retry_first_delay,
-  # every later retry after retry_delay, with +/- retry_jitter randomization.
-  config.max_retries      = 3    # attempts before dead letter (override per Worker)
-  config.retry_first_delay = 10  # seconds before the 1st retry
-  config.retry_delay       = 180 # seconds before each later retry (3 min)
-  config.retry_jitter      = 0.1 # +/- 10% to avoid retry storms
+  # Tiered retries: each delay tier has its own Kafka topic
+  # (<retry_topic>.short/.medium/.large), so a slow tier never head-of-line-
+  # blocks a fast one. By default the Nth retry walks the progression
+  # (1st->short, 2nd->medium, 3rd+->large). A Worker can pin all of its retries
+  # to one tier with `retry_tier :medium`.
+  config.max_retries            = 3    # attempts before dead letter (override per Worker)
+  config.retry_jitter           = 0.1  # +/- 10% to avoid retry storms
+  config.retry_tiers            = { short: 30, medium: 7 * 60, large: 20 * 60 } # seconds
+  config.retry_tier_progression = %i[short medium large]
 
   # After this many retries a still-failing job counts toward its batch's
   # on_complete (counted as failed) so the batch needn't wait for the full retry

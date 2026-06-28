@@ -6,11 +6,13 @@ module KafkaBatch
   module Consumers
     # Karafka consumer that processes individual batch jobs.
     #
-    # Retry strategy – dedicated retry topic (non-blocking):
-    #   On failure, the message is forwarded to KafkaBatch.config.retry_topic
-    #   with a `retry_after` timestamp and `retry_to` (original topic) embedded.
+    # Retry strategy – tiered retry topics (non-blocking):
+    #   On failure, the message is forwarded to the retry topic for the chosen
+    #   delay tier (config.retry_topic_for(tier)) with a `retry_after` timestamp
+    #   and `retry_to` (original topic) embedded. The tier is the worker's
+    #   `retry_tier` override, else config.retry_tier_progression by retry index.
     #   A separate RetryConsumer handles the wait and re-enqueue, so this
-    #   consumer's partition is never blocked during backoff.
+    #   consumer's partition is never blocked during the delay.
     #
     # Rescue scope separation:
     #   worker#perform errors and event-emission errors are caught in separate
@@ -183,12 +185,11 @@ module KafkaBatch
 
         if attempt < max_retries
           next_attempt = attempt + 1
-          delay        = KafkaBatch::Backoff.delay(
-            next_attempt: next_attempt,
-            first_delay:  KafkaBatch.config.retry_first_delay,
-            interval:     KafkaBatch.config.retry_delay,
-            jitter:       KafkaBatch.config.retry_jitter
-          )
+          # Pick the delay tier (worker override wins, else walk the progression)
+          # and route the retry to that tier's own topic so a slow tier never
+          # head-of-line-blocks a fast one.
+          tier         = KafkaBatch.config.retry_tier_for(next_attempt, data["retry_tier"])
+          delay        = KafkaBatch.config.retry_delay_for(tier)
           retry_after  = Time.now + delay
 
           # Record the failure on EVERY attempt (not just exhaustion) so problems
@@ -222,6 +223,7 @@ module KafkaBatch
             job_id:        job_id,
             next_attempt:  next_attempt,
             retry_after:   retry_after,
+            tier:          tier,
             worker_class:  worker_class,
             batch_id:      batch_id,
             batch_counted: batch_counted
@@ -246,14 +248,14 @@ module KafkaBatch
       # The RetryConsumer uses Karafka pause to wait until retry_after, then
       # re-enqueues back to the original topic – zero blocking here.
       def schedule_retry(message:, data:, job_id:, next_attempt:, retry_after:,
-                         worker_class: nil, batch_id: nil, batch_counted: false)
+                         tier:, worker_class: nil, batch_id: nil, batch_counted: false)
         KafkaBatch.logger.info(
           "[KafkaBatch][JobConsumer] Scheduling retry for job_id=#{job_id} " \
-          "attempt=#{next_attempt} at #{retry_after.iso8601}"
+          "attempt=#{next_attempt} tier=#{tier} at #{retry_after.iso8601}"
         )
 
         KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.retry_topic,
+          topic:   KafkaBatch.config.retry_topic_for(tier),
           payload: data.merge(
             "attempt"       => next_attempt,
             "retry_after"   => retry_after.iso8601,

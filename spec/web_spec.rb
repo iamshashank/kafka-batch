@@ -193,18 +193,22 @@ RSpec.describe KafkaBatch::Web do
       expect(html).not_to include(">All<")
     end
 
-    it "shows the retry topic lag (pending retries) when available" do
+    it "shows the total and per-tier pending retries when available" do
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
       allow(KafkaBatch::Lag).to receive(:partitions).and_return(
         [
-          { group: "g-control", topic: KafkaBatch.config.retry_topic, partition: 0, lag: 4 },
-          { group: "g-jobs",    topic: "something.else",              partition: 0, lag: 9 }
+          { group: "g-control", topic: KafkaBatch.config.retry_topic_for(:short),  partition: 0, lag: 3 },
+          { group: "g-control", topic: KafkaBatch.config.retry_topic_for(:short),  partition: 1, lag: 2 },
+          { group: "g-control", topic: KafkaBatch.config.retry_topic_for(:medium), partition: 0, lag: 1 },
+          { group: "g-jobs",    topic: "something.else",                           partition: 0, lag: 9 }
         ]
       )
 
       html = get("/failures").last.join
-      expect(html).to include("Pending retries (retry topic lag)")
-      expect(html).to include(">4<") # only the retry topic's lag, not 13
+      expect(html).to include("Pending retries (all tiers)")
+      expect(html).to include("short tier", "medium tier", "large tier")
+      expect(html).to include(">6<") # total across tier topics (3+2+1), not 15
+      expect(html).to include(">5<") # short tier (3+2)
     end
   end
 

@@ -10,10 +10,56 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.jobs_topic).to eq("kafka_batch.jobs")
       expect(config.retry_topic).to eq("kafka_batch.jobs.retry")
       expect(config.max_retries).to eq(3)
-      expect(config.retry_first_delay).to eq(10)
-      expect(config.retry_delay).to eq(180)
       expect(config.retry_jitter).to eq(0.1)
       expect(config.complete_after_retries).to eq(3)
+    end
+
+    it "ships tiered retry delays (short/medium/large)" do
+      expect(config.retry_tiers).to eq(short: 30, medium: 420, large: 1200)
+      expect(config.retry_tier_progression).to eq(%i[short medium large])
+    end
+
+    it "derives a retry topic per tier" do
+      expect(config.retry_topic_for(:short)).to eq("kafka_batch.jobs.retry.short")
+      expect(config.retry_topic_for(:medium)).to eq("kafka_batch.jobs.retry.medium")
+      expect(config.retry_topic_for(:large)).to eq("kafka_batch.jobs.retry.large")
+      expect(config.retry_topics).to eq(%w[
+        kafka_batch.jobs.retry.short
+        kafka_batch.jobs.retry.medium
+        kafka_batch.jobs.retry.large
+      ])
+    end
+
+    it "walks the progression by retry index, clamping to the last tier" do
+      expect(config.retry_tier_for(1)).to eq(:short)
+      expect(config.retry_tier_for(2)).to eq(:medium)
+      expect(config.retry_tier_for(3)).to eq(:large)
+      expect(config.retry_tier_for(4)).to eq(:large)
+      expect(config.retry_tier_for(99)).to eq(:large)
+    end
+
+    it "honours a valid worker tier override regardless of attempt" do
+      expect(config.retry_tier_for(1, :large)).to eq(:large)
+      expect(config.retry_tier_for(5, "short")).to eq(:short)
+    end
+
+    it "ignores an unknown worker tier and falls back to the progression" do
+      expect(config.retry_tier_for(2, :bogus)).to eq(:medium)
+    end
+
+    it "applies the tier delay (no jitter) when retry_jitter is 0" do
+      config.retry_jitter = 0
+      expect(config.retry_delay_for(:short)).to eq(30.0)
+      expect(config.retry_delay_for(:medium)).to eq(420.0)
+      expect(config.retry_delay_for(:large)).to eq(1200.0)
+    end
+
+    it "keeps the tier delay within the jitter band" do
+      config.retry_jitter = 0.1
+      100.times do
+        d = config.retry_delay_for(:short)
+        expect(d).to be_between(27.0, 33.0)
+      end
     end
 
     it "decouples the reconciler lock TTL from the staleness threshold" do

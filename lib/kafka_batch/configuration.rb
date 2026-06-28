@@ -47,13 +47,14 @@ module KafkaBatch
     attr_accessor :liveness_heartbeat_interval # Integer – seconds; default 5 (:store write throttle)
 
     # ── Retry behaviour ──────────────────────────────────────────────────────
-    # Fixed, short retry schedule (Kafka-friendly): the 1st retry after
-    # retry_first_delay, every subsequent retry after retry_delay, with optional
-    # +/- retry_jitter to avoid synchronized retry storms.
-    attr_accessor :max_retries        # Integer – attempts before dead letter (worker can override)
-    attr_accessor :retry_first_delay  # Integer – seconds before the 1st retry (default 10)
-    attr_accessor :retry_delay        # Integer – seconds before each later retry (default 180)
-    attr_accessor :retry_jitter       # Float   – +/- fraction of randomization (default 0.1)
+    # Tiered retries: each delay tier has its own Kafka topic, so a slow tier
+    # never head-of-line-blocks a fast one (within a topic, FIFO == due order).
+    # By default the Nth retry walks the progression (1st→short, 2nd→medium,
+    # 3rd+→large); a Worker can pin all its retries to one tier via `retry_tier`.
+    attr_accessor :max_retries             # Integer – attempts before dead letter (worker can override)
+    attr_accessor :retry_jitter            # Float   – +/- fraction of randomization (default 0.1)
+    attr_accessor :retry_tiers             # Hash{Symbol=>Integer} – tier => delay seconds
+    attr_accessor :retry_tier_progression  # Array<Symbol> – default tier per retry index
 
     # After this many retries a still-failing job counts toward its batch's
     # on_complete (as failed) so the batch needn't wait for the full retry budget
@@ -161,9 +162,9 @@ module KafkaBatch
       @retry_topic              = "kafka_batch.jobs.retry"
       @consumer_group           = "kafka-batch"
       @max_retries              = 3
-      @retry_first_delay        = 10   # seconds
-      @retry_delay              = 180  # seconds (3 minutes)
       @retry_jitter             = 0.1  # +/- 10%
+      @retry_tiers              = { short: 30, medium: 7 * 60, large: 20 * 60 }
+      @retry_tier_progression   = %i[short medium large]
       @complete_after_retries   = 3    # == max_retries default → no early completion by default
       @event_emit_retries       = 3
       @event_emit_backoff       = 2
@@ -188,6 +189,39 @@ module KafkaBatch
       @consumer_config          = {}
       @validate_topics_on_boot  = false
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
+    end
+
+    # ── Retry tier helpers ───────────────────────────────────────────────────
+
+    # Kafka topic for a given retry tier, e.g. "kafka_batch.jobs.retry.short".
+    def retry_topic_for(tier)
+      "#{retry_topic}.#{tier}"
+    end
+
+    # All tier retry topics (one per configured tier).
+    def retry_topics
+      retry_tiers.keys.map { |t| retry_topic_for(t) }
+    end
+
+    # Tier for the upcoming retry. A worker override (if it's a valid tier) wins;
+    # otherwise walk the progression by retry index (1st retry → progression[0]),
+    # clamping to the last tier for all further retries.
+    # @return [Symbol]
+    def retry_tier_for(next_attempt, worker_tier = nil)
+      wt = worker_tier&.to_sym
+      return wt if wt && retry_tiers.key?(wt)
+
+      prog = retry_tier_progression
+      prog[[next_attempt.to_i - 1, prog.size - 1].min] || prog.last
+    end
+
+    # Delay (seconds) for a tier, with +/- retry_jitter applied to avoid storms.
+    def retry_delay_for(tier)
+      base = retry_tiers.fetch(tier.to_sym) { retry_tiers.values.first }.to_f
+      j    = retry_jitter.to_f
+      return base if j <= 0
+
+      base * (1 + ((rand * 2) - 1) * j)
     end
 
     def validate!

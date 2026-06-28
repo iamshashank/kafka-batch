@@ -302,29 +302,48 @@ module KafkaBatch
       HTML
     end
 
-    # Pending retries currently sitting on the retry topic (consumer lag),
-    # rendered as a metric on the failures page. Returns "" if lag is unavailable.
+    # Pending retries sitting on the retry topics (consumer lag), rendered on the
+    # failures page as a total plus a per-tier breakdown (short/medium/large).
+    # Returns "" if lag is unavailable.
     def retry_lag_metric
-      lag = retry_lag
-      return "" if lag.nil?
-      <<~HTML
-        <div class="metrics">
-          <div class="metric">
-            <div class="metric-value">#{lag_badge(lag)}</div>
-            <div class="metric-label">Pending retries (retry topic lag)</div>
-          </div>
-        </div>
-      HTML
+      by_tier = retry_lag_by_tier
+      return "" if by_tier.nil?
+
+      total = by_tier.values.sum
+      cards = +%(<div class="metric"><div class="metric-value">#{lag_badge(total)}</div>) +
+              %(<div class="metric-label">Pending retries (all tiers)</div></div>)
+      by_tier.each do |tier, lag|
+        cards << %(<div class="metric"><div class="metric-value">#{lag_badge(lag)}</div>) +
+                 %(<div class="metric-label">#{tier} tier (#{tier_delay_label(tier)})</div></div>)
+      end
+
+      %(<div class="metrics">#{cards}</div>)
     end
 
-    # Total lag on the configured retry topic across consumer groups.
-    def retry_lag
+    # Pending (lag) per retry tier topic: { short: N, medium: N, large: N }.
+    # nil when lag introspection is unavailable.
+    def retry_lag_by_tier
       return nil unless KafkaBatch::Lag.available?
-      rt = KafkaBatch.config.retry_topic
-      KafkaBatch::Lag.partitions.select { |r| r[:topic] == rt }.sum { |r| r[:lag].to_i }
+      parts = KafkaBatch::Lag.partitions
+      KafkaBatch.config.retry_tiers.keys.each_with_object({}) do |tier, h|
+        topic  = KafkaBatch.config.retry_topic_for(tier)
+        h[tier] = parts.select { |r| r[:topic] == topic }.sum { |r| r[:lag].to_i }
+      end
     rescue StandardError => e
-      KafkaBatch.logger.warn("[KafkaBatch::Web] retry_lag failed: #{e.message}")
+      KafkaBatch.logger.warn("[KafkaBatch::Web] retry_lag_by_tier failed: #{e.message}")
       nil
+    end
+
+    # Total lag across all retry tier topics (used by callers wanting one number).
+    def retry_lag
+      by_tier = retry_lag_by_tier
+      by_tier&.values&.sum
+    end
+
+    # Human delay for a tier, e.g. "~30s" / "~7m".
+    def tier_delay_label(tier)
+      secs = KafkaBatch.config.retry_tiers[tier].to_i
+      secs >= 60 ? "~#{secs / 60}m" : "~#{secs}s"
     end
 
     def render_fairness

@@ -195,7 +195,8 @@ module KafkaBatch
         "complete_after_retries" => worker_class.complete_after_retries,
         "enqueued_at"            => Time.now.iso8601
       }
-      msg["tenant_id"] = tenant_id if tenant_id
+      msg["tenant_id"]  = tenant_id            if tenant_id
+      msg["retry_tier"] = worker_class.retry_tier.to_s if worker_class.retry_tier
       msg
     end
 

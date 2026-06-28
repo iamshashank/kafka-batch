@@ -23,12 +23,15 @@ module KafkaBatch
     end
 
     module ClassMethods
-      # Kafka topic this worker consumes from.
+      # Kafka topic this worker consumes from. When a worker doesn't declare one,
+      # it falls back to the shared default queue (config.jobs_topic) — multiple
+      # such workers share that topic, and JobConsumer dispatches each message to
+      # the right worker via its embedded worker_class.
       def kafka_topic(name = nil)
         if name
           @kafka_topic = name.to_s
         else
-          @kafka_topic || raise(ConfigurationError, "#{self}.kafka_topic is not set")
+          @kafka_topic || KafkaBatch.config.jobs_topic
         end
       end
 
@@ -50,6 +53,21 @@ module KafkaBatch
           @complete_after_retries = n.to_i
         else
           @complete_after_retries || KafkaBatch.config.complete_after_retries
+        end
+      end
+
+      # Pin every retry of this worker to a single delay tier (e.g. :short,
+      # :medium, :large) instead of walking the default progression. Pass nil
+      # (default) to use config.retry_tier_progression.
+      #
+      #   retry_tier :medium   # all retries wait ~7 min
+      #
+      # @return [Symbol, nil]
+      def retry_tier(tier = :__unset__)
+        if tier == :__unset__
+          @retry_tier
+        else
+          @retry_tier = tier&.to_sym
         end
       end
     end

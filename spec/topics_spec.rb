@@ -1,0 +1,121 @@
+RSpec.describe KafkaBatch::Topics do
+  def stub_existing(names)
+    info = double("cluster_info", topics: names.map { |n| { topic_name: n } })
+    allow(Karafka::Admin).to receive(:cluster_info).and_return(info)
+  end
+
+  describe ".specs" do
+    it "covers each registered worker's job topic + control + tier retries + DLT" do
+      KafkaBatch.config.fairness_enabled = false
+      allow(KafkaBatch).to receive(:workers).and_return([SuccessfulWorker, FailingWorker])
+      names = described_class.specs.map { |s| s[:name] }
+
+      expect(names).to include(
+        SuccessfulWorker.kafka_topic,   # per-worker job topic, not config.jobs_topic
+        FailingWorker.kafka_topic,
+        KafkaBatch.config.events_topic,
+        KafkaBatch.config.callbacks_topic,
+        KafkaBatch.config.dead_letter_topic,
+        *KafkaBatch.config.retry_topics
+      )
+      expect(names).not_to include(KafkaBatch.config.jobs_topic)
+    end
+
+    it "skips registry entries that don't respond to kafka_topic rather than raising" do
+      KafkaBatch.config.fairness_enabled = false
+      bad = Class.new # not a Worker, no kafka_topic
+      allow(KafkaBatch).to receive(:workers).and_return([SuccessfulWorker, bad])
+      expect { described_class.specs }.not_to raise_error
+    end
+
+    it "falls back to config.jobs_topic when no workers are registered" do
+      KafkaBatch.config.fairness_enabled = false
+      allow(KafkaBatch).to receive(:workers).and_return([])
+      names = described_class.specs.map { |s| s[:name] }
+
+      expect(names).to include(KafkaBatch.config.jobs_topic)
+    end
+
+    it "creates one topic per retry tier" do
+      tiers = described_class.specs.select { |s| KafkaBatch.config.retry_topics.include?(s[:name]) }
+      expect(tiers.size).to eq(3)
+      expect(tiers.map { |s| s[:partitions] }).to all(eq(KafkaBatch::Topics::DEFAULT_PARTITIONS[:retry]))
+    end
+
+    it "swaps the jobs topic for ingest/ready when fairness is enabled" do
+      KafkaBatch.config.fairness_enabled = true
+      names = described_class.specs.map { |s| s[:name] }
+
+      expect(names).to include(KafkaBatch.config.fairness_ingest_topic, KafkaBatch.config.fairness_ready_topic)
+      expect(names).not_to include(KafkaBatch.config.jobs_topic)
+    end
+
+    it "forces every topic to the given partition count when provided" do
+      specs = described_class.specs(partitions: 9)
+      expect(specs.map { |s| s[:partitions] }).to all(eq(9))
+    end
+
+    it "applies the replication factor" do
+      specs = described_class.specs(replication_factor: 3)
+      expect(specs.map { |s| s[:replication_factor] }).to all(eq(3))
+    end
+  end
+
+  describe ".create_all!" do
+    before { KafkaBatch.config.fairness_enabled = false }
+
+    it "creates only the missing topics and skips the existing ones" do
+      stub_existing([KafkaBatch.config.events_topic, KafkaBatch.config.callbacks_topic])
+      created = []
+      allow(Karafka::Admin).to receive(:create_topic) { |name, *_| created << name }
+
+      result = described_class.create_all!
+
+      expect(result[:skipped]).to include(KafkaBatch.config.events_topic, KafkaBatch.config.callbacks_topic)
+      expect(created).to include(*KafkaBatch.config.retry_topics, KafkaBatch.config.dead_letter_topic)
+      expect(result[:created]).to match_array(created)
+      expect(result[:failed]).to be_empty
+    end
+
+    it "passes partition + replication factor through to Karafka::Admin" do
+      stub_existing([])
+      allow(Karafka::Admin).to receive(:create_topic)
+
+      described_class.create_all!(partitions: 4, replication_factor: 2)
+
+      expect(Karafka::Admin).to have_received(:create_topic)
+        .with(KafkaBatch.config.retry_topic_for(:short), 4, 2)
+    end
+
+    it "treats an 'already exists' error as skipped, not failed" do
+      stub_existing([])  # nothing known up front
+      allow(Karafka::Admin).to receive(:create_topic).and_raise(StandardError.new("Topic already exists"))
+
+      result = described_class.create_all!
+
+      expect(result[:created]).to be_empty
+      expect(result[:failed]).to be_empty
+      expect(result[:skipped]).not_to be_empty
+    end
+
+    it "records genuine failures without aborting the rest" do
+      stub_existing([])
+      call = 0
+      allow(Karafka::Admin).to receive(:create_topic) do |name, *_|
+        call += 1
+        raise StandardError, "boom" if call == 1
+      end
+
+      result = described_class.create_all!
+
+      expect(result[:failed].size).to eq(1)
+      expect(result[:created]).not_to be_empty
+    end
+
+    it "raises a clear error when Karafka::Admin is unavailable" do
+      hide_const("Karafka::Admin")
+      expect { described_class.create_all! }
+        .to raise_error(KafkaBatch::ConfigurationError, /Karafka::Admin is required/)
+    end
+  end
+end

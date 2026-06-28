@@ -13,6 +13,7 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     }
     payload["complete_after_retries"] = complete_after_retries unless complete_after_retries.nil?
     payload["batch_counted"]          = batch_counted if batch_counted
+    payload["retry_tier"]             = worker.retry_tier.to_s if worker.respond_to?(:retry_tier) && worker.retry_tier
     FakeMessage.new(topic: topic || worker.kafka_topic, offset: offset, payload: payload)
   end
 
@@ -20,8 +21,16 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     FakeProducer.for_topic(KafkaBatch.config.events_topic).select { |m| m.payload["job_id"] == job_id }
   end
 
+  # Search across all tier retry topics (short/medium/large).
   def retry_for(job_id)
-    FakeProducer.for_topic(KafkaBatch.config.retry_topic).find { |m| m.payload["job_id"] == job_id }
+    KafkaBatch.config.retry_topics.flat_map { |t| FakeProducer.for_topic(t) }
+              .find { |m| m.payload["job_id"] == job_id }
+  end
+
+  def retry_topic_used(job_id)
+    KafkaBatch.config.retry_topics.find do |t|
+      FakeProducer.for_topic(t).any? { |m| m.payload["job_id"] == job_id }
+    end
   end
 
   describe "early batch completion (complete_after_retries)" do
@@ -94,15 +103,32 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
   end
 
   describe "failing job with retries remaining" do
-    it "schedules a retry on the retry topic with incremented attempt" do
+    it "schedules a retry on the short tier topic with incremented attempt" do
       consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 0))
 
-      retries = FakeProducer.for_topic(KafkaBatch.config.retry_topic)
+      retries = FakeProducer.for_topic(KafkaBatch.config.retry_topic_for(:short))
       expect(retries.size).to eq(1)
       payload = retries.first.payload
       expect(payload["attempt"]).to eq(1)
       expect(payload["retry_to"]).to eq("test.fail")
       expect(payload["retry_after"]).to be_a(String)
+    end
+
+    it "walks the tier progression: 1st→short, 2nd→medium, 3rd→large" do
+      consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 0, max_retries: 5, job_id: "p1"))
+      consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 1, max_retries: 5, job_id: "p2"))
+      consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 2, max_retries: 5, job_id: "p3"))
+
+      expect(retry_topic_used("p1")).to eq(KafkaBatch.config.retry_topic_for(:short))
+      expect(retry_topic_used("p2")).to eq(KafkaBatch.config.retry_topic_for(:medium))
+      expect(retry_topic_used("p3")).to eq(KafkaBatch.config.retry_topic_for(:large))
+    end
+
+    it "pins all retries to the worker's retry_tier override" do
+      consumer.send(:process_message, job_message(worker: TierPinnedWorker, batch_id: "b1", attempt: 0, job_id: "tp1", topic: "test.tier_pinned"))
+      msg = retry_for("tp1")
+      expect(msg.payload["retry_tier"]).to eq("large")
+      expect(retry_topic_used("tp1")).to eq(KafkaBatch.config.retry_topic_for(:large))
     end
 
     it "records the failure as 'retrying' on the first failed attempt" do
@@ -113,15 +139,15 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       expect(f[:status]).to eq("retrying")
       expect(f[:job_id]).to eq("jr")
       expect(f[:error_class]).to eq("RuntimeError")
-      expect(f[:next_retry_at]).not_to be_nil  # exponential backoff schedule
+      expect(f[:next_retry_at]).not_to be_nil  # tiered retry schedule
     end
 
-    it "schedules the first retry ~retry_first_delay in the future" do
+    it "schedules the first retry within the short tier (~30s)" do
       consumer.send(:process_message, job_message(worker: FailingWorker, batch_id: "b1", attempt: 0, job_id: "jr2"))
-      msg = FakeProducer.for_topic(KafkaBatch.config.retry_topic).first
+      msg = retry_for("jr2")
       retry_after = Time.parse(msg.payload["retry_after"])
       expect(retry_after).to be > Time.now
-      expect(retry_after).to be < Time.now + 60  # ~10s, not hours
+      expect(retry_after).to be < Time.now + 60  # ~30s, not minutes/hours
     end
   end
 
@@ -135,7 +161,7 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
 
       dlt = FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic)
       expect(dlt.first.payload["dlt_type"]).to eq("job")
-      expect(FakeProducer.for_topic(KafkaBatch.config.retry_topic)).to be_empty
+      expect(KafkaBatch.config.retry_topics.flat_map { |t| FakeProducer.for_topic(t) }).to be_empty
     end
 
     it "records the failure for the batch (always-on failure tracking)" do

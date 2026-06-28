@@ -4,7 +4,6 @@ require "oj"
 require_relative "kafka_batch/version"
 require_relative "kafka_batch/errors"
 require_relative "kafka_batch/configuration"
-require_relative "kafka_batch/backoff"
 require_relative "kafka_batch/instrumentation"
 require_relative "kafka_batch/stores/base"
 require_relative "kafka_batch/stores/mysql_store"
@@ -13,6 +12,7 @@ require_relative "kafka_batch/producer"
 require_relative "kafka_batch/cancellation_cache"
 require_relative "kafka_batch/liveness"
 require_relative "kafka_batch/lag"
+require_relative "kafka_batch/topics"
 require_relative "kafka_batch/fairness/scheduler"
 require_relative "kafka_batch/fairness/dispatcher"
 require_relative "kafka_batch/worker"
@@ -131,7 +131,11 @@ module KafkaBatch
         consumer_group "#{cfg.consumer_group}-control" do
           topic(cfg.events_topic)    { consumer KafkaBatch::Consumers::EventConsumer }
           topic(cfg.callbacks_topic) { consumer KafkaBatch::Consumers::CallbackConsumer }
-          topic(cfg.retry_topic)     { consumer KafkaBatch::Consumers::RetryConsumer }
+          # One retry topic per delay tier so a slow tier (e.g. large/20m) never
+          # head-of-line-blocks a fast one (e.g. short/30s).
+          cfg.retry_topics.each do |retry_topic|
+            topic(retry_topic) { consumer KafkaBatch::Consumers::RetryConsumer }
+          end
         end
 
         if fairness
@@ -146,8 +150,10 @@ module KafkaBatch
           end
         elsif !workers.empty?
           consumer_group "#{cfg.consumer_group}-jobs" do
-            workers.each do |worker_class|
-              topic(worker_class.kafka_topic) { consumer KafkaBatch::Consumers::JobConsumer }
+            # Dedup: several workers may share a topic (e.g. the config.jobs_topic
+            # default). JobConsumer dispatches per-message via embedded worker_class.
+            workers.map(&:kafka_topic).uniq.each do |job_topic|
+              topic(job_topic) { consumer KafkaBatch::Consumers::JobConsumer }
             end
           end
         end
@@ -160,13 +166,11 @@ module KafkaBatch
     # Called at boot when config.validate_topics_on_boot = true.
     # Raises ConfigurationError with a list of missing topics.
     def validate_topics!
-      required = [
-        config.jobs_topic,
-        config.events_topic,
-        config.callbacks_topic,
-        config.retry_topic,
-        config.dead_letter_topic
-      ].compact.uniq
+      # Derive the real topic set from the same source as `rake create_topics`:
+      # per-worker job topics (or fairness ingest/ready), plus the control plane
+      # (events, callbacks, retry tiers, dead_letter). Note: config.jobs_topic is
+      # NOT validated — nothing produces to or consumes from it.
+      required = KafkaBatch::Topics.specs.map { |s| s[:name] }.compact.uniq
 
       # Attempt to list topics via WaterDrop's internal Rdkafka handle
       existing = begin

@@ -66,6 +66,35 @@ module KafkaBatch
           KafkaBatch::Reconciler.run
         end
 
+        desc "Create all KafkaBatch Kafka topics (idempotent). " \
+             "Env: PARTITIONS=N forces every topic to N partitions; " \
+             "REPLICATION_FACTOR=N (default 1)."
+        task create_topics: :environment do
+          # Worker classes register their job topics on load. In dev/test Zeitwerk
+          # loads them lazily, so eager-load first to discover every job topic
+          # (non-fairness mode). Best-effort: never fail provisioning over this.
+          begin
+            Rails.application.eager_load! if defined?(Rails) && Rails.respond_to?(:application) && Rails.application
+          rescue StandardError => e
+            warn "[KafkaBatch] eager_load skipped: #{e.message}"
+          end
+
+          partitions = ENV["PARTITIONS"] && !ENV["PARTITIONS"].empty? ? ENV["PARTITIONS"].to_i : nil
+          rf         = (ENV["REPLICATION_FACTOR"] || 1).to_i
+
+          puts "[KafkaBatch] Creating topics " \
+               "(partitions=#{partitions || 'per-topic defaults'} replication_factor=#{rf})…"
+          result = KafkaBatch::Topics.create_all!(partitions: partitions, replication_factor: rf)
+
+          puts "  created: #{result[:created].size}  #{result[:created].join(', ')}"
+          puts "  skipped: #{result[:skipped].size}  #{result[:skipped].join(', ')}"
+          unless result[:failed].empty?
+            puts "  FAILED:  #{result[:failed].size}"
+            result[:failed].each { |f| puts "    - #{f[:name]}: #{f[:error]}" }
+            abort "[KafkaBatch] topic creation had failures"
+          end
+        end
+
         desc "Generate KafkaBatch migrations (MySQL store only)"
         task :install_migrations do
           source = File.expand_path("../../db/migrate", __dir__)

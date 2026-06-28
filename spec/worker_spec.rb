@@ -13,9 +13,17 @@ RSpec.describe KafkaBatch::Worker do
       expect(SuccessfulWorker.max_retries).to eq(9)
     end
 
-    it "raises if the topic was never set" do
+    it "defaults retry_tier to nil (uses the progression)" do
+      expect(SuccessfulWorker.retry_tier).to be_nil
+    end
+
+    it "supports a per-worker retry_tier override" do
+      expect(TierPinnedWorker.retry_tier).to eq(:large)
+    end
+
+    it "falls back to config.jobs_topic when no topic is set" do
       klass = Class.new { include KafkaBatch::Worker }
-      expect { klass.kafka_topic }.to raise_error(KafkaBatch::ConfigurationError)
+      expect(klass.kafka_topic).to eq(KafkaBatch.config.jobs_topic)
     end
   end
 

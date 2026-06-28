@@ -64,7 +64,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
    │    │                     │     src_offset}; keyed by
    │    │                     │     src_topic/src_partition
    │    └─ failure            │
-   │        ├─ retriable ─────┼──► kafka_batch.jobs.retry
+   │        ├─ retriable ─────┼──► kafka_batch.jobs.retry.{short|medium|large}
    │        └─ exhausted ─────┼──► kafka_batch.dead_letter
    └──────────────────────────┘         +events (failed)
                 │ (events topic)
@@ -95,7 +95,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
                                    never a lost callback)
 
    ┌──────────────────────────┐
-   │  Karafka: RetryConsumer   │  ◄── kafka_batch.jobs.retry
+   │  Karafka: RetryConsumer   │  ◄── kafka_batch.jobs.retry.{short|medium|large}
    │                          │
    │  retry_after in future?  │
    │    ├─ yes ──► pause()    │  (Karafka partition pause –
@@ -135,15 +135,25 @@ Run migrations if using the MySQL store:
 bundle exec rails db:migrate
 ```
 
-Create the required Kafka topics (adjust partitions to your throughput):
+Create the required Kafka topics. The easiest way is the built-in rake task, which derives the full topic set from your config and creates whatever is missing (see [Provisioning topics](#provisioning-topics-the-migration-for-kafka)):
+
+```bash
+bundle exec rake kafka_batch:create_topics
+```
+
+Or create them manually (adjust partitions to your throughput):
 
 ```bash
 kafka-topics.sh --create --topic kafka_batch.jobs       --partitions 6
 kafka-topics.sh --create --topic kafka_batch.events     --partitions 3
 kafka-topics.sh --create --topic kafka_batch.callbacks  --partitions 1
-kafka-topics.sh --create --topic kafka_batch.jobs.retry --partitions 3
+kafka-topics.sh --create --topic kafka_batch.jobs.retry.short  --partitions 3
+kafka-topics.sh --create --topic kafka_batch.jobs.retry.medium --partitions 3
+kafka-topics.sh --create --topic kafka_batch.jobs.retry.large  --partitions 3
 kafka-topics.sh --create --topic kafka_batch.dead_letter --partitions 1
 ```
+
+> `kafka_batch.jobs` above is the shared default queue; if your workers each declare their own `kafka_topic`, create those instead (the rake task does this automatically).
 
 ---
 
@@ -167,7 +177,8 @@ KafkaBatch.configure do |config|
   config.jobs_topic        = "kafka_batch.jobs"
   config.events_topic      = "kafka_batch.events"
   config.callbacks_topic   = "kafka_batch.callbacks"
-  config.retry_topic       = "kafka_batch.jobs.retry"   # dedicated retry topic
+  config.retry_topic       = "kafka_batch.jobs.retry"   # prefix; tier topics are
+                                                        # <prefix>.short/.medium/.large
   config.dead_letter_topic = "kafka_batch.dead_letter"
   # Multi-tenant fairness topics (only used when config.fairness_enabled = true):
   config.fairness_ingest_topic = "kafka_batch.ingest"   # per-tenant intake (durable backlog)
@@ -185,12 +196,14 @@ KafkaBatch.configure do |config|
   config.cancellation_cache_ttl = 120  # seconds
 
   # ── Retry behaviour (global defaults; override per Worker class) ────
-  # Fixed, short retry schedule (Kafka-friendly): 1st retry after
-  # retry_first_delay, later retries after retry_delay, with +/- retry_jitter.
-  config.max_retries       = 3   # attempts before dead letter
-  config.retry_first_delay = 10  # seconds before the 1st retry
-  config.retry_delay       = 180 # seconds before each later retry (3 min)
-  config.retry_jitter      = 0.1 # +/- 10% randomization
+  # Tiered retries: each delay tier has its own Kafka topic, so a slow tier
+  # never head-of-line-blocks a fast one. By default the Nth retry walks the
+  # progression (1st→short, 2nd→medium, 3rd+→large); a Worker can pin all of
+  # its retries to one tier via `retry_tier :medium`.
+  config.max_retries           = 3            # attempts before dead letter
+  config.retry_jitter          = 0.1          # +/- 10% randomization
+  config.retry_tiers           = { short: 30, medium: 7 * 60, large: 20 * 60 } # seconds
+  config.retry_tier_progression = %i[short medium large]
   # After this many retries a still-failing job counts toward on_complete while
   # it keeps retrying in the background up to max_retries (per-Worker override).
   # Default == max_retries default, so default behaviour is unchanged.
@@ -251,15 +264,15 @@ Every option on `KafkaBatch.config`:
 | `brokers` | Array&lt;String&gt; | `["localhost:9092"]` | Kafka bootstrap brokers |
 | `consumer_group` | String | `"kafka-batch"` | Base consumer-group name (suffixed `-control` / `-jobs` / `-dispatch`) |
 | `logger` | Logger | `Rails.logger` | Logger instance |
-| `jobs_topic` | String | `"kafka_batch.jobs"` | Default worker jobs topic (non-fairness) |
+| `jobs_topic` | String | `"kafka_batch.jobs"` | Shared default job topic for workers that don't declare their own `kafka_topic` (non-fairness) |
 | `events_topic` | String | `"kafka_batch.events"` | Completion-event topic |
 | `callbacks_topic` | String | `"kafka_batch.callbacks"` | Batch-callback topic |
-| `retry_topic` | String | `"kafka_batch.jobs.retry"` | Retry topic |
+| `retry_topic` | String | `"kafka_batch.jobs.retry"` | Retry-topic **prefix** (tier topics are `<prefix>.short/.medium/.large`) |
 | `dead_letter_topic` | String | `"kafka_batch.dead_letter"` | Dead-letter topic |
 | `max_retries` | Integer | `3` | Retry attempts before dead-letter (per-Worker override) |
-| `retry_first_delay` | Integer (s) | `10` | Delay before the 1st retry |
-| `retry_delay` | Integer (s) | `180` | Delay before each later retry |
 | `retry_jitter` | Float | `0.1` | ± randomization on retry delays |
+| `retry_tiers` | Hash | `{short: 30, medium: 420, large: 1200}` | Tier → delay (seconds) |
+| `retry_tier_progression` | Array | `[:short, :medium, :large]` | Default tier per retry index (clamps to last) |
 | `complete_after_retries` | Integer | `3` | Count a still-failing job toward `on_complete` after N retries (keeps retrying in bg; per-Worker override) |
 | `event_emit_retries` | Integer | `3` | Inline retries when producing a completion event |
 | `event_emit_backoff` | Integer (s) | `2` | Linear backoff for event-emit retries (`attempt × backoff`) |
@@ -290,7 +303,7 @@ Every option on `KafkaBatch.config`:
 | `consumer_config` | Hash | `{}` | Raw rdkafka consumer overrides (merged into every consumer) |
 | `validate_topics_on_boot` | Boolean | `false` | Raise at boot if required topics are missing |
 
-**Per-Worker overrides** (on the worker class, not `config`): `kafka_topic` (required), `max_retries`, `complete_after_retries`.
+**Per-Worker overrides** (on the worker class, not `config`): `kafka_topic` (optional — defaults to `config.jobs_topic`), `max_retries`, `complete_after_retries`, `retry_tier`.
 
 ### Choosing a store
 
@@ -424,7 +437,7 @@ Include `KafkaBatch::Worker` and implement `#perform`:
 class ProcessOrderWorker
   include KafkaBatch::Worker
 
-  kafka_topic            "orders.process" # required – Kafka topic to consume from
+  kafka_topic            "orders.process" # optional – defaults to config.jobs_topic
   max_retries            5                # optional – overrides config.max_retries
   complete_after_retries 3                # optional – overrides config.complete_after_retries
 
@@ -437,6 +450,24 @@ end
 ```
 
 > **Workers must be idempotent.** If `perform` succeeds but the subsequent event-emission fails, the job message is redelivered and `perform` runs again. Design your workers so running twice produces the same result (upsert, check-before-write, etc.).
+
+### The `kafka_topic` is optional (shared default queue)
+
+If a worker doesn't declare a `kafka_topic`, it falls back to `config.jobs_topic` (default `"kafka_batch.jobs"`). Several topic-less workers therefore **share one queue** — `JobConsumer` still dispatches each message to the correct worker via the `worker_class` embedded in the message, so this is safe:
+
+```ruby
+class SendEmailWorker
+  include KafkaBatch::Worker      # no kafka_topic → uses config.jobs_topic
+  def perform(payload) = Mailer.deliver(payload["id"])
+end
+
+class SyncCrmWorker
+  include KafkaBatch::Worker      # also config.jobs_topic — same queue, different worker
+  def perform(payload) = Crm.sync(payload["id"])
+end
+```
+
+Declare an explicit `kafka_topic` when you want a worker isolated on its own topic/partitions (independent scaling, ordering, or lag). In multi-tenant **fairness mode** the per-worker topic is ignored entirely — all jobs flow through the ingest → ready topics regardless.
 
 ---
 
@@ -604,28 +635,58 @@ The `batch` hash passed to callbacks:
 When a job raises an exception, `JobConsumer` catches it and takes one of two paths based on the current attempt count:
 
 **Retriable (attempt < max_retries):**
-The message is produced to `kafka_batch.jobs.retry` with two extra fields:
-- `retry_after` — ISO8601 timestamp of when to re-enqueue (exponential backoff; see below)
+The message is produced to the retry topic **for its delay tier** (`<retry_topic>.short` / `.medium` / `.large`) with two extra fields:
+- `retry_after` — ISO8601 timestamp of when to re-enqueue
 - `retry_to` — the original worker topic to re-enqueue to
 
 The `JobConsumer` partition is immediately freed for the next message. No thread blocking occurs.
 
-**RetryConsumer** picks up the message. If `retry_after` is still in the future, it calls Karafka's `pause(offset, ms)` to suspend that partition for up to `MAX_PAUSE_SECONDS` (30s) at a time, then checks again. When the message is due it re-enqueues to `retry_to` and commits.
+**RetryConsumer** (subscribed to all tier topics) picks up the message. If `retry_after` is still in the future, it calls Karafka's `pause(offset, ms)` to suspend that partition for up to `MAX_PAUSE_SECONDS` (30s) at a time, then checks again. When the message is due it re-enqueues to `retry_to` and commits.
 
 **Exhausted (attempt == max_retries):**
 A `failed` event is emitted to the events topic (so the batch counter is updated) and the message is forwarded to the dead-letter topic.
 
-Backoff is a **fixed, short schedule** (deliberately Kafka-friendly): the **1st** retry after `retry_first_delay` (default **10s**), and **every subsequent** retry after `retry_delay` (default **180s / 3 min**), each with `±retry_jitter` (default 10%) randomization to avoid synchronized retry storms. e.g. `max_retries: 4` ⇒ retries at ~10s, ~3m, ~6m, ~9m.
+### Tiered retries
 
-Short delays keep the `RetryConsumer`'s `pause()` head-of-line wait negligible (≤ `retry_delay`), so no scheduler/re-queue machinery is needed. The **time until the next retry** is recorded on each retrying failure and shown in the dashboard's *Job failures* "Next retry" column (e.g. `in 2m 47s`).
+Each delay tier gets its **own Kafka topic**. Because messages within a topic are consumed in (roughly) produce order — which here equals due order, since a fixed delay is added to every message — a slow tier can never head-of-line-block a fast one. The defaults:
 
-> For long downstream outages this exhausts retries within ~`max_retries × retry_delay`; raise `max_retries` (cheap, since each retry is short) or replay from the DLT.
+| Tier | Delay | Topic |
+|------|-------|-------|
+| `short`  | 30s    | `kafka_batch.jobs.retry.short`  |
+| `medium` | 7 min  | `kafka_batch.jobs.retry.medium` |
+| `large`  | 20 min | `kafka_batch.jobs.retry.large`  |
 
-Override attempts per worker with `max_retries`.
+Each delay has `±retry_jitter` (default 10%) randomization to avoid synchronized retry storms.
+
+**Default progression:** the Nth retry walks `retry_tier_progression` (`[:short, :medium, :large]`), clamping to the last tier for all further retries. So with `max_retries: 3` a job retries at ~30s (short), ~7m (medium), ~20m (large), then dead-letters.
+
+**Per-worker tier pinning:** a worker can route *all* of its retries to a single tier — useful when a class of jobs should always back off slowly (or quickly) regardless of attempt:
+
+```ruby
+class WebhookWorker
+  include KafkaBatch::Worker
+  kafka_topic "webhooks.deliver"
+  max_retries 6
+  retry_tier  :medium   # every retry waits ~7 min, never short or large
+end
+```
+
+Tune the delays and progression globally:
+
+```ruby
+config.retry_tiers            = { short: 30, medium: 7 * 60, large: 20 * 60 }
+config.retry_tier_progression = %i[short medium large]
+```
+
+> For long downstream outages this exhausts retries within ~`max_retries × largest tier delay`; raise `max_retries` or replay from the DLT. The **time until the next retry** is recorded on each retrying failure and shown in the dashboard's *Job failures* "Next retry" column (e.g. `in 2m 47s`).
+
+> **Migration note:** the three tier topics (`<retry_topic>.short/.medium/.large`) replace the single `<retry_topic>`. Create them before deploying and drain any in-flight messages on the old single retry topic first (it is no longer consumed).
+
+Override attempts per worker with `max_retries`, and the tier with `retry_tier`.
 
 ### Early batch completion (`complete_after_retries`)
 
-A persistently-failing job can otherwise hold up its batch's **`on_complete`** for the whole retry budget (`max_retries × retry_delay`), even when every other job is done. To cap that latency, a job counts toward its batch (as *failed*) after **`complete_after_retries`** retries (default **3**) — while it **keeps retrying in the background** up to `max_retries`:
+A persistently-failing job can otherwise hold up its batch's **`on_complete`** for the whole retry budget (`max_retries × largest tier delay`), even when every other job is done. To cap that latency, a job counts toward its batch (as *failed*) after **`complete_after_retries`** retries (default **3**) — while it **keeps retrying in the background** up to `max_retries`:
 
 ```ruby
 class FlakyWorker
@@ -905,14 +966,39 @@ When `ActiveSupport` is not available (non-Rails environments), all instrumentat
 
 | Task | Description |
 |---|---|
+| `kafka_batch:create_topics` | Create all configured Kafka topics (idempotent). `PARTITIONS=N` forces every topic to N partitions; `REPLICATION_FACTOR=N` (default 1) |
 | `kafka_batch:reconcile` | Run both reconciler sweeps (stuck-running + lost-callback) |
 | `kafka_batch:install_migrations` | Copy all migrations to `db/migrate/` |
 | `kafka_batch:workers` | Print all registered workers, topics, and retry config |
 
+### Provisioning topics (the "migration" for Kafka)
+
+Kafka has no migration system, so `kafka_batch:create_topics` is the equivalent: it derives the full topic set from your current config and creates any that are missing. It is idempotent (existing topics are skipped, never mutated) and uses per-topic default partition counts unless you override them. The set it creates:
+
+- **Job topics** — in fairness mode, the **ingest** and **ready** topics; otherwise **each registered worker's `kafka_topic`** (the rake task eager-loads the app so all workers are discovered; if none are loaded it falls back to `config.jobs_topic`).
+- **Control plane** — events, callbacks, the three retry tier topics (`…retry.short/.medium/.large`), and the dead-letter topic.
+
+```bash
+# sensible per-topic defaults (jobs=6, events=3, retry tiers=3 each, …)
+bundle exec rake kafka_batch:create_topics
+
+# force every topic to 12 partitions, replication factor 3
+PARTITIONS=12 REPLICATION_FACTOR=3 bundle exec rake kafka_batch:create_topics
+```
+
+Or call it from Ruby (e.g. a deploy hook):
+
+```ruby
+KafkaBatch::Topics.create_all!(partitions: 12, replication_factor: 3)
+# => { created: [...], skipped: [...], failed: [...] }
+```
+
+> Kafka can only **grow** partition counts, never shrink them, so this task never alters an existing topic. To change partitioning, manage the topic with your Kafka admin tooling.
+
 ```bash
 bundle exec rake kafka_batch:workers
-#  ProcessOrderWorker   → topic: orders.process   retries: 5  backoff: 10s
-#  GenerateReportWorker → topic: reports.generate retries: 3  backoff: 5s
+#  ProcessOrderWorker   → topic: orders.process   retries: 5
+#  GenerateReportWorker → topic: reports.generate retries: 3
 ```
 
 ---
@@ -929,7 +1015,7 @@ bundle exec rake kafka_batch:workers
 | **Callback fires at least once** | Callback is invoked, then `callback_dispatched_at` is set; duplicates are suppressed and crashes lead to safe re-invocation (callbacks must be idempotent) |
 | **Lost callbacks are recovered** | Reconciler scans for `status IN (success,complete) AND callback_dispatched_at IS NULL` |
 | **Reconciler runs once per cluster** | Distributed lock (MySQL `GET_LOCK`, Redis `SET NX EX`) prevents concurrent reconciler sweeps |
-| **Retries don't block partitions** | Failed jobs go to `kafka_batch.jobs.retry`; `RetryConsumer` uses Karafka `pause()` |
+| **Retries don't block partitions** | Failed jobs go to per-tier `kafka_batch.jobs.retry.*` topics; `RetryConsumer` uses Karafka `pause()` |
 | **Event emission failure ≠ job failure** | Separate rescue blocks; emission retried independently before leaving offset uncommitted |
 | **Malformed JSON is never silently dropped** | Unparseable messages in all consumers are forwarded to DLT before committing |
 | **Cancellation stops remaining jobs** | `JobConsumer` skips jobs of cancelled batches using a per-process cancelled-id cache (eventually-consistent within `cancellation_cache_ttl`) |
@@ -972,7 +1058,7 @@ bundle exec rake kafka_batch:workers
 
 **What you don't need to change:** Callback class names and method signatures are structurally the same.
 
-**Key difference:** Workers must `include KafkaBatch::Worker`, define a `kafka_topic`, and be **idempotent**. They are consumed by Karafka rather than Sidekiq threads.
+**Key difference:** Workers must `include KafkaBatch::Worker` and be **idempotent** (a `kafka_topic` is optional — it defaults to `config.jobs_topic`). They are consumed by Karafka rather than Sidekiq threads.
 
 ---
 
@@ -996,7 +1082,7 @@ With a single `rescue`, a transient Kafka error on `emit_event` looks identical 
 
 ### Why a dedicated retry topic instead of `sleep`?
 
-A `sleep` inside `JobConsumer` blocks the entire Kafka partition for the backoff duration. The retry topic approach forwards the message immediately and suspends only the *retry partition* (via Karafka `pause()`) — the job partition is fully unblocked. Because the backoff schedule is short and bounded (`retry_delay`, default 3 min), the retry partition's head-of-line pause stays small.
+A `sleep` inside `JobConsumer` blocks the entire Kafka partition for the backoff duration. The retry-topic approach forwards the message immediately and suspends only the *retry partition* (via Karafka `pause()`) — the job partition is fully unblocked. Splitting retries across per-tier topics keeps each retry partition's head-of-line pause bounded by **that tier's** delay, so a slow tier never blocks a fast one.
 
 ### Why invoke the callback first, then claim?
 
@@ -1028,7 +1114,7 @@ Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, th
 | Topic (default name) | Produced by | Consumed by | Purpose |
 |---|---|---|---|
 | `kafka_batch.jobs` (per worker) | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages (non-fairness mode) |
-| `kafka_batch.jobs.retry` | `JobConsumer` | `RetryConsumer` | Failed jobs awaiting backoff |
+| `kafka_batch.jobs.retry.{short,medium,large}` | `JobConsumer` | `RetryConsumer` | Failed jobs awaiting their tier's delay |
 | `kafka_batch.events` | `JobConsumer` | `EventConsumer` | Job completion signals |
 | `kafka_batch.callbacks` | `EventConsumer` / `Reconciler` | `CallbackConsumer` | Batch-complete triggers |
 | `kafka_batch.dead_letter` | `JobConsumer` / `CallbackConsumer` / `RetryConsumer` | Your consumer | Exhausted jobs + unresolvable callbacks |

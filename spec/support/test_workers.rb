@@ -35,6 +35,18 @@ class FailingWorker
   end
 end
 
+# Always-failing worker that pins every retry to the :large tier.
+class TierPinnedWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.tier_pinned"
+  max_retries 5
+  retry_tier :large
+
+  def perform(_payload)
+    raise "always fails"
+  end
+end
+
 # Pushes a child job into its own batch (exercises the in-job `batch` context).
 class FanoutWorker
   include KafkaBatch::Worker
