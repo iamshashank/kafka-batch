@@ -97,6 +97,13 @@ module KafkaBatch
       workers_mutex.synchronize { Array(@workers) }
     end
 
+    # True if any registered worker opts into the multi-tenant fair lane. Used to
+    # decide whether to wire the dispatcher/ready consumer and create those topics.
+    # @return [Boolean]
+    def fairness?
+      workers.any?(&:fairness?)
+    end
+
     # ── Karafka routing helper ─────────────────────────────────────────────
     #
     # Call this INSIDE your karafka.rb routes.draw block, passing `self` (the
@@ -122,11 +129,20 @@ module KafkaBatch
       cfg     = config
       workers = KafkaBatch.workers
 
+      # Fairness is per-worker: fair workers share the ingest→ready lane; plain
+      # workers consume their own topic. Both run side by side.
+      fair_workers = workers.select(&:fairness?)
+      plain_topics = workers.reject(&:fairness?).map(&:kafka_topic).uniq
+      any_fair     = fair_workers.any?
+
+      # Topics for the shared "-jobs" group: plain worker topics + (if any worker
+      # is fair) the ready topic the dispatcher feeds.
+      job_topics = plain_topics.dup
+      job_topics << cfg.fairness_ready_topic if any_fair
+
       # Karafka's routing DSL methods (consumer_group/topic/consumer) are private
       # and only resolve with implicit self, so define routes inside the builder
-      # via instance_eval. Locals (cfg/workers) remain available via closure.
-      fairness = cfg.fairness_enabled
-
+      # via instance_eval. Locals remain available via closure.
       builder.instance_eval do
         consumer_group "#{cfg.consumer_group}-control" do
           topic(cfg.events_topic)    { consumer KafkaBatch::Consumers::EventConsumer }
@@ -138,21 +154,21 @@ module KafkaBatch
           end
         end
 
-        if fairness
-          # Fairness mode: jobs land on the ingest topic; the Dispatcher forwards
-          # them (throttled) onto the ready topic, which the JobConsumer swarm
-          # drains. No Redis or extra process on the path.
+        if any_fair
+          # Fair workers: jobs land on the ingest topic; the Dispatcher forwards
+          # them (throttled) onto the ready topic, drained by the JobConsumer swarm
+          # in the -jobs group below. No Redis or extra process on the path.
           consumer_group "#{cfg.consumer_group}-dispatch" do
             topic(cfg.fairness_ingest_topic) { consumer KafkaBatch::Fairness::Dispatcher }
           end
-          consumer_group "#{cfg.consumer_group}-jobs" do
-            topic(cfg.fairness_ready_topic) { consumer KafkaBatch::Consumers::JobConsumer }
-          end
-        elsif !workers.empty?
+        end
+
+        unless job_topics.empty?
           consumer_group "#{cfg.consumer_group}-jobs" do
             # Dedup: several workers may share a topic (e.g. the config.jobs_topic
             # default). JobConsumer dispatches per-message via embedded worker_class.
-            workers.map(&:kafka_topic).uniq.each do |job_topic|
+            # Includes the ready topic when any worker opts into fairness.
+            job_topics.uniq.each do |job_topic|
               topic(job_topic) { consumer KafkaBatch::Consumers::JobConsumer }
             end
           end
@@ -216,10 +232,10 @@ module KafkaBatch
     # Warn (or raise, when strict) if the fairness ingest topic has too few
     # partitions. Tenants are spread across partitions by key hash, so too few
     # means tenants collide onto one partition and fairness degrades — a single
-    # partition gives no fairness at all. No-op unless fairness is enabled.
+    # partition gives no fairness at all. No-op unless a worker opts into fairness.
     # @param strict [Boolean] raise ConfigurationError instead of warning
     def validate_fairness_partitions!(strict: config.validate_topics_on_boot)
-      return unless config.fairness_enabled
+      return unless fairness?
 
       count = fairness_ingest_partition_count
       return if count.nil?  # couldn't determine — don't false-alarm
@@ -227,7 +243,7 @@ module KafkaBatch
       min = [config.fairness_min_ingest_partitions.to_i, 2].max
       return if count >= min
 
-      msg = "[KafkaBatch] fairness_enabled but ingest topic '#{config.fairness_ingest_topic}' has " \
+      msg = "[KafkaBatch] a worker opts into fairness but ingest topic '#{config.fairness_ingest_topic}' has " \
             "#{count} partition(s) (recommended >= #{min}). Tenants are hashed to partitions, so too " \
             "few means tenants share a partition (1 = no fairness at all). Recreate the topic with more " \
             "partitions (≈ your max concurrent tenant count)."

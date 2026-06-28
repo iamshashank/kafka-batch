@@ -45,16 +45,26 @@ module KafkaBatch
         }
       end
 
-      if cfg.fairness_enabled
-        # Jobs funnel through ingest -> dispatcher -> ready; per-worker topics
-        # are not used in this mode.
+      workers       = KafkaBatch.workers
+      fair_workers  = workers.select { |w| w.respond_to?(:fairness?) && w.fairness? }
+      plain_workers = workers - fair_workers
+
+      # Fair workers share the ingest -> dispatcher -> ready lane.
+      if fair_workers.any?
         add.call(cfg.fairness_ingest_topic, :ingest)
         add.call(cfg.fairness_ready_topic, :ready)
-      else
-        # Jobs are produced to each registered worker's own topic (see
-        # Batch#produce_job), so those are the real job topics — not jobs_topic.
-        job_topics(cfg).each { |t| add.call(t, :jobs) }
       end
+
+      # Plain workers are produced to their own topic (see Batch#produce_job).
+      # When no workers are loaded at all (e.g. a producer-only process), fall
+      # back to the shared default queue so the control plane is still complete.
+      plain_topics = plain_workers.filter_map do |w|
+        w.kafka_topic
+      rescue StandardError
+        nil
+      end.uniq
+      plain_topics = [cfg.jobs_topic].compact if plain_topics.empty? && fair_workers.empty?
+      plain_topics.each { |t| add.call(t, :jobs) }
 
       add.call(cfg.events_topic, :events)
       add.call(cfg.callbacks_topic, :callbacks)
@@ -106,21 +116,6 @@ module KafkaBatch
       end
 
       result
-    end
-
-    # Job topics for non-fairness mode: every registered worker's own topic.
-    # Falls back to config.jobs_topic when no workers are loaded (e.g. the rake
-    # task ran without eager-loading the app). Workers without a topic are
-    # skipped rather than raising.
-    # @return [Array<String>]
-    def job_topics(cfg = KafkaBatch.config)
-      topics = KafkaBatch.workers.filter_map do |w|
-        w.kafka_topic
-      rescue StandardError
-        nil
-      end.uniq
-
-      topics.empty? ? [cfg.jobs_topic].compact : topics
     end
 
     # Names of topics that already exist on the cluster.

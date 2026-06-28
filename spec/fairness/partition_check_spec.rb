@@ -1,11 +1,12 @@
 RSpec.describe "KafkaBatch.validate_fairness_partitions!" do
   before do
-    KafkaBatch.config.fairness_enabled              = true
+    # At least one worker opts into fairness so the check is active.
+    allow(KafkaBatch).to receive(:fairness?).and_return(true)
     KafkaBatch.config.fairness_min_ingest_partitions = 4
   end
 
-  it "is a no-op when fairness is disabled (even with too few partitions)" do
-    KafkaBatch.config.fairness_enabled = false
+  it "is a no-op when no worker opts into fairness (even with too few partitions)" do
+    allow(KafkaBatch).to receive(:fairness?).and_return(false)
     allow(KafkaBatch).to receive(:fairness_ingest_partition_count).and_return(1)
     expect { KafkaBatch.validate_fairness_partitions!(strict: true) }.not_to raise_error
   end

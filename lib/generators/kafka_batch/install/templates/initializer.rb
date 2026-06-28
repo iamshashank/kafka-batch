@@ -79,13 +79,21 @@ KafkaBatch.configure do |config|
   config.max_failures_per_batch = 1000       # 0 = unlimited
 
   # ── Multi-tenant fairness (Kafka-only; NO Redis required) ──────────────────
-  # Share capacity dynamically across tenants: 1 active tenant uses 100%, N split
-  # ~1/N (work-conserving, approximate). Jobs land on the ingest topic (keyed by
-  # tenant); the Dispatcher (auto-wired by draw_routes) forwards them onto the
-  # ready topic — throttled so its depth stays between the watermarks — and the
-  # normal JobConsumer swarm drains it. Tag jobs via
+  # Fairness is a PER-WORKER opt-in — there is no global switch. A worker that
+  # declares `fairness true` shares capacity dynamically across tenants: 1 active
+  # tenant uses 100%, N split ~1/N (work-conserving, approximate). Its jobs land
+  # on the ingest topic (keyed by tenant); the Dispatcher (auto-wired by
+  # draw_routes) forwards them onto the ready topic — throttled so its depth stays
+  # between the watermarks — and the normal JobConsumer swarm drains it. Plain
+  # workers keep using their own topic. Tag jobs via
   # Batch.create(tenant_id: "...") / batch.push(Worker, payload, tenant_id: "...").
-  config.fairness_enabled        = false  # opt-in
+  #
+  #   class CampaignSendWorker
+  #     include KafkaBatch::Worker
+  #     fairness true
+  #   end
+  #
+  # The settings below configure the shared fair lane (used by all fair workers):
   config.fairness_ingest_topic   = "kafka_batch.ingest"  # per-tenant intake (durable backlog in Kafka)
   config.fairness_ready_topic    = "kafka_batch.ready"   # throttled execution queue
   config.fairness_ready_lag_high = 5000   # dispatcher pauses forwarding above this depth

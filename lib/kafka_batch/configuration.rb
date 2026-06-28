@@ -91,11 +91,13 @@ module KafkaBatch
     attr_accessor :max_failures_per_batch    # Integer – 0 = unlimited; default 1000
 
     # ── Multi-tenant fairness (Kafka-only; NO Redis required) ────────────────
-    # When enabled, capacity is shared dynamically across tenants — one active
-    # tenant uses 100%, N split ~1/N (work-conserving, approximate) — using only
-    # Kafka (ingest topic → Dispatcher → ready topic → JobConsumer swarm). The
-    # durable backlog stays in Kafka; nothing is stored in Redis on this path.
-    attr_accessor :fairness_enabled                 # Boolean – default false
+    # Fairness is a PER-WORKER property (`fairness true` on the Worker class) —
+    # there is no global enable switch. When a worker opts in, capacity is shared
+    # dynamically across tenants — one active tenant uses 100%, N split ~1/N
+    # (work-conserving, approximate) — using only Kafka (ingest topic → Dispatcher
+    # → ready topic → JobConsumer swarm). The durable backlog stays in Kafka.
+    # The settings below configure that lane (shared by all fair workers).
+    #
     # The four settings below apply ONLY to the optional Redis-backed
     # KafkaBatch::Fairness::Scheduler (strict weighted shares), NOT the default
     # dispatcher, which uses the ingest/ready topics + watermarks above.
@@ -173,7 +175,6 @@ module KafkaBatch
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
       @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
-      @fairness_enabled                 = false
       @fairness_global_concurrency      = 50
       @fairness_max_inflight_per_tenant = 0     # 0 = no per-tenant cap (rely on WFQ)
       @fairness_ready_window            = 500   # bounded ready jobs per tenant in Redis

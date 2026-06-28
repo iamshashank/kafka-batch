@@ -28,7 +28,6 @@ RSpec.describe "KafkaBatch.validate_topics!" do
 
   it "does not require config.jobs_topic when worker topics are registered" do
     allow(KafkaBatch).to receive(:workers).and_return([SuccessfulWorker])
-    KafkaBatch.config.fairness_enabled = false
     # Cluster has the worker's topic + control plane, but NOT config.jobs_topic.
     existing = [SuccessfulWorker.kafka_topic, KafkaBatch.config.events_topic,
                 KafkaBatch.config.callbacks_topic, KafkaBatch.config.dead_letter_topic,

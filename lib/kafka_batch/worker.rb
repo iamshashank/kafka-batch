@@ -56,6 +56,28 @@ module KafkaBatch
         end
       end
 
+      # Whether this worker's jobs flow through the shared multi-tenant FAIR lane
+      # (ingest topic → Dispatcher → ready topic → JobConsumer swarm) instead of
+      # the worker's own/default topic. Fairness is a per-worker choice — there is
+      # no global switch — so fair and plain workers run side by side in the same
+      # process. Tenant isolation comes from the `tenant_id` set on the batch/push.
+      #
+      #   fairness true    # this worker shares the fair lane across tenants
+      #
+      # @return [Boolean]
+      def fairness(enabled = :__unset__)
+        if enabled == :__unset__
+          @fairness.nil? ? false : @fairness
+        else
+          @fairness = enabled ? true : false
+        end
+      end
+
+      # Predicate form of #fairness.
+      def fairness?
+        fairness
+      end
+
       # Pin every retry of this worker to a single delay tier (e.g. :short,
       # :medium, :large) instead of walking the default progression. Pass nil
       # (default) to use config.retry_tier_progression.

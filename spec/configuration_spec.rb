@@ -78,8 +78,8 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.max_failures_per_batch).to eq(1000)
     end
 
-    it "ships fairness disabled with sane WFQ defaults" do
-      expect(config.fairness_enabled).to eq(false)
+    it "ships sane fairness-lane defaults (fairness is a per-worker opt-in)" do
+      expect(config).not_to respond_to(:fairness_enabled)
       expect(config.fairness_global_concurrency).to eq(50)
       expect(config.fairness_max_inflight_per_tenant).to eq(0)
       expect(config.fairness_ready_window).to eq(500)

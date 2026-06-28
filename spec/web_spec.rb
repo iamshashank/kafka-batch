@@ -134,14 +134,14 @@ RSpec.describe KafkaBatch::Web do
   end
 
   describe "GET /fairness" do
-    it "says fairness is disabled when it's off" do
-      KafkaBatch.config.fairness_enabled = false
+    it "says fairness is off when no worker opts in" do
+      allow(KafkaBatch).to receive(:fairness?).and_return(false)
       html = get("/fairness").last.join
-      expect(html).to include("disabled")
+      expect(html).to include("No workers opt into")
     end
 
-    it "renders lanes, buffer depth and dispatcher status when enabled" do
-      KafkaBatch.config.fairness_enabled  = true
+    it "renders lanes, buffer depth and dispatcher status when a worker is fair" do
+      allow(KafkaBatch).to receive(:fairness?).and_return(true)
       KafkaBatch.config.fairness_ready_lag_high = 5000
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
       ingest_group = "#{KafkaBatch.config.consumer_group}-dispatch"
@@ -159,8 +159,8 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Flowing")
     end
 
-    it "links to /fairness from the dashboard when enabled" do
-      KafkaBatch.config.fairness_enabled = true
+    it "links to /fairness from the dashboard when a worker is fair" do
+      allow(KafkaBatch).to receive(:fairness?).and_return(true)
       expect(get("/").last.join).to include("/kafka_batch/fairness")
     end
   end
@@ -250,7 +250,7 @@ RSpec.describe KafkaBatch::Web do
     end
 
     it "/live, /lag and /fairness auto-reload every 5s" do
-      KafkaBatch.config.fairness_enabled = true
+      allow(KafkaBatch).to receive(:fairness?).and_return(true)
       allow(KafkaBatch::Lag).to receive(:available?).and_return(false)
       %w[/live /lag /fairness].each do |path|
         expect(get(path).last.join).to include("setTimeout(function(){ location.reload(); }, 5000)")

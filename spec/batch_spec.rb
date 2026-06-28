@@ -138,25 +138,33 @@ RSpec.describe KafkaBatch::Batch do
     end
   end
 
-  describe "fairness routing" do
-    it "routes pushes to the ingest topic keyed by tenant when fairness is enabled" do
-      KafkaBatch.config.fairness_enabled = true
+  describe "fairness routing (per-worker)" do
+    it "routes a fair worker's pushes to the ingest topic keyed by tenant" do
       batch = described_class.create(tenant_id: "acme")
-      batch.push(SuccessfulWorker, { "x" => 1 })
+      batch.push(FairWorker, { "x" => 1 })
 
       ingest = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic)
       expect(ingest.size).to eq(1)
       expect(ingest.first.key).to eq("acme")
       expect(ingest.first.payload["tenant_id"]).to eq("acme")
-      expect(FakeProducer.for_topic("test.success")).to be_empty  # not the worker topic
+      expect(FakeProducer.for_topic("test.fair")).to be_empty  # not the worker topic
     end
 
-    it "produces to the worker topic (not ingest) when fairness is disabled" do
+    it "produces a plain worker to its own topic (not ingest)" do
       batch = described_class.create
       batch.push(SuccessfulWorker, { "x" => 1 })
 
       expect(FakeProducer.for_topic("test.success").size).to eq(1)
       expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic)).to be_empty
+    end
+
+    it "lets fair and plain workers coexist in one batch" do
+      batch = described_class.create(tenant_id: "acme")
+      batch.push(FairWorker, { "x" => 1 })
+      batch.push(SuccessfulWorker, { "y" => 2 })
+
+      expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic).size).to eq(1)
+      expect(FakeProducer.for_topic("test.success").size).to eq(1)
     end
   end
 

@@ -105,7 +105,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
    └──────────────────────────┘
 ```
 
-> **Multi-tenant fairness mode** (opt-in) inserts a stage before `JobConsumer`: `Batch.push` writes to a per-tenant **ingest** topic, a `Fairness::Dispatcher` fairly forwards onto a throttled **ready** topic, and the `JobConsumer` swarm drains *that*. Everything downstream (events/callbacks/retry/DLT) is identical. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
+> **Multi-tenant fairness** (per-worker opt-in via `fairness true`) inserts a stage before `JobConsumer` for *that worker*: `Batch.push` writes to a per-tenant **ingest** topic, a `Fairness::Dispatcher` fairly forwards onto a throttled **ready** topic, and the `JobConsumer` swarm drains *that*. Plain workers keep going straight to their own topic. Everything downstream (events/callbacks/retry/DLT) is identical. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
 
 ---
 
@@ -180,7 +180,7 @@ KafkaBatch.configure do |config|
   config.retry_topic       = "kafka_batch.jobs.retry"   # prefix; tier topics are
                                                         # <prefix>.short/.medium/.large
   config.dead_letter_topic = "kafka_batch.dead_letter"
-  # Multi-tenant fairness topics (only used when config.fairness_enabled = true):
+  # Multi-tenant fairness topics (only used when a worker declares `fairness true`):
   config.fairness_ingest_topic = "kafka_batch.ingest"   # per-tenant intake (durable backlog)
   config.fairness_ready_topic  = "kafka_batch.ready"    # throttled execution queue
 
@@ -234,8 +234,8 @@ KafkaBatch.configure do |config|
   config.liveness_heartbeat_interval = 5   # :store throttle: 1 write/consumer/N s
   config.track_running_jobs          = true # gate :redis per-job running-state writes
 
-  # ── Multi-tenant fairness (Kafka-only, opt-in; see the Fairness section) ─
-  config.fairness_enabled        = false
+  # ── Multi-tenant fairness (per-worker opt-in via `fairness true`; see the
+  #    Fairness section). These settings configure the shared fair lane. ──
   config.fairness_ready_lag_high = 5000 # dispatcher pauses forwarding above this depth
   config.fairness_ready_lag_low  = 1000 # ...resumes below this depth
 
@@ -287,7 +287,6 @@ Every option on `KafkaBatch.config`:
 | `liveness_ttl` | Integer (s) | `30` | How long a heartbeat/entry is considered live |
 | `liveness_heartbeat_interval` | Integer (s) | `5` | `:store` heartbeat write throttle |
 | `track_running_jobs` | Boolean | `true` | Gate per-job running-state writes (`:redis` liveness) |
-| `fairness_enabled` | Boolean | `false` | Enable multi-tenant fairness (Kafka-only dispatcher) |
 | `fairness_ingest_topic` | String | `"kafka_batch.ingest"` | Per-tenant intake topic (fairness) |
 | `fairness_ready_topic` | String | `"kafka_batch.ready"` | Throttled execution topic (fairness) |
 | `fairness_ready_lag_high` | Integer | `5000` | Dispatcher pauses forwarding above this ready-topic depth |
@@ -303,7 +302,7 @@ Every option on `KafkaBatch.config`:
 | `consumer_config` | Hash | `{}` | Raw rdkafka consumer overrides (merged into every consumer) |
 | `validate_topics_on_boot` | Boolean | `false` | Raise at boot if required topics are missing |
 
-**Per-Worker overrides** (on the worker class, not `config`): `kafka_topic` (optional — defaults to `config.jobs_topic`), `max_retries`, `complete_after_retries`, `retry_tier`.
+**Per-Worker overrides** (on the worker class, not `config`): `kafka_topic` (optional — defaults to `config.jobs_topic`), `max_retries`, `complete_after_retries`, `retry_tier`, `fairness` (opt into the shared multi-tenant fair lane).
 
 ### Choosing a store
 
@@ -467,7 +466,7 @@ class SyncCrmWorker
 end
 ```
 
-Declare an explicit `kafka_topic` when you want a worker isolated on its own topic/partitions (independent scaling, ordering, or lag). In multi-tenant **fairness mode** the per-worker topic is ignored entirely — all jobs flow through the ingest → ready topics regardless.
+Declare an explicit `kafka_topic` when you want a worker isolated on its own topic/partitions (independent scaling, ordering, or lag). A worker that opts into **fairness** (`fairness true`) ignores its own topic — its jobs flow through the shared ingest → ready lane instead.
 
 ---
 
@@ -759,7 +758,23 @@ end
 
 ## Multi-tenant fairness (WFQ)
 
-When many tenants (businesses) push jobs into the same system, a naive Kafka topic processes them roughly FIFO — so one tenant dumping 10M jobs starves everyone behind it. KafkaBatch shares capacity dynamically across tenants using **only Kafka — no Redis required**:
+When many tenants (businesses) push jobs into the same system, a naive Kafka topic processes them roughly FIFO — so one tenant dumping 10M jobs starves everyone behind it. KafkaBatch shares capacity dynamically across tenants using **only Kafka — no Redis required**.
+
+Fairness is a **per-worker opt-in** (`fairness true` on the Worker class) — there's no global switch. Fair workers share one ingest → ready lane; plain workers keep using their own topic, and both run together in the same process:
+
+```ruby
+class CampaignSendWorker
+  include KafkaBatch::Worker
+  fairness true        # this worker's jobs go through the fair lane
+end
+
+class InternalSyncWorker
+  include KafkaBatch::Worker
+  kafka_topic "internal.sync"   # plain worker, dedicated topic (no fairness)
+end
+```
+
+The fair lane gives you:
 
 - **1 active tenant → 100%** of capacity; **2 → ~50:50**; **N → ~1/N each** — and it's **work-conserving** (an idle tenant's share is instantly redistributed).
 - The durable backlog stays in **Kafka** (the ingest topic), so memory is bounded regardless of backlog size. Nothing is stored in Redis on the fairness path.
@@ -775,10 +790,9 @@ batch.push(ProcessUserWorker, { "user_id" => 1 })          # inherits tenant "ac
 batch.push(ProcessUserWorker, { "user_id" => 2 }, tenant_id: "globex")  # override
 ```
 
-Configure (no Redis needed):
+Configure the shared lane (no Redis needed) — these apply to every fair worker:
 
 ```ruby
-config.fairness_enabled        = true
 config.fairness_ingest_topic   = "kafka_batch.ingest"  # per-tenant intake (durable backlog)
 config.fairness_ready_topic    = "kafka_batch.ready"   # throttled execution queue
 config.fairness_ready_lag_high = 5000   # dispatcher pauses forwarding above this depth
@@ -806,7 +820,7 @@ Two things make this fair, with no Redis and no extra process:
 1. **Kafka's balanced fetch.** A consumer fetches roughly evenly across its assigned partitions, so with ingest keyed one-tenant-per-partition the dispatcher naturally forwards a balanced mix. One active tenant fills the ready topic alone (**100%**); N active split **~1/N**; idle tenants contribute nothing (**work-conserving**).
 2. **A shallow ready topic.** The throttle keeps the ready topic's depth bounded, so a newly active tenant only ever waits behind ~the watermark of queued work — not the whole backlog. That's what keeps fairness *dynamic*.
 
-`draw_routes` wires this automatically when `fairness_enabled` (a `…-dispatch` group on the ingest topic + the `…-jobs` group on the ready topic). The durable backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees.
+`draw_routes` wires this automatically when **any** registered worker declares `fairness true` (a `…-dispatch` group on the ingest topic + the ready topic added to the `…-jobs` group, alongside the plain workers' own topics). The durable backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees.
 
 Fairness here is **approximate** ("good enough"): granularity is the fetch batch, and it assumes ~even partition assignment per tenant and similar job sizes. For **strict weighted shares**, `KafkaBatch::Fairness::Scheduler` is available as a standalone Redis-backed virtual-time WFQ engine (`enqueue`/`checkout`/`complete`/`set_weight`/`stats`) you can build a custom dispatcher/worker around.
 
@@ -823,7 +837,7 @@ Tenants are mapped to ingest partitions by **Kafka's key-hash partitioner** — 
   kafka-topics --create --topic <prefix>kafka_batch.ready  --partitions 64  --replication-factor 3
   ```
 
-**Boot safety check:** when `fairness_enabled`, KafkaBatch checks the ingest topic's partition count at consumer startup and **warns** if it's below `config.fairness_min_ingest_partitions` (default `2`; a single partition is always flagged). Under `config.validate_topics_on_boot = true` it **raises** instead. Set `fairness_min_ingest_partitions` near your expected concurrent-tenant count to enforce proper sizing:
+**Boot safety check:** when any worker opts into fairness, KafkaBatch checks the ingest topic's partition count at consumer startup and **warns** if it's below `config.fairness_min_ingest_partitions` (default `2`; a single partition is always flagged). Under `config.validate_topics_on_boot = true` it **raises** instead. Set `fairness_min_ingest_partitions` near your expected concurrent-tenant count to enforce proper sizing:
 
 ```ruby
 config.fairness_min_ingest_partitions = 128   # warn/raise if the ingest topic has fewer
@@ -975,7 +989,7 @@ When `ActiveSupport` is not available (non-Rails environments), all instrumentat
 
 Kafka has no migration system, so `kafka_batch:create_topics` is the equivalent: it derives the full topic set from your current config and creates any that are missing. It is idempotent (existing topics are skipped, never mutated) and uses per-topic default partition counts unless you override them. The set it creates:
 
-- **Job topics** — in fairness mode, the **ingest** and **ready** topics; otherwise **each registered worker's `kafka_topic`** (the rake task eager-loads the app so all workers are discovered; if none are loaded it falls back to `config.jobs_topic`).
+- **Job topics** — for any fair worker, the shared **ingest** and **ready** topics; for plain workers, **each worker's own `kafka_topic`** (the rake task eager-loads the app so all workers are discovered; if none are loaded it falls back to `config.jobs_topic`).
 - **Control plane** — events, callbacks, the three retry tier topics (`…retry.short/.medium/.large`), and the dead-letter topic.
 
 ```bash
@@ -1105,7 +1119,7 @@ Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, th
 8.  CallbackConsumer → callback class   INVOKE on_success / on_complete, then CLAIM
 ```
 
-**In fairness mode**, step 2 changes to: `Batch.push → Kafka ingest topic` (keyed by `tenant_id`), then `Fairness::Dispatcher → Kafka ready topic` (fairly ordered + throttled), and the `JobConsumer` swarm consumes the **ready** topic. Steps 3–8 are otherwise unchanged.
+**For a fair worker** (`fairness true`), step 2 changes to: `Batch.push → Kafka ingest topic` (keyed by `tenant_id`), then `Fairness::Dispatcher → Kafka ready topic` (fairly ordered + throttled), and the `JobConsumer` swarm consumes the **ready** topic. Steps 3–8 are otherwise unchanged.
 
 ---
 
@@ -1113,7 +1127,7 @@ Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, th
 
 | Topic (default name) | Produced by | Consumed by | Purpose |
 |---|---|---|---|
-| `kafka_batch.jobs` (per worker) | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages (non-fairness mode) |
+| `kafka_batch.jobs` (per worker) | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages (plain, non-fair workers) |
 | `kafka_batch.jobs.retry.{short,medium,large}` | `JobConsumer` | `RetryConsumer` | Failed jobs awaiting their tier's delay |
 | `kafka_batch.events` | `JobConsumer` | `EventConsumer` | Job completion signals |
 | `kafka_batch.callbacks` | `EventConsumer` / `Reconciler` | `CallbackConsumer` | Batch-complete triggers |
@@ -1121,7 +1135,7 @@ Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, th
 | `kafka_batch.ingest` *(fairness only)* | `Batch.push` (keyed by `tenant_id`) | `Fairness::Dispatcher` | Per-tenant intake queue (durable backlog) |
 | `kafka_batch.ready` *(fairness only)* | `Fairness::Dispatcher` | `JobConsumer` swarm | Fairly-ordered, throttled execution queue |
 
-In **fairness mode** (`config.fairness_enabled = true`), jobs flow `ingest → ready → JobConsumer` instead of straight to the per-worker topic. The `ingest` topic holds the durable backlog (key it one-tenant-per-partition), and the `ready` topic is the shallow, throttled queue the worker swarm drains. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
+For a **fair worker** (`fairness true`), jobs flow `ingest → ready → JobConsumer` instead of straight to the worker's own topic. The `ingest` topic holds the durable backlog (key it one-tenant-per-partition), and the `ready` topic is the shallow, throttled queue the worker swarm drains. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
 
 ---
 

@@ -35,6 +35,17 @@ class FailingWorker
   end
 end
 
+# Worker that opts into the multi-tenant fair lane (ingest -> ready).
+class FairWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.fair"
+  fairness true
+
+  def perform(payload)
+    KafkaBatchSpec::WorkerRuns.record(:fair, payload)
+  end
+end
+
 # Always-failing worker that pins every retry to the :large tier.
 class TierPinnedWorker
   include KafkaBatch::Worker

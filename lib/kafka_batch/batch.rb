@@ -169,9 +169,17 @@ module KafkaBatch
         worker_class: worker_class, payload: payload,
         job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id
       )
-      KafkaBatch::Producer.produce_sync(
-        topic: worker_class.kafka_topic, payload: message, key: job_id
-      )
+      if worker_class.fairness?
+        KafkaBatch::Producer.produce_sync(
+          topic:   KafkaBatch.config.fairness_ingest_topic,
+          payload: message,
+          key:     (tenant_id || job_id).to_s
+        )
+      else
+        KafkaBatch::Producer.produce_sync(
+          topic: worker_class.kafka_topic, payload: message, key: job_id
+        )
+      end
       job_id
     end
 
@@ -239,7 +247,7 @@ module KafkaBatch
         job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tenant_id
       )
 
-      if KafkaBatch.config.fairness_enabled
+      if worker_class.fairness?
         # Land on the ingest topic keyed by tenant (per-tenant ordering); the
         # Dispatcher fairly schedules from there onto the ready topic.
         KafkaBatch::Producer.produce_sync(

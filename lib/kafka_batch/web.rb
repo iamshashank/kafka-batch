@@ -116,7 +116,7 @@ module KafkaBatch
 
       <<~HTML
         #{summary}
-        <div class="toolbar"><button id="kb-live-toggle" type="button" class="btn">○ Live</button> <a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a>#{KafkaBatch.config.fairness_enabled ? " <a class=\"btn\" href=\"#{fairness_path}\">⚖ Fairness</a>" : ""}</div>
+        <div class="toolbar"><button id="kb-live-toggle" type="button" class="btn">○ Live</button> <a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a>#{KafkaBatch.fairness? ? " <a class=\"btn\" href=\"#{fairness_path}\">⚖ Fairness</a>" : ""}</div>
         <div class="filterbar">#{filters}#{search_box(search, status)}</div>
         <div class="card">
           <table>
@@ -400,8 +400,8 @@ module KafkaBatch
     def render_fairness
       back = "<p><a class=\"back\" href=\"#{index_path}\">← All batches</a></p>"
 
-      unless KafkaBatch.config.fairness_enabled
-        return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>Multi-tenant fairness is disabled (<code>config.fairness_enabled = false</code>).</p></div>"
+      unless KafkaBatch.fairness?
+        return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>No workers opt into multi-tenant fairness (set <code>fairness true</code> on a Worker class).</p></div>"
       end
       unless KafkaBatch::Lag.available?
         return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>#{auto_reload_script}"

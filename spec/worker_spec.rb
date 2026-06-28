@@ -17,6 +17,14 @@ RSpec.describe KafkaBatch::Worker do
       expect(SuccessfulWorker.retry_tier).to be_nil
     end
 
+    it "defaults fairness to false" do
+      expect(SuccessfulWorker.fairness?).to eq(false)
+    end
+
+    it "supports a per-worker fairness opt-in" do
+      expect(FairWorker.fairness?).to eq(true)
+    end
+
     it "supports a per-worker retry_tier override" do
       expect(TierPinnedWorker.retry_tier).to eq(:large)
     end

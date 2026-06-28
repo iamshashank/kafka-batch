@@ -5,8 +5,7 @@ RSpec.describe KafkaBatch::Topics do
   end
 
   describe ".specs" do
-    it "covers each registered worker's job topic + control + tier retries + DLT" do
-      KafkaBatch.config.fairness_enabled = false
+    it "covers each plain worker's job topic + control + tier retries + DLT" do
       allow(KafkaBatch).to receive(:workers).and_return([SuccessfulWorker, FailingWorker])
       names = described_class.specs.map { |s| s[:name] }
 
@@ -22,14 +21,12 @@ RSpec.describe KafkaBatch::Topics do
     end
 
     it "skips registry entries that don't respond to kafka_topic rather than raising" do
-      KafkaBatch.config.fairness_enabled = false
       bad = Class.new # not a Worker, no kafka_topic
       allow(KafkaBatch).to receive(:workers).and_return([SuccessfulWorker, bad])
       expect { described_class.specs }.not_to raise_error
     end
 
     it "falls back to config.jobs_topic when no workers are registered" do
-      KafkaBatch.config.fairness_enabled = false
       allow(KafkaBatch).to receive(:workers).and_return([])
       names = described_class.specs.map { |s| s[:name] }
 
@@ -42,12 +39,21 @@ RSpec.describe KafkaBatch::Topics do
       expect(tiers.map { |s| s[:partitions] }).to all(eq(KafkaBatch::Topics::DEFAULT_PARTITIONS[:retry]))
     end
 
-    it "swaps the jobs topic for ingest/ready when fairness is enabled" do
-      KafkaBatch.config.fairness_enabled = true
+    it "adds ingest/ready when a fair worker is present, alongside plain topics" do
+      allow(KafkaBatch).to receive(:workers).and_return([FairWorker, SuccessfulWorker])
       names = described_class.specs.map { |s| s[:name] }
 
       expect(names).to include(KafkaBatch.config.fairness_ingest_topic, KafkaBatch.config.fairness_ready_topic)
-      expect(names).not_to include(KafkaBatch.config.jobs_topic)
+      expect(names).to include(SuccessfulWorker.kafka_topic)  # plain worker still wired
+      expect(names).not_to include(FairWorker.kafka_topic)    # fair worker uses the lane
+    end
+
+    it "omits ingest/ready when no worker opts into fairness" do
+      allow(KafkaBatch).to receive(:workers).and_return([SuccessfulWorker])
+      names = described_class.specs.map { |s| s[:name] }
+
+      expect(names).not_to include(KafkaBatch.config.fairness_ingest_topic)
+      expect(names).not_to include(KafkaBatch.config.fairness_ready_topic)
     end
 
     it "forces every topic to the given partition count when provided" do
@@ -62,7 +68,6 @@ RSpec.describe KafkaBatch::Topics do
   end
 
   describe ".create_all!" do
-    before { KafkaBatch.config.fairness_enabled = false }
 
     it "creates only the missing topics and skips the existing ones" do
       stub_existing([KafkaBatch.config.events_topic, KafkaBatch.config.callbacks_topic])
