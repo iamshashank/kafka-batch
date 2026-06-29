@@ -144,12 +144,12 @@ RSpec.describe KafkaBatch::Web do
       allow(KafkaBatch).to receive(:fairness?).and_return(true)
       KafkaBatch.config.fairness_ready_lag_high = 5000
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
-      ingest_group = "#{KafkaBatch.config.consumer_group}-dispatch"
-      jobs_group   = "#{KafkaBatch.config.consumer_group}-jobs"
+      ingest_group = KafkaBatch.dispatch_consumer_group
+      fair_group   = KafkaBatch.jobs_fair_consumer_group
       allow(KafkaBatch::Lag).to receive(:read_group).with(ingest_group, [KafkaBatch.config.fairness_ingest_topic])
         .and_return(ingest_group => { KafkaBatch.config.fairness_ingest_topic => { 8 => { offset: 0, lag: 40 }, 9 => { offset: 0, lag: 25 } } })
-      allow(KafkaBatch::Lag).to receive(:read_group).with(jobs_group, [KafkaBatch.config.fairness_ready_topic])
-        .and_return(jobs_group => { KafkaBatch.config.fairness_ready_topic => { 0 => { offset: 0, lag: 12 } } })
+      allow(KafkaBatch::Lag).to receive(:read_group).with(fair_group, [KafkaBatch.config.fairness_ready_topic])
+        .and_return(fair_group => { KafkaBatch.config.fairness_ready_topic => { 0 => { offset: 0, lag: 12 } } })
 
       html = get("/fairness").last.join
       expect(html).to include("Active lanes")

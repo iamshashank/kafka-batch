@@ -72,10 +72,10 @@ module KafkaBatch
     end
 
     # @api private
-    # Read lags ONLY for this gem's consumer groups (control + jobs), so the
-    # dashboard never reports on the host app's unrelated topics. Returns {} if
-    # the gem's groups aren't present in the routing (nothing to show) rather
-    # than falling back to Karafka's "all groups" behaviour.
+    # Read lags ONLY for this gem's consumer groups, so the dashboard never
+    # reports on the host app's unrelated topics. Returns {} if the gem's groups
+    # aren't present in the routing (nothing to show) rather than falling back
+    # to Karafka's "all groups" behaviour.
     def read
       groups = gem_groups_with_topics
       return {} if groups.empty?
@@ -86,8 +86,7 @@ module KafkaBatch
     # @api private
     # @return [Hash<String, Array<String>>] { gem_consumer_group => [topics] }
     def gem_groups_with_topics
-      base   = KafkaBatch.config.consumer_group
-      wanted = ["#{base}-control", "#{base}-jobs"]
+      wanted = KafkaBatch.consumer_groups
 
       Karafka::App.routes
                   .select { |cg| wanted.include?(cg.id) }

@@ -80,7 +80,7 @@ module KafkaBatch
       def read_ready_lag
         return 0 unless KafkaBatch::Lag.available?
 
-        group = "#{KafkaBatch.config.consumer_group}-jobs"
+        group = KafkaBatch.jobs_fair_consumer_group
         topic = KafkaBatch.config.fairness_ready_topic
         data  = KafkaBatch::Lag.read_group(group, [topic])
         (data[group] || {}).values.sum { |parts| parts.values.sum { |i| [i[:lag].to_i, 0].max } }

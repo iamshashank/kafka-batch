@@ -104,6 +104,33 @@ module KafkaBatch
       workers.any?(&:fairness?)
     end
 
+    # ── Consumer group names (derived from config.consumer_group) ───────────
+
+    def control_consumer_group
+      "#{config.consumer_group}-control"
+    end
+
+    def dispatch_consumer_group
+      "#{config.consumer_group}-dispatch"
+    end
+
+    def jobs_fair_consumer_group
+      "#{config.consumer_group}-jobs-fair"
+    end
+
+    def jobs_consumer_group
+      "#{config.consumer_group}-jobs"
+    end
+
+    # All gem-managed consumer groups that exist given the current worker registry.
+    # @return [Array<String>]
+    def consumer_groups
+      groups = [control_consumer_group]
+      groups << dispatch_consumer_group << jobs_fair_consumer_group if fairness?
+      groups << jobs_consumer_group unless workers.reject(&:fairness?).empty?
+      groups
+    end
+
     # ── Karafka routing helper ─────────────────────────────────────────────
     #
     # Call this INSIDE your karafka.rb routes.draw block, passing `self` (the
@@ -118,10 +145,11 @@ module KafkaBatch
     #     end
     #   end
     #
-    # It creates TWO consumer groups so the control plane (events/callbacks/
-    # retry) is isolated from job execution and isn't blocked behind long jobs:
-    #   "<consumer_group>-control" – events + callbacks + retry
-    #   "<consumer_group>-jobs"    – one topic per registered worker
+    # It creates separate consumer groups so each lane scales independently:
+    #   "<consumer_group>-control"  – events + callbacks + retry
+    #   "<consumer_group>-dispatch" – fairness ingest → ready (when any fair worker)
+    #   "<consumer_group>-jobs-fair" – ready topic (fair JobConsumer swarm)
+    #   "<consumer_group>-jobs"     – plain worker topics (non-fair JobConsumer)
     #
     # With config.concurrency > 1 (recommended), control messages are then
     # worked in parallel with jobs, so progress/callbacks propagate promptly.
@@ -130,15 +158,11 @@ module KafkaBatch
       workers = KafkaBatch.workers
 
       # Fairness is per-worker: fair workers share the ingest→ready lane; plain
-      # workers consume their own topic. Both run side by side.
+      # workers consume their own topic. Each lane has its own consumer group so
+      # you can scale fair vs non-fair throughput independently.
       fair_workers = workers.select(&:fairness?)
       plain_topics = workers.reject(&:fairness?).map(&:kafka_topic).uniq
       any_fair     = fair_workers.any?
-
-      # Topics for the shared "-jobs" group: plain worker topics + (if any worker
-      # is fair) the ready topic the dispatcher feeds.
-      job_topics = plain_topics.dup
-      job_topics << cfg.fairness_ready_topic if any_fair
 
       # Karafka's routing DSL methods (consumer_group/topic/consumer) are private
       # and only resolve with implicit self, so define routes inside the builder
@@ -155,20 +179,21 @@ module KafkaBatch
         end
 
         if any_fair
-          # Fair workers: jobs land on the ingest topic; the Dispatcher forwards
-          # them (throttled) onto the ready topic, drained by the JobConsumer swarm
-          # in the -jobs group below. No Redis or extra process on the path.
+          # Fair lane: ingest → Dispatcher (throttled) → ready → JobConsumer swarm.
           consumer_group "#{cfg.consumer_group}-dispatch" do
             topic(cfg.fairness_ingest_topic) { consumer KafkaBatch::Fairness::Dispatcher }
           end
+
+          consumer_group "#{cfg.consumer_group}-jobs-fair" do
+            topic(cfg.fairness_ready_topic) { consumer KafkaBatch::Consumers::JobConsumer }
+          end
         end
 
-        unless job_topics.empty?
+        unless plain_topics.empty?
           consumer_group "#{cfg.consumer_group}-jobs" do
-            # Dedup: several workers may share a topic (e.g. the config.jobs_topic
+            # Dedup: several plain workers may share a topic (e.g. config.jobs_topic
             # default). JobConsumer dispatches per-message via embedded worker_class.
-            # Includes the ready topic when any worker opts into fairness.
-            job_topics.uniq.each do |job_topic|
+            plain_topics.uniq.each do |job_topic|
               topic(job_topic) { consumer KafkaBatch::Consumers::JobConsumer }
             end
           end

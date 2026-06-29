@@ -410,8 +410,8 @@ module KafkaBatch
       cfg            = KafkaBatch.config
       ingest, ready =
         begin
-          [lag_partitions("#{cfg.consumer_group}-dispatch", cfg.fairness_ingest_topic),
-           lag_partitions("#{cfg.consumer_group}-jobs",     cfg.fairness_ready_topic)]
+          [lag_partitions(KafkaBatch.dispatch_consumer_group, cfg.fairness_ingest_topic),
+           lag_partitions(KafkaBatch.jobs_fair_consumer_group, cfg.fairness_ready_topic)]
         rescue StandardError => e
           KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
           return "#{back}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>#{auto_reload_script}"

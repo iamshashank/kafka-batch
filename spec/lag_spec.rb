@@ -45,16 +45,26 @@ RSpec.describe KafkaBatch::Lag do
       double(id: id, topics: topics.map { |t| double(name: t) })
     end
 
-    it "selects only the gem's -control and -jobs groups (not the host app's)" do
+    it "selects only the gem's consumer groups (not the host app's)" do
       KafkaBatch.config.consumer_group = "kb"
       allow(Karafka::App).to receive(:routes).and_return([
-        fake_cg("kb-control", %w[events callbacks retry]),
-        fake_cg("kb-jobs",    %w[demo]),
-        fake_cg("app",        %w[orders.process])
+        fake_cg("kb-control",   %w[events callbacks retry]),
+        fake_cg("kb-dispatch",  %w[ingest]),
+        fake_cg("kb-jobs-fair", %w[ready]),
+        fake_cg("kb-jobs",      %w[demo]),
+        fake_cg("app",          %w[orders.process])
       ])
+      allow(KafkaBatch).to receive(:consumer_groups).and_return(
+        %w[kb-control kb-dispatch kb-jobs-fair kb-jobs]
+      )
 
       result = described_class.gem_groups_with_topics
-      expect(result).to eq("kb-control" => %w[events callbacks retry], "kb-jobs" => %w[demo])
+      expect(result).to eq(
+        "kb-control"   => %w[events callbacks retry],
+        "kb-dispatch"  => %w[ingest],
+        "kb-jobs-fair" => %w[ready],
+        "kb-jobs"      => %w[demo]
+      )
       expect(result).not_to have_key("app")
     end
   end

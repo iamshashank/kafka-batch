@@ -17,6 +17,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
   - [MySQL store](#mysql-store)
   - [Redis store](#redis-store)
   - [Karafka routing](#karafka-routing)
+    - [Scaling consumer groups independently](#scaling-consumer-groups-independently)
 - [Completion counting & scalability](#completion-counting--scalability)
 - [Defining workers](#defining-workers)
 - [Creating batches](#creating-batches)
@@ -105,7 +106,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
    └──────────────────────────┘
 ```
 
-> **Multi-tenant fairness** (per-worker opt-in via `fairness true`) inserts a stage before `JobConsumer` for *that worker*: `Batch.push` writes to a per-tenant **ingest** topic, a `Fairness::Dispatcher` fairly forwards onto a throttled **ready** topic, and the `JobConsumer` swarm drains *that*. Plain workers keep going straight to their own topic. Everything downstream (events/callbacks/retry/DLT) is identical. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
+> **Multi-tenant fairness** (per-worker opt-in via `fairness true`) inserts a stage before `JobConsumer` for *that worker*: `Batch.push` writes to a per-tenant **ingest** topic, a `Fairness::Dispatcher` fairly forwards onto a throttled **ready** topic, and a dedicated **`…-jobs-fair`** consumer group drains the ready topic. Plain workers keep going straight to their own topic in the **`…-jobs`** group. Everything downstream (events/callbacks/retry/DLT) is identical. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
 
 ---
 
@@ -262,7 +263,7 @@ Every option on `KafkaBatch.config`:
 |---|---|---|---|
 | `store` | Symbol | `:mysql` | State store for counters/cursors/failures: `:mysql` or `:redis` |
 | `brokers` | Array&lt;String&gt; | `["localhost:9092"]` | Kafka bootstrap brokers |
-| `consumer_group` | String | `"kafka-batch"` | Base consumer-group name (suffixed `-control` / `-jobs` / `-dispatch`) |
+| `consumer_group` | String | `"kafka-batch"` | Base consumer-group name (suffixed `-control`, `-dispatch`, `-jobs-fair`, `-jobs`) |
 | `logger` | Logger | `Rails.logger` | Logger instance |
 | `jobs_topic` | String | `"kafka_batch.jobs"` | Shared default job topic for workers that don't declare their own `kafka_topic` (non-fairness) |
 | `events_topic` | String | `"kafka_batch.events"` | Completion-event topic |
@@ -382,20 +383,93 @@ class KarafkaApp < Karafka::App
 
     # Ensure worker classes are registered before drawing routes:
     ProcessOrderWorker
-    # KafkaBatch: control-plane group + jobs group
+    # KafkaBatch: control + dispatch + jobs-fair + jobs consumer groups
     KafkaBatch.draw_routes(self)
   end
 end
 ```
 
-`draw_routes` registers **two consumer groups**, deliberately isolating the control plane from job execution so progress/callbacks aren't blocked behind long jobs:
+`draw_routes` registers **up to four consumer groups**, isolating control, fairness dispatch, fair jobs, and plain jobs so each lane scales independently:
 
 | Group | Topic(s) | Consumer(s) |
 |---|---|---|
-| `<consumer_group>-control` | `events`, `callbacks`, `jobs.retry` | `EventConsumer`, `CallbackConsumer`, `RetryConsumer` |
-| `<consumer_group>-jobs` | each worker's `kafka_topic` | `JobConsumer` |
+| `<consumer_group>-control` | `events`, `callbacks`, retry tiers | `EventConsumer`, `CallbackConsumer`, `RetryConsumer` |
+| `<consumer_group>-dispatch` | `fairness_ingest_topic` | `Fairness::Dispatcher` (when any worker has `fairness true`) |
+| `<consumer_group>-jobs-fair` | `fairness_ready_topic` | `JobConsumer` (fair workers only) |
+| `<consumer_group>-jobs` | each plain worker's `kafka_topic` | `JobConsumer` (non-fair workers) |
 
-> **Tip:** keep `config.concurrency > 1` (and/or run a separate `karafka server` process for the control group) so the control plane is processed in parallel with jobs. With `concurrency = 1`, a long-running job can delay (not starve) event/callback processing.
+**Which groups exist?** `draw_routes` always registers `-control`. The fairness groups (`-dispatch`, `-jobs-fair`) appear only when **at least one** registered worker declares `fairness true`. The `-jobs` group appears only when **at least one** plain worker exists (every worker without `fairness true`). A mixed app with both fair and plain workers gets all four.
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │  {consumer_group}-control               │
+                    │  events · callbacks · retry tiers       │
+                    └─────────────────────────────────────────┘
+
+  fair worker ──► ingest ──► ┌──────────────────────────────┐
+                             │  {consumer_group}-dispatch    │
+                             │  Fairness::Dispatcher         │
+                             └──────────────┬───────────────┘
+                                            ▼ ready
+                             ┌──────────────────────────────┐
+                             │  {consumer_group}-jobs-fair   │
+                             │  JobConsumer (fair workers)   │
+                             └──────────────────────────────┘
+
+  plain worker ─────────────►┌──────────────────────────────┐
+                             │  {consumer_group}-jobs        │
+                             │  JobConsumer (plain workers)  │
+                             └──────────────────────────────┘
+```
+
+Group names are derived from `config.consumer_group` (default `"kafka-batch"`). Helpers:
+
+```ruby
+KafkaBatch.control_consumer_group   # => "kafka-batch-control"
+KafkaBatch.dispatch_consumer_group  # => "kafka-batch-dispatch"   (when fairness?)
+KafkaBatch.jobs_fair_consumer_group # => "kafka-batch-jobs-fair"   (when fairness?)
+KafkaBatch.jobs_consumer_group      # => "kafka-batch-jobs"
+KafkaBatch.consumer_groups          # => array of groups that should exist for current workers
+```
+
+### Scaling consumer groups independently
+
+Fair and plain jobs use the **same** `JobConsumer` class but run in **separate consumer groups**, so you can scale throughput per lane without one starving the other:
+
+| What you want | Knob |
+|---|---|
+| More fair-job throughput | Add `-jobs-fair` consumers (or raise `concurrency` on a process that includes that group); size the **ready** topic with enough partitions |
+| More plain-job throughput | Add `-jobs` consumers; size each plain worker's topic |
+| Faster dispatch from ingest → ready | Scale `-dispatch` (usually lightweight — one consumer per ingest partition is enough) |
+| Prompt batch callbacks / retries | Scale `-control` separately so long jobs don't delay events |
+
+By default, `bundle exec karafka server` runs **all** registered groups in one process. To dedicate processes per lane, use Karafka's `--include-consumer-groups` flag (comma-separated):
+
+```bash
+# Control plane only (events, callbacks, retries)
+bundle exec karafka server \
+  --include-consumer-groups kafka-batch-control
+
+# Fairness dispatcher (ingest → ready)
+bundle exec karafka server \
+  --include-consumer-groups kafka-batch-dispatch
+
+# Fair workers only (ready topic)
+bundle exec karafka server \
+  --include-consumer-groups kafka-batch-jobs-fair
+
+# Plain workers only
+bundle exec karafka server \
+  --include-consumer-groups kafka-batch-jobs
+
+# Fair + plain job execution together, control elsewhere
+bundle exec karafka server \
+  --include-consumer-groups kafka-batch-jobs-fair,kafka-batch-jobs
+```
+
+Replace `kafka-batch` with your `config.consumer_group` value. Use `--exclude-consumer-groups` to run everything *except* named groups.
+
+> **Tip:** keep `config.concurrency > 1` on processes that include `-control` or job groups so partitions are worked in parallel. For production, a common split is: one (or more) `-control` processes, one `-dispatch` process, and independently sized `-jobs-fair` / `-jobs` swarms. With `concurrency = 1`, a long-running job can delay (not starve) event/callback processing on the same process.
 
 ---
 
@@ -466,7 +540,7 @@ class SyncCrmWorker
 end
 ```
 
-Declare an explicit `kafka_topic` when you want a worker isolated on its own topic/partitions (independent scaling, ordering, or lag). A worker that opts into **fairness** (`fairness true`) ignores its own topic — its jobs flow through the shared ingest → ready lane instead.
+Declare an explicit `kafka_topic` when you want a worker isolated on its own topic/partitions (independent scaling, ordering, or lag). A worker that opts into **fairness** (`fairness true`) ignores its own topic — its jobs flow through the shared ingest → ready lane and are executed by the `-jobs-fair` consumer group instead of `-jobs`.
 
 ---
 
@@ -760,7 +834,7 @@ end
 
 When many tenants (businesses) push jobs into the same system, a naive Kafka topic processes them roughly FIFO — so one tenant dumping 10M jobs starves everyone behind it. KafkaBatch shares capacity dynamically across tenants using **only Kafka — no Redis required**.
 
-Fairness is a **per-worker opt-in** (`fairness true` on the Worker class) — there's no global switch. Fair workers share one ingest → ready lane; plain workers keep using their own topic, and both run together in the same process:
+Fairness is a **per-worker opt-in** (`fairness true` on the Worker class) — there's no global switch. Fair workers share one ingest → ready lane (consumer groups `-dispatch` and `-jobs-fair`); plain workers use their own topics in the `-jobs` group. Both lanes can run in the same Karafka process or in **separate processes** for independent scaling — see [Scaling consumer groups independently](#scaling-consumer-groups-independently).
 
 ```ruby
 class CampaignSendWorker
@@ -803,16 +877,23 @@ config.fairness_ready_lag_low  = 1000   # ...resumes below this depth
 
 ### How it's wired (reuses normal Kafka consumers, no Redis on the path)
 
-Execution stays on ordinary `JobConsumer`s — fairness is achieved by controlling the *order* jobs reach them, using only Kafka:
+Execution stays on ordinary `JobConsumer`s — fairness is achieved by controlling the *order* jobs reach them, using only Kafka. Each stage has its **own consumer group** so fair and plain throughput scale independently:
 
 ```
 push → ingest topic (keyed one-tenant-per-partition)
         │
-   Fairness::Dispatcher (Karafka consumer): forwards each job ingest → ready,
+   {consumer_group}-dispatch
+   Fairness::Dispatcher: forwards each job ingest → ready,
         │   THROTTLED so the ready topic's un-consumed depth stays between
         │   fairness_ready_lag_low/high (pauses above high, resumes below low)
+        │   (reads ready lag from {consumer_group}-jobs-fair, not -jobs)
         ▼
-   ready topic ── swarm of normal JobConsumers (full speed) → perform → events
+   ready topic
+        │
+   {consumer_group}-jobs-fair
+   JobConsumer swarm → perform → events
+
+plain worker push → worker topic → {consumer_group}-jobs → JobConsumer → events
 ```
 
 Two things make this fair, with no Redis and no extra process:
@@ -820,9 +901,19 @@ Two things make this fair, with no Redis and no extra process:
 1. **Kafka's balanced fetch.** A consumer fetches roughly evenly across its assigned partitions, so with ingest keyed one-tenant-per-partition the dispatcher naturally forwards a balanced mix. One active tenant fills the ready topic alone (**100%**); N active split **~1/N**; idle tenants contribute nothing (**work-conserving**).
 2. **A shallow ready topic.** The throttle keeps the ready topic's depth bounded, so a newly active tenant only ever waits behind ~the watermark of queued work — not the whole backlog. That's what keeps fairness *dynamic*.
 
-`draw_routes` wires this automatically when **any** registered worker declares `fairness true` (a `…-dispatch` group on the ingest topic + the ready topic added to the `…-jobs` group, alongside the plain workers' own topics). The durable backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees.
+`draw_routes` wires this automatically when **any** registered worker declares `fairness true`. The durable backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees. **Retries for fair workers** go back to the **ready** topic (not ingest), so they skip the dispatcher on retry.
 
 Fairness here is **approximate** ("good enough"): granularity is the fetch batch, and it assumes ~even partition assignment per tenant and similar job sizes. For **strict weighted shares**, `KafkaBatch::Fairness::Scheduler` is available as a standalone Redis-backed virtual-time WFQ engine (`enqueue`/`checkout`/`complete`/`set_weight`/`stats`) you can build a custom dispatcher/worker around.
+
+### Scaling fair vs plain jobs
+
+Because fair jobs (`-jobs-fair`) and plain jobs (`-jobs`) are separate consumer groups:
+
+- A burst of fair, multi-tenant campaign work does **not** block plain internal/sync jobs on `-jobs`, and vice versa.
+- Size **ready** partitions and `-jobs-fair` consumer count for fair throughput; size plain worker topics and `-jobs` consumers for non-fair throughput.
+- The dispatcher's throttle watches lag on `-jobs-fair` only — plain job backlog does not affect fair forwarding.
+
+See [Scaling consumer groups independently](#scaling-consumer-groups-independently) for `--include-consumer-groups` examples.
 
 ### Partitioning & topic sizing (important)
 
@@ -1119,23 +1210,23 @@ Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, th
 8.  CallbackConsumer → callback class   INVOKE on_success / on_complete, then CLAIM
 ```
 
-**For a fair worker** (`fairness true`), step 2 changes to: `Batch.push → Kafka ingest topic` (keyed by `tenant_id`), then `Fairness::Dispatcher → Kafka ready topic` (fairly ordered + throttled), and the `JobConsumer` swarm consumes the **ready** topic. Steps 3–8 are otherwise unchanged.
+**For a fair worker** (`fairness true`), step 2 changes to: `Batch.push → Kafka ingest topic` (keyed by `tenant_id`), then `Fairness::Dispatcher` (`-dispatch` group) → Kafka ready topic (fairly ordered + throttled), then `JobConsumer` on the **ready** topic in the `-jobs-fair` group. Plain workers still use step 2 as written (`-jobs` group). Steps 3–8 are otherwise unchanged.
 
 ---
 
 ## Topic reference
 
-| Topic (default name) | Produced by | Consumed by | Purpose |
-|---|---|---|---|
-| `kafka_batch.jobs` (per worker) | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages (plain, non-fair workers) |
-| `kafka_batch.jobs.retry.{short,medium,large}` | `JobConsumer` | `RetryConsumer` | Failed jobs awaiting their tier's delay |
-| `kafka_batch.events` | `JobConsumer` | `EventConsumer` | Job completion signals |
-| `kafka_batch.callbacks` | `EventConsumer` / `Reconciler` | `CallbackConsumer` | Batch-complete triggers |
-| `kafka_batch.dead_letter` | `JobConsumer` / `CallbackConsumer` / `RetryConsumer` | Your consumer | Exhausted jobs + unresolvable callbacks |
-| `kafka_batch.ingest` *(fairness only)* | `Batch.push` (keyed by `tenant_id`) | `Fairness::Dispatcher` | Per-tenant intake queue (durable backlog) |
-| `kafka_batch.ready` *(fairness only)* | `Fairness::Dispatcher` | `JobConsumer` swarm | Fairly-ordered, throttled execution queue |
+| Topic (default name) | Consumer group | Produced by | Consumed by | Purpose |
+|---|---|---|---|---|
+| `kafka_batch.jobs` (per worker) | `{consumer_group}-jobs` | `Batch.create` / `Batch.enqueue` | `JobConsumer` | Individual job messages (plain, non-fair workers) |
+| `kafka_batch.jobs.retry.{short,medium,large}` | `{consumer_group}-control` | `JobConsumer` | `RetryConsumer` | Failed jobs awaiting their tier's delay |
+| `kafka_batch.events` | `{consumer_group}-control` | `JobConsumer` | `EventConsumer` | Job completion signals |
+| `kafka_batch.callbacks` | `{consumer_group}-control` | `EventConsumer` / `Reconciler` | `CallbackConsumer` | Batch-complete triggers |
+| `kafka_batch.dead_letter` | — | `JobConsumer` / `CallbackConsumer` / `RetryConsumer` | Your consumer | Exhausted jobs + unresolvable callbacks |
+| `kafka_batch.ingest` *(fairness only)* | `{consumer_group}-dispatch` | `Batch.push` (keyed by `tenant_id`) | `Fairness::Dispatcher` | Per-tenant intake queue (durable backlog) |
+| `kafka_batch.ready` *(fairness only)* | `{consumer_group}-jobs-fair` | `Fairness::Dispatcher` | `JobConsumer` | Fairly-ordered, throttled execution queue |
 
-For a **fair worker** (`fairness true`), jobs flow `ingest → ready → JobConsumer` instead of straight to the worker's own topic. The `ingest` topic holds the durable backlog (key it one-tenant-per-partition), and the `ready` topic is the shallow, throttled queue the worker swarm drains. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
+For a **fair worker** (`fairness true`), jobs flow `ingest → ready → JobConsumer` in the `-dispatch` / `-jobs-fair` groups instead of straight to the worker's own topic on `-jobs`. The `ingest` topic holds the durable backlog (key it one-tenant-per-partition), and the `ready` topic is the shallow, throttled queue the `-jobs-fair` swarm drains. See [Multi-tenant fairness](#multi-tenant-fairness-wfq) and [Scaling consumer groups independently](#scaling-consumer-groups-independently).
 
 ---
 
