@@ -44,6 +44,9 @@ RSpec.configure do |config|
     allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, payload:, key: nil, headers: {}|
       FakeProducer.record(topic: topic, payload: payload, key: key, headers: headers)
     end
+    allow(KafkaBatch::Producer).to receive(:produce_many_sync) do |messages|
+      messages.each { |m| FakeProducer.record(topic: m[:topic], payload: m[:payload], key: m[:key], headers: m[:headers] || {}) }
+    end
 
     KafkaBatchSpec::CallbackDoubles.reset!
     KafkaBatchSpec::WorkerRuns.reset!

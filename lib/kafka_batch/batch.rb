@@ -116,7 +116,9 @@ module KafkaBatch
 
     # Push many jobs (same worker class) into this open batch in one call.
     # total_jobs is grown by payloads.size with a single atomic store write, then
-    # each job is produced. Raises BatchClosedError if completed/cancelled.
+    # ALL jobs are produced in one produce_many_sync call so librdkafka can
+    # pipeline them into one (or a few) Kafka MessageSets. This is the equivalent
+    # of Sidekiq's push_bulk: one broker round-trip instead of N.
     #
     #   batch.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
     #
@@ -130,19 +132,30 @@ module KafkaBatch
       reserve!(payloads.size)
 
       tid      = tenant_id || @tenant_id
+      fair     = worker_class.fairness?
+      topic    = fair ? KafkaBatch.config.fairness_ingest_topic : worker_class.kafka_topic
+
       job_ids  = []
-      produced = 0
+      messages = payloads.map do |payload|
+        job_id  = SecureRandom.uuid
+        job_ids << job_id
+        message = self.class.build_message(
+          worker_class: worker_class, payload: payload,
+          job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid
+        )
+        # Fairness: key by tenant so one partition per tenant in the ingest topic.
+        # Normal: key by job_id for even partition spread.
+        key = fair ? (tid || @id).to_s : job_id
+        { topic: topic, payload: message, key: key }
+      end
+
       begin
-        payloads.each do |payload|
-          job_id = SecureRandom.uuid
-          produce_job(worker_class, payload, job_id, tid)
-          job_ids << job_id
-          produced += 1
-        end
+        KafkaBatch::Producer.produce_many_sync(messages)
       rescue StandardError
-        # Roll back only the jobs we didn't manage to produce.
-        remainder = payloads.size - produced
-        (KafkaBatch.store.add_jobs(@id, -remainder) rescue nil) if remainder.positive?
+        # On broker failure the idempotent producer will have sent zero or all
+        # messages (partial produce is extremely rare with acks:all). Roll back
+        # the full reservation; the reconciler will catch any edge-case mismatch.
+        (KafkaBatch.store.add_jobs(@id, -payloads.size) rescue nil)
         raise
       end
 

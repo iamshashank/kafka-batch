@@ -27,9 +27,29 @@ module KafkaBatch
           headers: headers
         )
       rescue WaterDrop::Errors::BaseError, Rdkafka::RdkafkaError => e
-        # WaterDrop::Errors::BaseError is the superclass of every WaterDrop
-        # producer error, so this stays correct across WaterDrop versions
-        # (older releases exposed differently-named subclasses).
+        raise KafkaBatch::ProducerError, "Kafka produce failed: #{e.message}"
+      end
+
+      # Produce multiple messages in one shot and wait for all ACKs.
+      #
+      # Internally WaterDrop calls produce_async for each message, collecting
+      # delivery handles, then awaits them all. librdkafka pipelines the sends
+      # into one or a few Kafka MessageSets — the same throughput win as
+      # Sidekiq's push_bulk, without the per-message round-trip overhead of
+      # calling produce_sync in a loop.
+      #
+      # @param messages [Array<Hash>] each with keys: :topic, :payload, :key (opt), :headers (opt)
+      def produce_many_sync(messages)
+        encoded = messages.map do |m|
+          {
+            topic:   m[:topic],
+            payload: encode(m[:payload]),
+            key:     m[:key]&.to_s,
+            headers: m[:headers] || {}
+          }
+        end
+        instance.produce_many_sync(encoded)
+      rescue WaterDrop::Errors::BaseError, Rdkafka::RdkafkaError => e
         raise KafkaBatch::ProducerError, "Kafka produce failed: #{e.message}"
       end
 
@@ -60,7 +80,16 @@ module KafkaBatch
           :"enable.idempotence"       => true,
           :"retry.backoff.ms"         => 200,
           :"socket.timeout.ms"        => 30_000,
-          :"message.timeout.ms"       => 30_000
+          :"message.timeout.ms"       => 30_000,
+          # ── Throughput / latency tuning ──────────────────────────────────────
+          # Send as soon as messages are queued (no artificial linger). With
+          # produce_many_sync all messages land in the librdkafka queue at once,
+          # so they are already batched; no linger needed for throughput.
+          :"queue.buffering.max.ms"   => 5,
+          # Disable Nagle's algorithm: flush TCP segments immediately rather than
+          # waiting to coalesce small packets. Meaningfully reduces per-produce
+          # round-trip latency on LAN connections.
+          :"socket.nagle.disable"     => true
         }
         overrides = (cfg.producer_config || {}).each_with_object({}) do |(k, v), h|
           h[k.to_sym] = v
