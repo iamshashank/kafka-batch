@@ -1,3 +1,3 @@
 module KafkaBatch
-  VERSION = "1.2.0"
+  VERSION = "0.0.1"
 end
