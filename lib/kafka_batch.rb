@@ -22,6 +22,11 @@ require_relative "kafka_batch/worker"
 require_relative "kafka_batch/batch"
 require_relative "kafka_batch/reconciler"
 require_relative "kafka_batch/consumers/job_consumer"
+require_relative "kafka_batch/consumers/priority_gate"
+require_relative "kafka_batch/consumers/fast_p0_consumer"
+require_relative "kafka_batch/consumers/fast_p1_consumer"
+require_relative "kafka_batch/consumers/slow_p0_consumer"
+require_relative "kafka_batch/consumers/slow_p1_consumer"
 require_relative "kafka_batch/consumers/retry_consumer"
 require_relative "kafka_batch/consumers/event_consumer"
 require_relative "kafka_batch/consumers/callback_consumer"
@@ -125,12 +130,30 @@ module KafkaBatch
       "#{config.consumer_group}-jobs"
     end
 
+    def fast_consumer_group
+      "#{config.consumer_group}-jobs-fast"
+    end
+
+    def slow_consumer_group
+      "#{config.consumer_group}-jobs-slow"
+    end
+
     # All gem-managed consumer groups that exist given the current worker registry.
     # @return [Array<String>]
     def consumer_groups
-      groups = [control_consumer_group]
+      groups    = [control_consumer_group]
       groups << dispatch_consumer_group << jobs_fair_consumer_group if fairness?
-      groups << jobs_consumer_group unless workers.reject(&:fairness?).empty?
+
+      plain     = workers.reject(&:fairness?)
+      fast_set  = [config.fast_p0_topic, config.fast_p1_topic]
+      slow_set  = [config.slow_p0_topic, config.slow_p1_topic]
+
+      groups << fast_consumer_group if plain.any? { |w| fast_set.include?(w.kafka_topic) }
+      groups << slow_consumer_group if plain.any? { |w| slow_set.include?(w.kafka_topic) }
+
+      other = plain.reject { |w| (fast_set + slow_set).include?(w.kafka_topic) }
+      groups << jobs_consumer_group unless other.empty?
+
       groups
     end
 
@@ -167,6 +190,21 @@ module KafkaBatch
       plain_topics = workers.reject(&:fairness?).map(&:kafka_topic).uniq
       any_fair     = fair_workers.any?
 
+      # Priority topic sets — workers route here by setting kafka_topic.
+      fast_set = [cfg.fast_p0_topic, cfg.fast_p1_topic]
+      slow_set = [cfg.slow_p0_topic, cfg.slow_p1_topic]
+      all_prio = fast_set + slow_set
+
+      fast_p0_used = plain_topics.include?(cfg.fast_p0_topic)
+      fast_p1_used = plain_topics.include?(cfg.fast_p1_topic)
+      slow_p0_used = plain_topics.include?(cfg.slow_p0_topic)
+      slow_p1_used = plain_topics.include?(cfg.slow_p1_topic)
+      any_fast     = fast_p0_used || fast_p1_used
+      any_slow     = slow_p0_used || slow_p1_used
+
+      # Non-priority plain topics (legacy or custom per-worker topics).
+      other_plain_topics = plain_topics.reject { |t| all_prio.include?(t) }
+
       # Karafka's routing DSL methods (consumer_group/topic/consumer) are private
       # and only resolve with implicit self, so define routes inside the builder
       # via instance_eval. Locals remain available via closure.
@@ -192,11 +230,29 @@ module KafkaBatch
           end
         end
 
-        unless plain_topics.empty?
+        if any_fast
+          # Fast group: p0 (critical) runs unconditionally; p1 (normal) yields
+          # briefly when p0 has lag (weighted priority).
+          consumer_group "#{cfg.consumer_group}-jobs-fast" do
+            topic(cfg.fast_p0_topic) { consumer KafkaBatch::Consumers::FastP0Consumer } if fast_p0_used
+            topic(cfg.fast_p1_topic) { consumer KafkaBatch::Consumers::FastP1Consumer } if fast_p1_used
+          end
+        end
+
+        if any_slow
+          # Slow group: p0 (critical) runs unconditionally; p1 (normal) pauses
+          # entirely while p0 has lag (strict priority).
+          consumer_group "#{cfg.consumer_group}-jobs-slow" do
+            topic(cfg.slow_p0_topic) { consumer KafkaBatch::Consumers::SlowP0Consumer } if slow_p0_used
+            topic(cfg.slow_p1_topic) { consumer KafkaBatch::Consumers::SlowP1Consumer } if slow_p1_used
+          end
+        end
+
+        unless other_plain_topics.empty?
           consumer_group "#{cfg.consumer_group}-jobs" do
             # Dedup: several plain workers may share a topic (e.g. config.jobs_topic
             # default). JobConsumer dispatches per-message via embedded worker_class.
-            plain_topics.uniq.each do |job_topic|
+            other_plain_topics.uniq.each do |job_topic|
               topic(job_topic) { consumer KafkaBatch::Consumers::JobConsumer }
             end
           end

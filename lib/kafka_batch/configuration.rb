@@ -129,6 +129,24 @@ module KafkaBatch
     # fewer partitions than this. Set it near your max concurrent tenant count.
     attr_accessor :fairness_min_ingest_partitions # Integer – default 2
 
+    # ── Priority queues (non-fair, 4-topic 2-group design) ───────────────────
+    # Two independently-scalable consumer groups:
+    #   fast-group – short-running jobs; p1 yields briefly when p0 has lag
+    #                (weighted: p0 gets priority but p1 never starves)
+    #   slow-group – long-running jobs; p1 pauses entirely when p0 has lag
+    #                (strict: no new p1 jobs while p0 backlog exists)
+    #
+    # Workers opt in by setting kafka_topic to one of these four topic names.
+    # fairness true always takes precedence over kafka_topic.
+    attr_accessor :fast_p0_topic  # default "kafka_batch.jobs.fast_p0"
+    attr_accessor :fast_p1_topic  # default "kafka_batch.jobs.fast_p1"
+    attr_accessor :slow_p0_topic  # default "kafka_batch.jobs.slow_p0"
+    attr_accessor :slow_p1_topic  # default "kafka_batch.jobs.slow_p1"
+
+    # How often (seconds) p1 consumers re-check p0 lag. Smaller = faster p0
+    # response, more Admin API calls. Default 2.
+    attr_accessor :priority_lag_check_interval  # Integer – default 2
+
     # ── Reconciliation ───────────────────────────────────────────────────────
     # A periodic sweep that re-checks "running" batches that look stuck.
     attr_accessor :reconciliation_interval  # Integer – seconds; default 300
@@ -191,6 +209,11 @@ module KafkaBatch
       @fairness_ready_lag_high          = 5000
       @fairness_ready_lag_low           = 1000
       @fairness_min_ingest_partitions   = 2
+      @fast_p0_topic              = "kafka_batch.jobs.fast_p0"
+      @fast_p1_topic              = "kafka_batch.jobs.fast_p1"
+      @slow_p0_topic              = "kafka_batch.jobs.slow_p0"
+      @slow_p1_topic              = "kafka_batch.jobs.slow_p1"
+      @priority_lag_check_interval = 2
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600
       @producer_config          = {}

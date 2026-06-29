@@ -47,7 +47,7 @@ module KafkaBatch
       elsif method == "POST" && path == "/lag/resume"
         lag_consumption_control(:resume, params)
       elsif method == "GET" && path == "/fairness"
-        html(render_fairness)
+        html(render_fairness(params))
       elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
         batch = KafkaBatch.store.find_batch(m[1])
         batch ? html(render_show(batch)) : not_found
@@ -460,7 +460,8 @@ module KafkaBatch
       secs >= 60 ? "~#{secs / 60}m" : "~#{secs}s"
     end
 
-    def render_fairness
+    def render_fairness(params = {})
+      tenant_q = non_empty(params["tenant_id"])
       back = "<p><a class=\"back\" href=\"#{index_path}\">← All batches</a></p>"
 
       inactive_notice =
@@ -468,7 +469,7 @@ module KafkaBatch
           "<div class='card'><p class='muted'>No registered workers opt into multi-tenant fairness yet (set <code>fairness true</code> on a Worker class). Lag below reflects the configured ingest/ready topics.</p></div>"
         end
       unless KafkaBatch::Lag.available?
-        return "#{back}#{inactive_notice}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>#{auto_reload_script}"
+        return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path)}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>#{auto_reload_script}"
       end
 
       cfg            = KafkaBatch.config
@@ -478,8 +479,18 @@ module KafkaBatch
            lag_partitions(KafkaBatch.jobs_fair_consumer_group, cfg.fairness_ready_topic)]
         rescue StandardError => e
           KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
-          return "#{back}#{inactive_notice}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>#{auto_reload_script}"
+          return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path)}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>#{auto_reload_script}"
         end
+
+      # Augment ingest rows with :group and :topic so ingest_partition_lookup_result
+      # can match against them (same shape as KafkaBatch::Lag.partitions rows).
+      full_ingest_rows = ingest.map do |p|
+        { group:     KafkaBatch.dispatch_consumer_group,
+          topic:     cfg.fairness_ingest_topic,
+          partition: p[:partition],
+          lag:       p[:lag] }
+      end
+      lookup_html = ingest_partition_lookup_widget(tenant_q, lag_rows: full_ingest_rows, action: fairness_path)
 
       ingest_total = ingest.sum { |p| p[:lag] }
       ready_total  = ready.sum { |p| p[:lag] }
@@ -501,6 +512,7 @@ module KafkaBatch
       <<~HTML
         #{back}
         #{inactive_notice}
+        #{lookup_html}
         <div class="metrics">
           <div class="metric"><div class="metric-value">#{lanes}</div><div class="metric-label">Active lanes (≈ tenants)</div></div>
           <div class="metric"><div class="metric-value">#{ingest_total}</div><div class="metric-label">Un-dispatched (ingest)</div></div>
@@ -597,8 +609,9 @@ module KafkaBatch
       CGI.escape(value.to_s)
     end
 
-    # Small lookup on /lag: given tenant_id, show which ingest partition Kafka assigns.
-    def ingest_partition_lookup_widget(tenant_id, lag_rows: nil)
+    # Small lookup on /lag (or /fairness): given tenant_id, show which ingest partition Kafka assigns.
+    def ingest_partition_lookup_widget(tenant_id, lag_rows: nil, action: nil)
+      action ||= lag_path
       topic = KafkaBatch.config.fairness_ingest_topic
       result =
         if tenant_id.nil?
@@ -611,7 +624,7 @@ module KafkaBatch
         <div class="card ingest-lookup">
           <h3>Ingest partition lookup</h3>
           <p class="muted">Fair jobs are keyed by <code>tenant_id</code> on <code>#{h(topic)}</code>. Uses Kafka's default murmur2 partitioner (same as the producer).</p>
-          <form class="search" method="get" action="#{lag_path}">
+          <form class="search" method="get" action="#{action}">
             <input type="text" name="tenant_id" value="#{h(tenant_id.to_s)}" placeholder="tenant_id (e.g. acme)" autocomplete="off">
             <button type="submit" class="btn">Lookup</button>
           </form>

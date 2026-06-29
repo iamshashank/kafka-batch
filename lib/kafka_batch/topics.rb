@@ -18,6 +18,7 @@ module KafkaBatch
     # single count). These are starting points — size them for your throughput.
     DEFAULT_PARTITIONS = {
       jobs:        6,
+      priority:    6,   # fast/slow p0+p1 topics (override per topic if needed)
       events:      3,
       callbacks:   1,
       retry:       3,   # per tier
@@ -65,6 +66,14 @@ module KafkaBatch
       end.uniq
       plain_topics = [cfg.jobs_topic].compact if plain_topics.empty? && fair_workers.empty?
       plain_topics.each { |t| add.call(t, :jobs) }
+
+      # Priority queue topics: always provisioned so they're available when
+      # workers adopt them. uniq at the end deduplicates against any plain
+      # worker that already declared the same kafka_topic.
+      add.call(cfg.fast_p0_topic, :priority)
+      add.call(cfg.fast_p1_topic, :priority)
+      add.call(cfg.slow_p0_topic, :priority)
+      add.call(cfg.slow_p1_topic, :priority)
 
       add.call(cfg.events_topic, :events)
       add.call(cfg.callbacks_topic, :callbacks)
