@@ -27,7 +27,8 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 - [Retry behaviour](#retry-behaviour)
   - [Early batch completion (`complete_after_retries`)](#early-batch-completion-complete_after_retries)
 - [Dead Letter Topic](#dead-letter-topic)
-- [Multi-tenant fairness (WFQ)](#multi-tenant-fairness-wfq)
+  - [Multi-tenant fairness (WFQ)](#multi-tenant-fairness-wfq)
+    - [Enqueuing fair jobs](#enqueuing-fair-jobs)
 - [Web UI](#web-ui)
 - [Reconciler](#reconciler)
 - [Instrumentation](#instrumentation)
@@ -623,7 +624,7 @@ KafkaBatch::Batch.open(batch_id).push(ProcessUserWorker, { "user_id" => 7 })
 KafkaBatch::Batch.enqueue(ProcessOrderWorker, { order_id: 99 })
 ```
 
-The job goes through the same retry / DLT flow but no batch completion tracking occurs.
+The job goes through the same retry / DLT flow but no batch completion tracking occurs. For a **fair worker** (`fairness true`), pass `tenant_id:` so the job lands on the ingest topic under the right tenant key — see [Enqueuing fair jobs](#enqueuing-fair-jobs).
 
 ### Batch.find and Batch.cancel
 
@@ -856,13 +857,81 @@ The fair lane gives you:
 
 > **Does fairness need Redis? No.** The default fairness path (ingest → dispatcher → ready → swarm) uses Kafka only. Redis is involved **only** if you opt into the standalone `KafkaBatch::Fairness::Scheduler` (a virtual-time WFQ engine for *strict weighted* shares), which is **not** wired into the default path.
 
-Tag jobs with a tenant:
+### Enqueuing fair jobs
+
+For workers with `fairness true`, `push` and `enqueue` route to the **ingest** topic (not the worker's `kafka_topic`). The dispatcher forwards to **ready**, and `JobConsumer` on the `-jobs-fair` group runs `perform`. Everything downstream (events, callbacks, retry, DLT) is the same as plain workers.
+
+**Always pass `tenant_id`** for multi-tenant fairness — the ingest message is keyed by `tenant_id` so tenants spread across partitions. If omitted, the gem falls back to `batch_id` (batch jobs) or `job_id` (standalone), which still works but won't share capacity fairly across tenants.
+
+#### Standalone fair job (no batch)
+
+Use `Batch.enqueue` with `tenant_id:`. `batch_id` is `nil` — no completion tracking or callbacks.
 
 ```ruby
-batch = KafkaBatch::Batch.create(on_complete: "Cb", tenant_id: "acme")
-batch.push(ProcessUserWorker, { "user_id" => 1 })          # inherits tenant "acme"
-batch.push(ProcessUserWorker, { "user_id" => 2 }, tenant_id: "globex")  # override
+# One-off fair job for tenant "acme"
+KafkaBatch::Batch.enqueue(
+  CampaignSendWorker,
+  { "user_id" => 42, "campaign_id" => 99 },
+  tenant_id: "acme"
+)
+
+# Fire-and-forget across many tenants
+%w[acme globex initech].each do |tenant|
+  KafkaBatch::Batch.enqueue(
+    CampaignSendWorker,
+    { "user_id" => 1 },
+    tenant_id: tenant
+  )
+end
 ```
+
+#### Fair job inside a batch
+
+Set a default tenant on the batch; each `push` inherits it. Batch completion and callbacks work as usual.
+
+```ruby
+batch = KafkaBatch::Batch.create(
+  on_success:  "CampaignBatchSuccessCallback",
+  on_complete: "CampaignBatchCompleteCallback",
+  tenant_id:   "acme",
+  description: "Campaign #99 send",
+  meta:        { campaign_id: 99 }
+) do |b|
+  User.where(business_id: acme.id).find_each do |user|
+    b.push(CampaignSendWorker, { "user_id" => user.id })
+  end
+end
+```
+
+Override the tenant on individual pushes (same batch, multiple tenants):
+
+```ruby
+batch = KafkaBatch::Batch.create(on_complete: "Cb", tenant_id: "acme") do |b|
+  b.push(CampaignSendWorker, { "user_id" => 1 })                      # tenant: acme
+  b.push(CampaignSendWorker, { "user_id" => 2 }, tenant_id: "globex") # tenant: globex
+end
+```
+
+#### Mixed batch (fair + plain workers)
+
+Fair and plain workers can share one batch — each job routes by its worker class:
+
+```ruby
+batch = KafkaBatch::Batch.create(on_complete: "MixedCallback", tenant_id: "acme") do |b|
+  b.push(CampaignSendWorker, { "user_id" => 1 })   # fair  → ingest → ready
+  b.push(InternalSyncWorker, { "record_id" => 1 }) # plain → internal.sync topic
+end
+```
+
+| | Standalone | Batch |
+|---|---|---|
+| API | `Batch.enqueue(Worker, payload, tenant_id: "acme")` | `batch.push(Worker, payload)` or `Batch.create(..., tenant_id: "acme") { \|b\| ... }` |
+| `batch_id` | `nil` | batch UUID |
+| Callbacks | none | `on_success` / `on_complete` |
+| Fair routing | ingest → ready | same |
+| Ingest Kafka key | `tenant_id`, or `job_id` if omitted | `tenant_id`, per-push override, or `batch_id` fallback |
+
+Monitor ingest/ready depth on the Web UI **Fairness** page (`/kafka_batch/fairness`).
 
 Configure the shared lane (no Redis needed) — these apply to every fair worker:
 
