@@ -147,22 +147,25 @@ bundle exec rake kafka_batch:create_topics
 Or create them manually (adjust partitions to your throughput):
 
 ```bash
+# --replication-factor 1 is correct for a single-broker (local/dev) setup.
+# For multi-broker production clusters, use the number of brokers (e.g. 3).
+
 # Shared default queue (only if workers don't declare their own kafka_topic)
-kafka-topics.sh --create --topic kafka_batch.jobs            --partitions 6
+kafka-topics.sh --create --topic kafka_batch.jobs            --partitions 6  --replication-factor 1
 
 # Priority queues (fast/slow × p0/p1 — always provisioned)
-kafka-topics.sh --create --topic kafka_batch.jobs.fast_p0   --partitions 6
-kafka-topics.sh --create --topic kafka_batch.jobs.fast_p1   --partitions 6
-kafka-topics.sh --create --topic kafka_batch.jobs.slow_p0   --partitions 6
-kafka-topics.sh --create --topic kafka_batch.jobs.slow_p1   --partitions 6
+kafka-topics.sh --create --topic kafka_batch.jobs.fast_p0   --partitions 6  --replication-factor 1
+kafka-topics.sh --create --topic kafka_batch.jobs.fast_p1   --partitions 6  --replication-factor 1
+kafka-topics.sh --create --topic kafka_batch.jobs.slow_p0   --partitions 6  --replication-factor 1
+kafka-topics.sh --create --topic kafka_batch.jobs.slow_p1   --partitions 6  --replication-factor 1
 
 # Control plane
-kafka-topics.sh --create --topic kafka_batch.events          --partitions 3
-kafka-topics.sh --create --topic kafka_batch.callbacks       --partitions 1
-kafka-topics.sh --create --topic kafka_batch.jobs.retry.short  --partitions 3
-kafka-topics.sh --create --topic kafka_batch.jobs.retry.medium --partitions 3
-kafka-topics.sh --create --topic kafka_batch.jobs.retry.large  --partitions 3
-kafka-topics.sh --create --topic kafka_batch.dead_letter     --partitions 1
+kafka-topics.sh --create --topic kafka_batch.events            --partitions 3  --replication-factor 1
+kafka-topics.sh --create --topic kafka_batch.callbacks         --partitions 1  --replication-factor 1
+kafka-topics.sh --create --topic kafka_batch.jobs.retry.short  --partitions 3  --replication-factor 1
+kafka-topics.sh --create --topic kafka_batch.jobs.retry.medium --partitions 3  --replication-factor 1
+kafka-topics.sh --create --topic kafka_batch.jobs.retry.large  --partitions 3  --replication-factor 1
+kafka-topics.sh --create --topic kafka_batch.dead_letter       --partitions 1  --replication-factor 1
 ```
 
 > The rake task (`kafka_batch:create_topics`) creates all of the above automatically, including the priority topics, using per-topic partition defaults.
