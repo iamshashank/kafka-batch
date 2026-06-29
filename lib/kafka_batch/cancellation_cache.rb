@@ -23,6 +23,18 @@ module KafkaBatch
         ids.include?(batch_id)
       end
 
+      # Optimistically add a batch_id to the local cache immediately after an
+      # explicit cancel (e.g. from the Web UI or Batch.cancel). The cache will
+      # also pick it up on the next full store refresh; this just avoids waiting
+      # for the TTL window so the UI's cancel takes effect immediately in this
+      # process.
+      def add(batch_id)
+        return if batch_id.nil?
+        @mutex.synchronize do
+          @ids = (@ids || Set.new) << batch_id.to_s
+        end
+      end
+
       # Drop the cache (tests / after fork).
       def reset!
         @mutex.synchronize do
