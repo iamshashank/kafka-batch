@@ -292,7 +292,7 @@ Every option on `KafkaBatch.config`:
 | `fairness_ready_topic` | String | `"kafka_batch.ready"` | Throttled execution topic (fairness) |
 | `fairness_ready_lag_high` | Integer | `5000` | Dispatcher pauses forwarding above this ready-topic depth |
 | `fairness_ready_lag_low` | Integer | `1000` | Dispatcher resumes forwarding below this depth |
-| `fairness_min_ingest_partitions` | Integer | `2` | Boot check warns (raises under `validate_topics_on_boot`) if the ingest topic has fewer partitions; set near max concurrent tenants |
+| `fairness_min_ingest_partitions` | Integer | `2` | Warns (raises when `validate_topics_on_boot`) if the ingest topic has fewer partitions; set near max concurrent tenants |
 | `fairness_global_concurrency` | Integer | `50` | **Optional `Scheduler` only** — total in-flight slots |
 | `fairness_max_inflight_per_tenant` | Integer | `0` | **Optional `Scheduler` only** — per-tenant cap (`0` = none) |
 | `fairness_ready_window` | Integer | `500` | **Optional `Scheduler` only** — bounded ready jobs/tenant in Redis |
@@ -928,7 +928,7 @@ Tenants are mapped to ingest partitions by **Kafka's key-hash partitioner** — 
   kafka-topics --create --topic <prefix>kafka_batch.ready  --partitions 64  --replication-factor 3
   ```
 
-**Boot safety check:** when any worker opts into fairness, KafkaBatch checks the ingest topic's partition count at consumer startup and **warns** if it's below `config.fairness_min_ingest_partitions` (default `2`; a single partition is always flagged). Under `config.validate_topics_on_boot = true` it **raises** instead. Set `fairness_min_ingest_partitions` near your expected concurrent-tenant count to enforce proper sizing:
+**Boot safety check:** when any worker opts into fairness, KafkaBatch checks the ingest topic's partition count at Rails boot and again when Karafka starts. It **warns** if the count is below `config.fairness_min_ingest_partitions` (default `2`; a single partition is always flagged). Set `config.validate_topics_on_boot = true` to **raise** instead of warn. Set `fairness_min_ingest_partitions` near your expected concurrent-tenant count to enforce proper sizing:
 
 ```ruby
 config.fairness_min_ingest_partitions = 128   # warn/raise if the ingest topic has fewer
