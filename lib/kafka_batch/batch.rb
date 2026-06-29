@@ -69,6 +69,7 @@ module KafkaBatch
         on_complete: on_complete,
         meta:        meta,
         description: description,
+        tenant_id:   tenant_id,
         # Block form: hold the completion gate shut until population finishes.
         sealed:      !block_given?
       )

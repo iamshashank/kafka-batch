@@ -51,7 +51,7 @@ module KafkaBatch
 
       # ── Public interface ──────────────────────────────────────────────────
 
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, sealed: true)
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, tenant_id: nil, sealed: true)
         attrs = {
           id:               id,
           total_jobs:       total_jobs,
@@ -63,8 +63,9 @@ module KafkaBatch
           meta:             serialize(meta),
           locked_at:        sealed ? Time.now : nil  # locked_at == "sealed_at"
         }
-        # Tolerate apps that haven't run the description migration yet.
+        # Tolerate apps that haven't run the optional column migrations yet.
         attrs[:description] = description if batch_record_class.column_names.include?("description")
+        attrs[:tenant_id]   = tenant_id   if batch_record_class.column_names.include?("tenant_id")
         batch_record_class.create!(attrs)
       rescue ActiveRecord::RecordNotUnique
         nil  # idempotent – already created
@@ -516,6 +517,7 @@ module KafkaBatch
           on_success:             r.on_success,
           on_complete:            r.on_complete,
           description:            (r.respond_to?(:description) ? r.description : nil),
+          tenant_id:              (r.respond_to?(:tenant_id)   ? r.tenant_id   : nil),
           meta:                   deserialize(r.meta),
           created_at:             r.created_at,
           finished_at:            r.respond_to?(:finished_at)            ? r.finished_at            : nil,

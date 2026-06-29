@@ -29,6 +29,7 @@ module KafkaBatchSpec
           t.string   :on_success
           t.string   :on_complete
           t.string   :description
+          t.string   :tenant_id
           t.text     :meta
           t.datetime :created_at,             null: false
           t.datetime :finished_at

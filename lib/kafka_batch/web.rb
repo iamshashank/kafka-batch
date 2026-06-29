@@ -23,6 +23,22 @@ module KafkaBatch
       "pending"   => "#8b5cf6"
     }.freeze
 
+    # Deterministic colour pairs [text, background] for tenant_id chips.
+    # The index is derived from the tenant_id string so the same tenant always
+    # gets the same colour across page loads and between list/show pages.
+    TENANT_COLORS = [
+      ["#1d4ed8", "#dbeafe"],  # blue
+      ["#6d28d9", "#ede9fe"],  # violet
+      ["#be185d", "#fce7f3"],  # pink
+      ["#b45309", "#fef3c7"],  # amber
+      ["#047857", "#d1fae5"],  # emerald
+      ["#0f766e", "#ccfbf1"],  # teal
+      ["#4338ca", "#e0e7ff"],  # indigo
+      ["#b91c1c", "#fee2e2"],  # red
+      ["#7c3aed", "#f3e8ff"],  # purple
+      ["#0369a1", "#e0f2fe"],  # sky
+    ].freeze
+
     def self.call(env)
       new.call(env)
     end
@@ -147,7 +163,7 @@ module KafkaBatch
       filters = status_filters(status, counts, search)
       rows    = batches.map { |b| batch_row(b) }.join
       empty   = search ? "No batches match “#{h(search)}”." : "No batches found."
-      rows    = "<tr><td colspan='8' class='empty'>#{empty}</td></tr>" if batches.empty?
+      rows    = "<tr><td colspan='9' class='empty'>#{empty}</td></tr>" if batches.empty?
       pager   = pagination(page, has_next, status, search)
 
       <<~HTML
@@ -158,7 +174,7 @@ module KafkaBatch
           <table>
             <thead>
               <tr>
-                <th>Batch</th><th>Status</th><th>Total</th><th>Done</th>
+                <th>Batch</th><th>Tenant</th><th>Status</th><th>Total</th><th>Done</th>
                 <th>Failed</th><th>Pending</th><th>Progress</th><th>Actions</th>
               </tr>
             </thead>
@@ -679,10 +695,18 @@ module KafkaBatch
       pend = pending(b)
       meta = b[:meta].nil? || b[:meta].empty? ? "—" : "<pre>#{h(b[:meta].inspect)}</pre>"
 
+      tenant_row =
+        if (tid = non_empty(b[:tenant_id]))
+          { "Tenant" => tenant_chip(tid) }
+        else
+          {}
+        end
+
       rows = {
         "ID"             => h(b[:id]),
         "Description"    => (non_empty(b[:description]) ? h(b[:description]) : "—"),
         "Status"         => status_badge(b[:status]),
+      }.merge(tenant_row).merge(
         "Total jobs"     => b[:total_jobs],
         "Completed"      => b[:completed_count],
         "Failed"         => b[:failed_count],
@@ -694,7 +718,7 @@ module KafkaBatch
         "Callback fired" => (b[:callback_dispatched_at].to_s.empty? ? "no" : fmt_time(b[:callback_dispatched_at])),
         "Callback ran on" => (non_empty(b[:callback_dispatched_by]) ? "<span class='mono'>#{h(b[:callback_dispatched_by])}</span>" : "—"),
         "Meta"           => meta
-      }.map { |k, v| "<tr><th>#{k}</th><td>#{v}</td></tr>" }.join
+      ).map { |k, v| "<tr><th>#{k}</th><td>#{v}</td></tr>" }.join
 
       <<~HTML
         <p><a class="back" href="#{index_path}">← All batches</a></p>
@@ -790,11 +814,24 @@ module KafkaBatch
     end
 
     def batch_row(b)
-      pend = pending(b)
-      desc = non_empty(b[:description]) ? "<div class='desc'>#{h(b[:description])}</div>" : ""
+      pend   = pending(b)
+      desc   = if (raw_desc = non_empty(b[:description]))
+        words      = raw_desc.split
+        short      = words.first(3).join(" ")
+        short     += "…" if words.size > 3
+        tooltip    = words.size > 3 ? " title='#{h(words.first(20).join(" "))}'" : ""
+        "<div class='desc'#{tooltip}>#{h(short)}</div>"
+      end
+      tid    = non_empty(b[:tenant_id])
+      t_cell = if tid
+        "<td>#{tenant_chip(tid)}</td>"
+      else
+        "<td class='muted'>—</td>"
+      end
       <<~HTML
         <tr>
           <td><a href="#{show_path(b[:id])}" class="mono">#{h(short_id(b[:id]))}</a>#{desc}</td>
+          #{t_cell}
           <td>#{status_badge(b[:status])}</td>
           <td>#{b[:total_jobs]}</td>
           <td>#{b[:completed_count]}</td>
@@ -841,6 +878,16 @@ module KafkaBatch
     def status_badge(status)
       color = STATUS_COLORS[status] || "#6b7280"
       "<span class='badge' style='background:#{color}'>#{h(status)}</span>"
+    end
+
+    # Render a coloured pill for a tenant_id. The colour is deterministic: the
+    # same tenant always gets the same pair so operators can spot it visually
+    # without needing a legend.
+    def tenant_chip(tenant_id)
+      return "" if tenant_id.nil? || tenant_id.empty?
+      idx  = tenant_id.bytes.sum % TENANT_COLORS.size
+      fg, bg = TENANT_COLORS[idx]
+      "<span class='tenant-chip' style='color:#{fg};background:#{bg}'>#{h(tenant_id)}</span>"
     end
 
     def pagination(page, has_next, status, search = nil)
@@ -1031,6 +1078,8 @@ module KafkaBatch
       .detail th { width: 180px; color: #6b7280; vertical-align: top; }
       pre { white-space: pre-wrap; word-break: break-word; margin: 0; font-size: 12px; }
       h2 { margin-top: 0; }
+      .tenant-chip { display:inline-block; font-size:11px; font-weight:600; padding:1px 8px;
+                     border-radius:999px; white-space:nowrap; }
     CSS
   end
 end

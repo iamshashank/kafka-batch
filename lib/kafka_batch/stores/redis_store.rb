@@ -107,7 +107,8 @@ module KafkaBatch
           'meta',            ARGV[5],
           'created_at',      ARGV[6],
           'locked_at',       ARGV[8],
-          'description',     ARGV[9]
+          'description',     ARGV[9],
+          'tenant_id',       ARGV[10]
         )
         redis.call('EXPIRE', KEYS[1], tonumber(ARGV[7]))
         return 1
@@ -200,7 +201,7 @@ module KafkaBatch
 
       # ── Public interface ──────────────────────────────────────────────────
 
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, sealed: true)
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, tenant_id: nil, sealed: true)
         key = batch_key(id)
         now = Time.now
         with_redis do |r|
@@ -215,7 +216,8 @@ module KafkaBatch
               now.iso8601,
               @ttl.to_s,
               sealed ? now.iso8601 : "",
-              description.to_s
+              description.to_s,
+              tenant_id.to_s       # ARGV[10]
             ]
           )
           # Returns 1 if created, 0 if already existed (idempotent).
@@ -648,6 +650,7 @@ module KafkaBatch
           on_success:             presence(h["on_success"]),
           on_complete:            presence(h["on_complete"]),
           description:            presence(h["description"]),
+          tenant_id:              presence(h["tenant_id"]),
           meta:                   deserialize(h["meta"]),
           created_at:             h["created_at"],
           finished_at:            h["finished_at"],
