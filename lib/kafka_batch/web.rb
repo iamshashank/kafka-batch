@@ -41,7 +41,7 @@ module KafkaBatch
       elsif method == "GET" && path == "/live"
         html(render_live)
       elsif method == "GET" && path == "/lag"
-        html(render_lag)
+        html(render_lag(params))
       elsif method == "GET" && path == "/fairness"
         html(render_fairness)
       elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
@@ -283,10 +283,13 @@ module KafkaBatch
       HTML
     end
 
-    def render_lag
+    def render_lag(params = {})
+      tenant_q = non_empty(params["tenant_id"])
+
       unless KafkaBatch::Lag.available?
         return <<~HTML
           <p><a class="back" href="#{index_path}">← All batches</a></p>
+          #{ingest_partition_lookup_widget(tenant_q)}
           <div class="card">
             <h2>Topic lag</h2>
             <p class="muted">Lag requires Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p>
@@ -301,6 +304,7 @@ module KafkaBatch
         KafkaBatch.logger.warn("[KafkaBatch::Web] lag fetch failed: #{e.message}")
         return <<~HTML
           <p><a class="back" href="#{index_path}">← All batches</a></p>
+          #{ingest_partition_lookup_widget(tenant_q)}
           <div class="card">
             <h2>Topic lag</h2>
             <p class="muted">Could not read lag from Kafka: <code>#{h(e.message)}</code></p>
@@ -308,6 +312,8 @@ module KafkaBatch
           #{auto_reload_script}
         HTML
       end
+
+      lookup_html = ingest_partition_lookup_widget(tenant_q, lag_rows: rows)
 
       total   = KafkaBatch::Lag.total(rows)
       topics  = KafkaBatch::Lag.topics(rows)
@@ -329,6 +335,7 @@ module KafkaBatch
 
       <<~HTML
         <p><a class="back" href="#{index_path}">← All batches</a></p>
+        #{lookup_html}
         <div class="metrics">
           <div class="metric"><div class="metric-value">#{total}</div><div class="metric-label">Total pending</div></div>
           <div class="metric"><div class="metric-value">#{topics.size}</div><div class="metric-label">Topics</div></div>
@@ -462,6 +469,52 @@ module KafkaBatch
           </table>
         </div>
         #{auto_reload_script}
+      HTML
+    end
+
+    # Small lookup on /lag: given tenant_id, show which ingest partition Kafka assigns.
+    def ingest_partition_lookup_widget(tenant_id, lag_rows: nil)
+      topic = KafkaBatch.config.fairness_ingest_topic
+      result =
+        if tenant_id.nil?
+          ""
+        else
+          ingest_partition_lookup_result(tenant_id, topic, lag_rows)
+        end
+
+      <<~HTML
+        <div class="card ingest-lookup">
+          <h3>Ingest partition lookup</h3>
+          <p class="muted">Fair jobs are keyed by <code>tenant_id</code> on <code>#{h(topic)}</code>. Uses Kafka's default murmur2 partitioner (same as the producer).</p>
+          <form class="search" method="get" action="#{lag_path}">
+            <input type="text" name="tenant_id" value="#{h(tenant_id.to_s)}" placeholder="tenant_id (e.g. acme)" autocomplete="off">
+            <button type="submit" class="btn">Lookup</button>
+          </form>
+          #{result}
+        </div>
+      HTML
+    end
+
+    def ingest_partition_lookup_result(tenant_id, topic, lag_rows)
+      count = KafkaBatch.fairness_ingest_partition_count
+      unless count
+        return "<p class='muted'>Could not read partition count for <code>#{h(topic)}</code>.</p>"
+      end
+
+      partition = KafkaBatch::Partition.for_key(tenant_id, count)
+      lag_row   = lag_rows&.find do |r|
+        r[:topic] == topic && r[:partition].to_i == partition &&
+          r[:group] == KafkaBatch.dispatch_consumer_group
+      end
+      lag_note  =
+        if lag_row
+          " Pending on this partition (dispatch group): #{lag_badge(lag_row[:lag])}."
+        elsif lag_rows
+          " No dispatch-group lag row for this partition (may be zero or not yet consumed)."
+        end
+
+      <<~HTML
+        <p><strong>Tenant</strong> <code>#{h(tenant_id)}</code> → <strong>partition #{partition}</strong> of #{count} on <code>#{h(topic)}</code>.#{lag_note}</p>
       HTML
     end
 

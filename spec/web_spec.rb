@@ -128,8 +128,21 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Total pending")
       expect(html).to include("Pending by topic")
       expect(html).to include("Pending by partition")
+      expect(html).to include("Ingest partition lookup")
       expect(html).to include("demo")
       expect(html).to include("7") # the lag value
+    end
+
+    it "resolves ingest partition for a tenant_id query param" do
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      allow(KafkaBatch::Lag).to receive(:partitions).and_return([])
+      allow(KafkaBatch).to receive(:fairness_ingest_partition_count).and_return(12)
+      allow(KafkaBatch::Partition).to receive(:for_key).with("acme", 12).and_return(7)
+
+      html = get("/lag", query: "tenant_id=acme").last.join
+      expect(html).to include("partition 7")
+      expect(html).to include("acme")
+      expect(html).to include(KafkaBatch.config.fairness_ingest_topic)
     end
   end
 

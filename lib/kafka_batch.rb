@@ -12,6 +12,7 @@ require_relative "kafka_batch/producer"
 require_relative "kafka_batch/cancellation_cache"
 require_relative "kafka_batch/liveness"
 require_relative "kafka_batch/lag"
+require_relative "kafka_batch/partition"
 require_relative "kafka_batch/topics"
 require_relative "kafka_batch/fairness/scheduler"
 require_relative "kafka_batch/fairness/dispatcher"
@@ -252,6 +253,15 @@ module KafkaBatch
     rescue => e
       logger.warn("[KafkaBatch] could not read partition count for '#{config.fairness_ingest_topic}': #{e.message}")
       nil
+    end
+
+    # Ingest partition a tenant_id (Kafka message key) maps to, using the
+    # default murmur2 partitioner. @return [Integer, nil] nil if count unknown.
+    def fairness_ingest_partition_for(tenant_id)
+      count = fairness_ingest_partition_count
+      return nil if count.nil? || count.zero?
+
+      Partition.for_key(tenant_id.to_s, count)
     end
 
     # Warn (or raise, when strict) if the fairness ingest topic has too few
