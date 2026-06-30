@@ -89,7 +89,14 @@ module KafkaBatch
           # Disable Nagle's algorithm: flush TCP segments immediately rather than
           # waiting to coalesce small packets. Meaningfully reduces per-produce
           # round-trip latency on LAN connections.
-          :"socket.nagle.disable"     => true
+          :"socket.nagle.disable"     => true,
+          # Use murmur2_random to match the Java Kafka producer's partitioning
+          # algorithm. librdkafka's default (consistent_random) uses CRC32, which
+          # produces DIFFERENT partition assignments for the same key. The fairness
+          # ingest topic keys messages by tenant_id so each tenant lands on a fixed
+          # partition — the dashboard's ingest-partition lookup widget also uses
+          # murmur2, so both must agree or the widget shows the wrong partition.
+          :"partitioner"              => "murmur2_random"
         }
         overrides = (cfg.producer_config || {}).each_with_object({}) do |(k, v), h|
           h[k.to_sym] = v
