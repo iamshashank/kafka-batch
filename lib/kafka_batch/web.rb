@@ -1355,7 +1355,6 @@ module KafkaBatch
         <body>
           <header>
             <a href="#{index_path}" class="logo">KafkaBatch</a>
-            <span class="tag">batches</span>
             <nav class="header-nav">
               <button id="kb-live-toggle" type="button" class="btn">○ Live</button>
               <a class="btn" href="#{failures_path}">⚠ Failures</a>
