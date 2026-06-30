@@ -30,13 +30,22 @@ module KafkaBatch
       ALL_INDEX     = "kafka_batch:index:all"
       # SET of cancelled batch ids, read periodically by the cancellation cache.
       CANCELLED_INDEX = "kafka_batch:index:cancelled"
+      # Global (legacy) offsets key — kept for reference.  Active code now uses
+      # per-topic sharded keys via offsets_key(source_topic): "kafka_batch:offsets:#{topic}"
       OFFSETS_KEY   = "kafka_batch:offsets"
       HEARTBEATS_KEY = "kafka_batch:heartbeats"
+      # Hash field → integer count for each batch status ("running", "success",
+      # "complete", "cancelled").  Maintained atomically inside the Lua scripts
+      # and in create_batch / update_batch_status / delete_batch so batch_counts
+      # can return in O(1) instead of O(N pipelined HGETs).
+      COUNTS_KEY    = "kafka_batch:counts"
 
       # Atomically apply a completion, deduplicating by a monotonic per-partition
       # cursor over the job message's source offset, then check for completion.
-      #   KEYS[1] = batch hash, KEYS[2] = offsets hash
+      #   KEYS[1] = batch hash
+      #   KEYS[2] = per-topic offsets hash (Bug #3: sharded by source_topic)
       #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset
+      #   KEYS[5] = COUNTS_KEY hash (Bug #2: O(1) status counters)
       #   ARGV[1] = "topic/partition" field, ARGV[2] = source_offset,
       #   ARGV[3] = counter field, ARGV[4] = ttl, ARGV[5] = now (iso8601),
       #   ARGV[6] = finished_at score (unix float as string, for DONE_INDEX zadd)
@@ -45,8 +54,6 @@ module KafkaBatch
       #   [0, "not_found"]  – batch hash does not exist
       #   [1, outcome]      – batch just completed; outcome = "success"|"complete"
       #   [2, "continue"]   – still jobs outstanding
-      # Bug #1 fix: index updates (RUNNING→DONE) are now INSIDE the Lua script,
-      # making finalization and index movement a single atomic operation.
       BATCH_DONE_OFFSET_LUA = <<~LUA.freeze
         local last = redis.call('HGET', KEYS[2], ARGV[1])
         if last and tonumber(ARGV[2]) <= tonumber(last) then return {0, 'duplicate'} end
@@ -83,6 +90,10 @@ module KafkaBatch
             redis.call('ZREM', KEYS[3], batch_id)
             redis.call('ZADD', KEYS[4], tonumber(ARGV[6]), batch_id)
           end
+          -- Bug #2: keep COUNTS_KEY in sync atomically with finalization so
+          -- batch_counts() can be answered in O(1) without scanning ALL_INDEX.
+          redis.call('HINCRBY', KEYS[5], 'running', -1)
+          redis.call('HINCRBY', KEYS[5], outcome, 1)
           return {1, outcome}
         end
 
@@ -93,11 +104,19 @@ module KafkaBatch
       # HSETNX returns 1 if field was absent (we won the race), 0 if already set.
       # Guarded by EXISTS so a stale message for a TTL-expired batch does not
       # recreate a partial, TTL-less hash (orphan key); returns 0 in that case.
+      #   KEYS[1] = batch hash, KEYS[2] = DONE_INDEX zset
+      #   ARGV[1] = now (iso8601), ARGV[2] = dispatched_by, ARGV[3] = batch id
+      # #8 fix: ZREM DONE_INDEX inside Lua so claim + index removal are atomic.
       CLAIM_CALLBACK_LUA = <<~LUA.freeze
         if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
         local won = redis.call('HSETNX', KEYS[1], 'callback_dispatched_at', ARGV[1])
-        if won == 1 and ARGV[2] ~= '' then
-          redis.call('HSET', KEYS[1], 'callback_dispatched_by', ARGV[2])
+        if won == 1 then
+          if ARGV[2] ~= '' then
+            redis.call('HSET', KEYS[1], 'callback_dispatched_by', ARGV[2])
+          end
+          -- #8 fix: remove from DONE_INDEX atomically with the claim so the
+          -- reconciler cannot re-fire a callback whose claim just succeeded.
+          redis.call('ZREM', KEYS[2], ARGV[3])
         end
         return won
       LUA
@@ -141,7 +160,9 @@ module KafkaBatch
       LUA
 
       # Seal a batch (open its completion gate) and finalize if already drained.
-      #   ARGV[1] = now (iso8601), ARGV[2] = ttl
+      #   KEYS[1] = batch hash, KEYS[2] = COUNTS_KEY (Bug #2: O(1) status counters)
+      #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset (#7 fix: atomic move)
+      #   ARGV[1] = now (iso8601), ARGV[2] = ttl, ARGV[3] = now (unix float for DONE_INDEX score)
       # Returns [0,'not_found'] | [1,outcome] (just finalized) | [2,'sealed']
       SEAL_BATCH_LUA = <<~LUA.freeze
         if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
@@ -160,6 +181,17 @@ module KafkaBatch
             local outcome = (failed > 0) and 'complete' or 'success'
             redis.call('HSET', KEYS[1], 'status', outcome)
             redis.call('HSET', KEYS[1], 'finished_at', ARGV[1])
+            -- Bug #2: keep COUNTS_KEY in sync atomically with finalization.
+            redis.call('HINCRBY', KEYS[2], 'running', -1)
+            redis.call('HINCRBY', KEYS[2], outcome, 1)
+            -- #7 fix: move the batch from RUNNING_INDEX to DONE_INDEX inside Lua
+            -- so a process crash between Lua return and the Ruby ZREM/ZADD can
+            -- never strand the id in RUNNING_INDEX or miss DONE_INDEX.
+            local batch_id = redis.call('HGET', KEYS[1], 'id')
+            if batch_id then
+              redis.call('ZREM', KEYS[3], batch_id)
+              redis.call('ZADD', KEYS[4], tonumber(ARGV[3]), batch_id)
+            end
             return {1, outcome}
           end
         end
@@ -236,6 +268,11 @@ module KafkaBatch
             # Register in the running index (reconciler) and the all index (UI).
             r.zadd(RUNNING_INDEX, now.to_f, id)
             r.zadd(ALL_INDEX, now.to_f, id)
+            # Bug #2: maintain O(1) status counters.
+            r.hincrby(COUNTS_KEY, "running", 1)
+            # Bug #2: cap ALL_INDEX so it never grows unbounded at 500 pods × 7-day TTL.
+            max_size = KafkaBatch.config.all_index_max_size.to_i
+            r.zremrangebyrank(ALL_INDEX, 0, -(max_size + 1)) if max_size > 0
           end
           created
         end
@@ -251,13 +288,17 @@ module KafkaBatch
 
       def record_completion_by_offset(batch_id:, source_topic:, source_partition:, source_offset:, status:)
         field        = status == "success" ? "completed_count" : "failed_count"
+        # Bug #3: field is "topic/partition" inside the per-topic offsets key.
+        # Having the topic in both the key name and field is redundant but harmless
+        # — changing the field format would invalidate existing cursor data.
         offset_field = "#{source_topic}/#{source_partition}"
         bkey         = batch_key(batch_id)
+        okey         = offsets_key(source_topic)  # Bug #3: per-topic sharded key
         now          = Time.now.iso8601
 
         result = with_redis do |r|
           r.eval(BATCH_DONE_OFFSET_LUA,
-            keys: [bkey, OFFSETS_KEY, RUNNING_INDEX, DONE_INDEX],
+            keys: [bkey, okey, RUNNING_INDEX, DONE_INDEX, COUNTS_KEY],
             argv: [offset_field, source_offset.to_s, field, @ttl.to_s, now, Time.now.to_f.to_s]
           )
         end
@@ -266,7 +307,6 @@ module KafkaBatch
         case code
         when 0 then { status: payload.to_sym }
         when 1
-          # Index movement now done atomically inside Lua (Bug #1 fix).
           { status: :done, outcome: payload, batch: find_batch(batch_id) }
         when 2 then { status: :continue }
         end
@@ -287,10 +327,14 @@ module KafkaBatch
             events.each do |e|
               field        = e[:status] == "success" ? "completed_count" : "failed_count"
               offset_field = "#{e[:source_topic]}/#{e[:source_partition]}"
-              # Bug #1 fix: pass RUNNING_INDEX and DONE_INDEX as KEYS[3]/KEYS[4]
-              # so index movement is atomic with finalization inside Lua.
+              # Bug #3: use per-topic sharded offsets key to spread write
+              # contention across N Redis keys instead of serializing all 500
+              # pods on a single OFFSETS_KEY hash.
+              # Bug #2: pass COUNTS_KEY as KEYS[5] so finalization updates
+              # status counts atomically inside Lua.
               pipe.eval(BATCH_DONE_OFFSET_LUA,
-                keys: [batch_key(e[:batch_id]), OFFSETS_KEY, RUNNING_INDEX, DONE_INDEX],
+                keys: [batch_key(e[:batch_id]), offsets_key(e[:source_topic]),
+                       RUNNING_INDEX, DONE_INDEX, COUNTS_KEY],
                 argv: [offset_field, e[:source_offset].to_s, field, @ttl.to_s, now, now_float])
             end
           end
@@ -331,33 +375,37 @@ module KafkaBatch
       end
 
       def seal_batch(id)
-        now = Time.now.iso8601
+        now     = Time.now
+        now_iso = now.iso8601
+        now_f   = now.to_f.to_s
         result = with_redis do |r|
-          r.eval(SEAL_BATCH_LUA, keys: [batch_key(id)], argv: [now, @ttl.to_s])
+          # Bug #2: KEYS[2]=COUNTS_KEY keeps status counters in sync.
+          # #7 fix: KEYS[3]=RUNNING_INDEX, KEYS[4]=DONE_INDEX so the index move
+          # happens atomically inside Lua — no split-brain if the process crashes
+          # between the Lua return and the former Ruby-side ZREM/ZADD.
+          r.eval(SEAL_BATCH_LUA,
+            keys: [batch_key(id), COUNTS_KEY, RUNNING_INDEX, DONE_INDEX],
+            argv: [now_iso, @ttl.to_s, now_f]
+          )
         end
         code, payload = result
         case code
         when 0 then { status: :not_found }
-        when 1
-          with_redis do |r|
-            r.zrem(RUNNING_INDEX, id)
-            r.zadd(DONE_INDEX, Time.now.to_f, id)
-          end
-          { status: :done, outcome: payload, batch: find_batch(id) }
+        when 1 then { status: :done, outcome: payload, batch: find_batch(id) }
         when 2 then { status: :sealed }
         end
       end
 
       def claim_callback(id, dispatched_by = nil)
         now = Time.now.iso8601
+        # #8 fix: KEYS[2]=DONE_INDEX and ARGV[3]=id so the ZREM happens inside
+        # the Lua script atomically with the HSETNX claim, preventing a crash
+        # between the two from leaving the batch stranded in DONE_INDEX.
         result = with_redis do |r|
-          won = r.eval(CLAIM_CALLBACK_LUA,
-            keys: [batch_key(id)],
-            argv: [now, dispatched_by.to_s]
+          r.eval(CLAIM_CALLBACK_LUA,
+            keys: [batch_key(id), DONE_INDEX],
+            argv: [now, dispatched_by.to_s, id]
           )
-          # Once dispatched the batch no longer needs reconciliation.
-          r.zrem(DONE_INDEX, id) if won == 1
-          won
         end
         result == 1
       end
@@ -370,11 +418,19 @@ module KafkaBatch
 
       def update_batch_status(id, status)
         with_redis do |r|
+          # Bug #2: read old status so COUNTS_KEY can be adjusted correctly.
+          old_status = r.hget(batch_key(id), "status")
           r.hset(batch_key(id), "status", status)
           # Terminal/cancelled batches drop out of the running index.
           r.zrem(RUNNING_INDEX, id) if %w[success complete cancelled].include?(status)
-          # Track cancellations for the cancellation cache.
-          r.sadd(CANCELLED_INDEX, id) if status == "cancelled"
+          # Bug #2: maintain COUNTS_KEY.  old_status may be nil if the key expired.
+          if old_status && old_status != status
+            r.hincrby(COUNTS_KEY, old_status, -1)
+            r.hincrby(COUNTS_KEY, status,     1)
+          end
+          # Bug #6: CANCELLED_INDEX is now a ZSET (scored by timestamp) so old
+          # entries can be pruned cheaply with ZREMRANGEBYSCORE.
+          zadd_cancelled(r, id) if status == "cancelled"
         end
       end
 
@@ -382,8 +438,26 @@ module KafkaBatch
         with_redis { |r| presence(r.hget(batch_key(id), "status")) }
       end
 
+      # Bug #6: CANCELLED_INDEX is now a ZSET scored by cancellation timestamp.
+      # We only need IDs cancelled within the last 2 × batch_ttl window (any
+      # older job record will have expired from Redis anyway).  Pruning old
+      # entries and reading recent ones happen in a single pipelined round-trip.
       def cancelled_batch_ids
-        with_redis { |r| r.smembers(CANCELLED_INDEX) }
+        with_redis do |r|
+          cutoff = (Time.now.to_f - 2 * @ttl)
+          begin
+            results = r.pipelined do |pipe|
+              pipe.zremrangebyscore(CANCELLED_INDEX, "-inf", cutoff)  # prune stale
+              pipe.zrangebyscore(CANCELLED_INDEX, cutoff, "+inf")      # read active
+            end
+            results[1] || []
+          rescue Redis::CommandError => e
+            raise unless e.message.include?("WRONGTYPE")
+            # Pre-upgrade deployment had a plain SET — migrate it once on first read.
+            migrate_cancelled_index_to_zset(r)
+            r.zrangebyscore(CANCELLED_INDEX, cutoff, "+inf")
+          end
+        end
       end
 
       def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
@@ -522,31 +596,35 @@ module KafkaBatch
         end
       end
 
-      # Bug #17 fix: pipeline all HGET status calls into one round-trip instead of
-      # calling batch_status (one HGET each) per ID in a Ruby loop.
+      # Bug #2 fix: O(1) fast path via the pre-maintained COUNTS_KEY hash.
+      # Falls back to the full pipeline scan only on first call after deployment
+      # (before COUNTS_KEY is populated) or if the key was evicted/flushed.
       def batch_counts
-        ids = with_redis { |r| r.zrange(ALL_INDEX, 0, -1) }
-        return {} if ids.empty?
+        with_redis do |r|
+          raw = r.hgetall(COUNTS_KEY)
+          return raw.transform_values(&:to_i) unless raw.empty?
 
-        statuses = with_redis do |r|
-          r.pipelined do |pipe|
+          # Fallback: rebuild counts from ALL_INDEX via pipelined HGET.
+          ids = r.zrange(ALL_INDEX, 0, -1)
+          return {} if ids.empty?
+
+          statuses = r.pipelined do |pipe|
             ids.each { |id| pipe.hget(batch_key(id), "status") }
           end
-        end
 
-        counts  = Hash.new(0)
-        expired = []
-        ids.zip(statuses).each do |id, st|
-          if st.nil?
-            expired << id
-          else
-            counts[st] += 1
+          counts  = Hash.new(0)
+          expired = []
+          ids.zip(statuses).each do |id, st|
+            if st.nil?
+              expired << id
+            else
+              counts[st] += 1
+            end
           end
+
+          expired.each { |id| r.zrem(ALL_INDEX, id) } unless expired.empty?
+          counts
         end
-
-        with_redis { |r| expired.each { |id| r.zrem(ALL_INDEX, id) } } unless expired.empty?
-
-        counts
       end
 
       def mark_finished(id, outcome)
@@ -563,51 +641,88 @@ module KafkaBatch
       # Batches still in the running index that were created before +older_than+.
       # Self-heals the index by dropping members that have expired or already
       # advanced past "running".
+      # #9 fix: pipeline all HGETALL calls into one round-trip instead of N
+      # sequential find_batch calls (one HGETALL each).
       def stale_batches(older_than:)
         ids = with_redis do |r|
           r.zrangebyscore(RUNNING_INDEX, "-inf", older_than.to_f)
         end
+        return [] if ids.empty?
 
-        ids.each_with_object([]) do |id, acc|
-          batch = find_batch(id)
-          if batch.nil?
-            with_redis { |r| r.zrem(RUNNING_INDEX, id) }  # expired – prune
-          elsif batch[:status] != "running"
-            with_redis { |r| r.zrem(RUNNING_INDEX, id) }  # already advanced – prune
+        raw_hashes = with_redis do |r|
+          r.pipelined { |pipe| ids.each { |id| pipe.hgetall(batch_key(id)) } }
+        end
+
+        stale    = []
+        to_prune = []
+        ids.zip(raw_hashes).each do |id, h|
+          if h.nil? || h.empty?
+            to_prune << id  # expired – prune
           else
-            acc << batch
+            batch = hash_to_batch(h)
+            if batch[:status] != "running"
+              to_prune << id  # already advanced – prune
+            else
+              stale << batch
+            end
           end
         end
+
+        unless to_prune.empty?
+          with_redis { |r| r.pipelined { |pipe| to_prune.each { |id| pipe.zrem(RUNNING_INDEX, id) } } }
+        end
+
+        stale
       end
 
       # Batches in the done index that finished before +older_than+ but whose
       # callback was never dispatched.  Prunes expired or already-dispatched ids.
+      # #9 fix: pipeline all HGETALL calls into one round-trip.
       def done_batches_without_callback(older_than:)
         ids = with_redis do |r|
           r.zrangebyscore(DONE_INDEX, "-inf", older_than.to_f)
         end
+        return [] if ids.empty?
 
-        ids.each_with_object([]) do |id, acc|
-          batch = find_batch(id)
-          if batch.nil?
-            with_redis { |r| r.zrem(DONE_INDEX, id) }  # expired – prune
-          elsif !batch[:callback_dispatched_at].nil?
-            with_redis { |r| r.zrem(DONE_INDEX, id) }  # already dispatched – prune
-          elsif !%w[success complete].include?(batch[:status])
-            with_redis { |r| r.zrem(DONE_INDEX, id) }  # not actually done – prune
+        raw_hashes = with_redis do |r|
+          r.pipelined { |pipe| ids.each { |id| pipe.hgetall(batch_key(id)) } }
+        end
+
+        pending  = []
+        to_prune = []
+        ids.zip(raw_hashes).each do |id, h|
+          if h.nil? || h.empty?
+            to_prune << id  # expired – prune
           else
-            acc << batch
+            batch = hash_to_batch(h)
+            if !batch[:callback_dispatched_at].nil?
+              to_prune << id  # already dispatched – prune
+            elsif !%w[success complete].include?(batch[:status])
+              to_prune << id  # not actually done – prune
+            else
+              pending << batch
+            end
           end
         end
+
+        unless to_prune.empty?
+          with_redis { |r| r.pipelined { |pipe| to_prune.each { |id| pipe.zrem(DONE_INDEX, id) } } }
+        end
+
+        pending
       end
 
       def delete_batch(id)
         with_redis do |r|
+          # Bug #2: decrement COUNTS_KEY before erasing the batch hash.
+          st = r.hget(batch_key(id), "status")
           r.del(batch_key(id), failures_key(id))
           r.zrem(RUNNING_INDEX, id)
           r.zrem(DONE_INDEX, id)
           r.zrem(ALL_INDEX, id)
-          r.srem(CANCELLED_INDEX, id)
+          # Bug #6: CANCELLED_INDEX is now a ZSET — zrem works for both types.
+          r.zrem(CANCELLED_INDEX, id)
+          r.hincrby(COUNTS_KEY, st, -1) if st
         end
       end
 
@@ -649,6 +764,33 @@ module KafkaBatch
 
       def failures_key(id)
         "#{batch_key(id)}:failures"
+      end
+
+      # Bug #3: per-topic sharded offsets key.  Spreading the write load across N
+      # keys prevents all 500 pods serializing on a single Redis hash during the
+      # Lua HSET/HGET for offset dedup.
+      def offsets_key(source_topic)
+        "kafka_batch:offsets:#{source_topic}"
+      end
+
+      # Bug #6: write a cancellation entry to the ZSET-backed CANCELLED_INDEX.
+      # Handles a one-time migration from the legacy SET type with a WRONGTYPE rescue.
+      def zadd_cancelled(r, id)
+        r.zadd(CANCELLED_INDEX, Time.now.to_f, id)
+      rescue Redis::CommandError => e
+        raise unless e.message.include?("WRONGTYPE")
+        migrate_cancelled_index_to_zset(r)
+        r.zadd(CANCELLED_INDEX, Time.now.to_f, id)
+      end
+
+      # Convert the legacy plain-SET CANCELLED_INDEX to a ZSET in-place.
+      # Called at most once per Redis instance (right after a gem upgrade).
+      def migrate_cancelled_index_to_zset(r)
+        ids = r.smembers(CANCELLED_INDEX) rescue []
+        r.del(CANCELLED_INDEX)
+        now_f = Time.now.to_f
+        # Score all legacy entries as "now" — they will age out naturally.
+        r.zadd(CANCELLED_INDEX, ids.flat_map { |i| [now_f, i] }) unless ids.empty?
       end
 
       def failure_hash(h, batch_id: nil)

@@ -104,4 +104,138 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     consumer.send(:process_event, msg)
     expect(KafkaBatch.store.find_batch(id)[:completed_count]).to eq(0)
   end
+
+  # ── ProducerError re-raise leaves offset uncommitted ─────────────────────
+  describe "#apply re-raise on ProducerError" do
+    it "propagates ProducerError so the offset stays uncommitted and Karafka redelivers" do
+      id = SecureRandom.uuid
+      KafkaBatch.store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
+
+      # Make produce_sync raise ProducerError when targeting the callbacks topic.
+      allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, **|
+        raise KafkaBatch::ProducerError, "broker timeout" if topic == KafkaBatch.config.callbacks_topic
+      end
+
+      msgs = [event(id: id, status: "success", src_offset: 1)]
+      allow(consumer).to receive(:messages).and_return(msgs)
+
+      expect { consumer.consume }.to raise_error(KafkaBatch::ProducerError, /broker timeout/)
+    end
+
+    it "does NOT mark any message consumed when ProducerError is raised" do
+      id = SecureRandom.uuid
+      KafkaBatch.store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
+
+      allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, **|
+        raise KafkaBatch::ProducerError, "broker timeout" if topic == KafkaBatch.config.callbacks_topic
+      end
+
+      msgs = [event(id: id, status: "success", src_offset: 1)]
+      allow(consumer).to receive(:messages).and_return(msgs)
+
+      begin
+        consumer.consume
+      rescue KafkaBatch::ProducerError
+        nil
+      end
+
+      expect(consumer).not_to have_received(:mark_as_consumed!)
+    end
+
+    it "logs a clear error before re-raising so operators see the failure immediately" do
+      id = SecureRandom.uuid
+      KafkaBatch.store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
+
+      allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, **|
+        raise KafkaBatch::ProducerError, "broker timeout" if topic == KafkaBatch.config.callbacks_topic
+      end
+
+      expect(KafkaBatch.logger).to receive(:error).with(/Failed to produce callback/)
+
+      # apply takes raw event hashes — same format as record_completions_batch input.
+      events = [{
+        batch_id:         id,
+        source_topic:     "wt",
+        source_partition: 0,
+        source_offset:    1,
+        status:           "success"
+      }]
+      begin
+        consumer.send(:apply, events)
+      rescue KafkaBatch::ProducerError
+        nil
+      end
+    end
+  end
+
+  # ── maybe_reconcile dead-thread self-heal ─────────────────────────────────
+  describe "#maybe_reconcile dead-thread watchdog" do
+    before do
+      # Reset class-level reconciler state between tests
+      described_class.last_reconcile_at  = nil
+      described_class.reconciler_running = false
+      described_class.reconciler_thread  = nil
+      KafkaBatch.config.reconciliation_interval = 0  # always trigger
+    end
+
+    after do
+      described_class.last_reconcile_at  = nil
+      described_class.reconciler_running = false
+      described_class.reconciler_thread  = nil
+    end
+
+    it "resets reconciler_running and spawns a new thread when the stored thread is dead" do
+      # Simulate a thread that died before its ensure block ran
+      dead_thread = Thread.new { raise "unexpected death" }
+      dead_thread.join rescue nil  # let it die
+
+      described_class.reconciler_running = true
+      described_class.reconciler_thread  = dead_thread
+
+      stub_reconciler = -> { nil }
+      allow(KafkaBatch::Reconciler).to receive(:run, &stub_reconciler)
+
+      consumer.send(:maybe_reconcile)
+
+      # Watchdog should have reset the flag and spawned a fresh thread
+      sleep(0.05)  # give the thread a moment to start
+      expect(KafkaBatch::Reconciler).to have_received(:run)
+    end
+
+    it "does not spawn a second thread when a live thread is already running" do
+      # Use a Queue to block thread 1 so it stays alive (reconciler_running=true)
+      # while we make the second maybe_reconcile call.
+      blocker = Queue.new
+      allow(KafkaBatch::Reconciler).to receive(:run) { blocker.pop }
+
+      consumer.send(:maybe_reconcile)  # spawns thread 1, reconciler_running=true
+      sleep(0.02)  # let thread 1 start and block on blocker.pop
+
+      consumer.send(:maybe_reconcile)  # sees reconciler_running=true → no-ops
+
+      blocker.push(:done)  # unblock thread 1 so it can finish
+      described_class.reconciler_thread&.join(1)
+
+      expect(KafkaBatch::Reconciler).to have_received(:run).once
+    end
+
+    it "clears reconciler_running after the thread finishes (via ensure)" do
+      allow(KafkaBatch::Reconciler).to receive(:run)
+
+      consumer.send(:maybe_reconcile)
+
+      # Wait for the reconciler thread to finish
+      described_class.reconciler_thread&.join(1)
+      expect(described_class.reconciler_running).to be(false)
+    end
+
+    it "clears reconciler_running when the reconciler thread itself raises" do
+      allow(KafkaBatch::Reconciler).to receive(:run).and_raise(StandardError, "db down")
+
+      consumer.send(:maybe_reconcile)
+      described_class.reconciler_thread&.join(1)
+
+      expect(described_class.reconciler_running).to be(false)
+    end
+  end
 end

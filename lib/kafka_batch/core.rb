@@ -75,6 +75,29 @@ module KafkaBatch
       end
     end
 
+    # ── Fairness Scheduler singleton ──────────────────────────────────────
+
+    # Returns the process-wide Fairness::Scheduler instance, or nil when Redis
+    # is not configured or Scheduler is not loaded (e.g. UI-only deployments
+    # that don't require `kafka_batch/fairness/scheduler`).
+    # Thread-safe via double-checked locking (same pattern as #store).
+    def scheduler
+      return @scheduler if instance_variable_defined?(:@scheduler)
+      scheduler_mutex.synchronize do
+        return @scheduler if instance_variable_defined?(:@scheduler)
+        @scheduler =
+          if defined?(Fairness::Scheduler) &&
+             config.redis_url && !config.redis_url.to_s.empty?
+            begin
+              Fairness::Scheduler.new
+            rescue => e
+              logger.warn("[KafkaBatch] Fairness::Scheduler init failed: #{e.message}")
+              nil
+            end
+          end
+      end
+    end
+
     # ── Fairness (UI-safe fallbacks) ──────────────────────────────────────
     # The full backend (kafka_batch.rb) overrides fairness? with the real
     # worker-registry check. Core provides a safe default so the fairness
@@ -157,10 +180,12 @@ module KafkaBatch
     # Resets all singletons. Overridden by the full backend load
     # (kafka_batch.rb) to also reset producer, workers, etc.
     def reset!
-      @configuration = nil
-      @store         = nil
-      @store_mutex   = nil
-      @node_id       = nil
+      @configuration    = nil
+      @store            = nil
+      @store_mutex      = nil
+      @scheduler        = nil
+      @scheduler_mutex  = nil
+      @node_id          = nil
       CancellationCache.reset! if defined?(CancellationCache)
       Liveness.reset!          if defined?(Liveness)
       ConsumptionControl.reset! if defined?(ConsumptionControl)
@@ -170,6 +195,10 @@ module KafkaBatch
 
     def store_mutex
       @store_mutex ||= Mutex.new
+    end
+
+    def scheduler_mutex
+      @scheduler_mutex ||= Mutex.new
     end
   end
 end

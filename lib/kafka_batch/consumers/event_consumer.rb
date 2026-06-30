@@ -25,13 +25,17 @@ module KafkaBatch
       # reconciliation_interval seconds per process.  The distributed lock
       # inside Reconciler.run handles multi-process safety.
       RECONCILER_MUTEX   = Mutex.new
-      @last_reconcile_at = nil
+      @last_reconcile_at  = nil
       # Bug #14 fix: track whether a reconciler thread is already running so we
       # never spawn a second one if the first takes longer than the interval.
       @reconciler_running = false
+      # #11 fix: store the thread reference so maybe_reconcile can detect a
+      # thread that died before its ensure block ran (e.g. Thread.new EAGAIN)
+      # and self-heal the @reconciler_running flag.
+      @reconciler_thread  = nil
 
       class << self
-        attr_accessor :last_reconcile_at, :reconciler_running
+        attr_accessor :last_reconcile_at, :reconciler_running, :reconciler_thread
       end
 
       # Apply a whole poll's completion events in ONE store call (per-poll
@@ -75,6 +79,18 @@ module KafkaBatch
         now      = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
         should_run = RECONCILER_MUTEX.synchronize do
+          # #11 fix: if the stored thread died before its ensure block ran
+          # (e.g. Thread.new itself raised EAGAIN / system thread limit), the
+          # running flag would be permanently stuck.  Detect this and self-heal.
+          if self.class.reconciler_running &&
+             self.class.reconciler_thread &&
+             !self.class.reconciler_thread.alive?
+            KafkaBatch.logger.warn(
+              "[KafkaBatch][EventConsumer] reconciler thread died unexpectedly – resetting flag"
+            )
+            self.class.reconciler_running = false
+          end
+
           # Skip if a reconciler thread is already in flight.
           next false if self.class.reconciler_running
 
@@ -90,7 +106,9 @@ module KafkaBatch
 
         return unless should_run
 
-        Thread.new do
+        # #11 fix: store the thread reference so the watchdog above can check
+        # alive? on subsequent poll cycles.
+        thread = Thread.new do
           KafkaBatch::Reconciler.run(triggered_by: :consumer)
         rescue StandardError => e
           KafkaBatch.logger.warn(
@@ -100,6 +118,14 @@ module KafkaBatch
           # Always clear the running flag so the next interval can fire.
           RECONCILER_MUTEX.synchronize { self.class.reconciler_running = false }
         end
+        self.class.reconciler_thread = thread
+      rescue ThreadError => e
+        # Thread creation failed (system thread limit hit) – release the flag
+        # immediately so the next poll cycle can try again.
+        KafkaBatch.logger.error(
+          "[KafkaBatch][EventConsumer] Failed to spawn reconciler thread: #{e.message}"
+        )
+        RECONCILER_MUTEX.synchronize { self.class.reconciler_running = false }
       end
 
       # Apply the deduped, aggregated counter updates and fire callbacks for any

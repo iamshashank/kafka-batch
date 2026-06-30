@@ -1,5 +1,6 @@
 require "karafka"
 require "oj"
+require "set"
 
 module KafkaBatch
   module Fairness
@@ -29,15 +30,24 @@ module KafkaBatch
       PAUSE_MS      = 500
       LAG_CACHE_TTL = 1.0  # seconds – Admin lag is polled at most this often per process
 
-      @lag_cache       = { value: 0, at: -1.0 }
+      @lag_cache       = { value: 0, at: -Float::INFINITY }
+      @lag_cache_pid   = Process.pid   # #16 fix: fork-detection sentinel
       @lag_mutex       = Mutex.new
       # Bug #6 fix: promote @throttled to class-level with its own mutex so all
       # Dispatcher instances in this pod (one per assigned ingest partition) share
       # a single consistent throttle state, matching the class-wide lag cache.
       @throttled       = false
       @throttled_mutex = Mutex.new
+      # Process-local cache of tenant IDs already written to the Scheduler's
+      # VTIME hash. Once a tenant is in here, touch_tenants is not called again
+      # for that tenant in this process — HSETNX would be a no-op anyway, so
+      # we avoid the Redis round-trip entirely after the first touch.
+      @touched_tenants     = Set.new
+      @touched_tenants_pid = Process.pid
+      @touched_mutex       = Mutex.new
       class << self
-        attr_accessor :lag_cache, :lag_mutex, :throttled, :throttled_mutex
+        attr_accessor :lag_cache, :lag_cache_pid, :lag_mutex, :throttled, :throttled_mutex,
+                      :touched_tenants, :touched_tenants_pid, :touched_mutex
       end
 
       # Bug #7 fix: batch all messages into produce_many_sync (single broker
@@ -59,6 +69,19 @@ module KafkaBatch
 
         KafkaBatch::Producer.produce_many_sync(msgs_to_produce)
         mark_as_consumed!(messages.last)
+
+        # Register tenant IDs with the optional Scheduler so they surface on
+        # the /weights page automatically. Uses a process-local Set to skip
+        # tenants already written — avoids a Redis round-trip on every batch
+        # once a tenant has been touched once in this process's lifetime.
+        if (sched = KafkaBatch.scheduler)
+          tids = messages.filter_map { |m| extract_tenant_id(m.raw_payload) }.uniq
+          new_tids = unseen_tenants(tids)
+          unless new_tids.empty?
+            sched.touch_tenants(new_tids)
+            mark_tenants_seen(new_tids)
+          end
+        end
       end
 
       private
@@ -81,12 +104,37 @@ module KafkaBatch
       end
 
       # Process-wide cached ready-topic lag (avoids an Admin call per poll).
+      # #15 fix: release lag_mutex before making the Admin API call so other
+      # Dispatcher instances in this pod are not blocked for 100ms+ while one
+      # fetches lag. Re-acquire to write the result only if the cache is still
+      # stale (a concurrent caller may have already refreshed it).
+      # #16 fix: PID-based fork detection — if Process.pid changed we are in a
+      # forked child that inherited stale state; reset before proceeding.
       def cached_ready_lag
         now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+        # Fast path (or fork-reset path): brief mutex window.
+        self.class.lag_mutex.synchronize do
+          # #16 fix: detect fork by PID change and reset inherited state.
+          if Process.pid != self.class.lag_cache_pid
+            self.class.lag_cache     = { value: 0, at: -Float::INFINITY }
+            self.class.lag_cache_pid = Process.pid
+            self.class.throttled     = false
+          end
+
+          c = self.class.lag_cache
+          return c[:value] if now - c[:at] < LAG_CACHE_TTL
+        end
+
+        # Slow path: fetch OUTSIDE the mutex so we don't block other threads.
+        new_value = read_ready_lag
+
+        # Write back under the mutex; skip if a concurrent caller already wrote
+        # a fresher value while we were fetching.
         self.class.lag_mutex.synchronize do
           c = self.class.lag_cache
           if now - c[:at] >= LAG_CACHE_TTL
-            c[:value] = read_ready_lag
+            c[:value] = new_value
             c[:at]    = now
           end
           c[:value]
@@ -110,6 +158,35 @@ module KafkaBatch
       rescue StandardError
         nil
       end
+
+      # Extract the tenant_id from a raw JSON payload. Returns nil when the
+      # payload has no tenant_id (e.g. batch-level fallback keys a job by
+      # batch_id — we don't want batch IDs appearing as "tenants" on /weights).
+      def extract_tenant_id(raw)
+        t = Oj.load(raw)["tenant_id"]
+        t.is_a?(String) && !t.empty? ? t : nil
+      rescue StandardError
+        nil
+      end
+
+      # Returns tenant IDs not yet touched in this process. Also resets the
+      # cache on fork (Karafka forks workers; inherited state is stale).
+      def unseen_tenants(tids)
+        self.class.touched_mutex.synchronize do
+          if Process.pid != self.class.touched_tenants_pid
+            self.class.touched_tenants     = Set.new
+            self.class.touched_tenants_pid = Process.pid
+          end
+          tids.reject { |t| self.class.touched_tenants.include?(t) }
+        end
+      end
+
+      def mark_tenants_seen(tids)
+        self.class.touched_mutex.synchronize do
+          tids.each { |t| self.class.touched_tenants.add(t) }
+        end
+      end
     end
+
   end
 end

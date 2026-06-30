@@ -34,9 +34,12 @@ module KafkaBatch
     # ── Fairness scheduler ─────────────────────────────────────────────────
 
     # Optional Redis-backed WFQ scheduler. Not used by the default fairness
-    # path — standalone engine for custom dispatchers.
+    # path — standalone engine for custom dispatchers that need strict
+    # weighted fair queuing. Returns nil when redis_url is blank (no Redis).
+    # Alias of KafkaBatch.scheduler (defined in core.rb with double-checked
+    # locking + redis guard). Kept here for backwards-compatibility.
     def fairness_scheduler
-      @fairness_scheduler ||= Fairness::Scheduler.new
+      scheduler
     end
 
     # ── Worker registry ────────────────────────────────────────────────────
@@ -190,13 +193,14 @@ module KafkaBatch
     # ── Reset (full — overrides core.rb's minimal version) ────────────────
 
     def reset!
-      @configuration      = nil
-      @store              = nil
-      @workers            = []
-      @store_mutex        = nil
-      @workers_mutex      = nil
-      @fairness_scheduler = nil
-      @node_id            = nil
+      @configuration   = nil
+      @store           = nil
+      @scheduler       = nil   # shared with core.rb via fairness_scheduler alias
+      @workers         = []
+      @store_mutex     = nil
+      @workers_mutex   = nil
+      @scheduler_mutex = nil
+      @node_id         = nil
       Producer.reset!
       CancellationCache.reset!
       Liveness.reset!

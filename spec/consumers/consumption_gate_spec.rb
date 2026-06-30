@@ -42,4 +42,38 @@ RSpec.describe KafkaBatch::Consumers::ConsumptionGate do
     expect(consumer.ran).to eq(true)
     expect(consumer).not_to have_received(:pause)
   end
+
+  it "passes through to consume (does NOT pause) when ConsumptionControl is unavailable" do
+    allow(KafkaBatch::ConsumptionControl).to receive(:available?).and_return(false)
+    # paused? must never be called when the control plane is down
+    expect(KafkaBatch::ConsumptionControl).not_to receive(:paused?)
+
+    consumer.consume
+
+    expect(consumer.ran).to eq(true)
+    expect(consumer).not_to have_received(:pause)
+  end
+
+  it "calls pause only once when invoked repeatedly while already paused (no double-pause)" do
+    allow(KafkaBatch::ConsumptionControl).to receive(:paused?).and_return(true)
+
+    consumer.consume
+    consumer.consume  # second call while still paused
+
+    expect(consumer).to have_received(:pause).once
+  end
+
+  it "resumes and runs consume when transitioning from paused to unpaused" do
+    # First call: paused
+    allow(KafkaBatch::ConsumptionControl).to receive(:paused?).and_return(true)
+    consumer.consume
+    expect(consumer.ran).to be_nil
+
+    # Second call: unpaused
+    allow(KafkaBatch::ConsumptionControl).to receive(:paused?).and_return(false)
+    consumer.consume
+
+    expect(consumer).to have_received(:resume).once
+    expect(consumer.ran).to eq(true)
+  end
 end

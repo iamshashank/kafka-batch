@@ -79,24 +79,25 @@ module KafkaBatch
         nil  # idempotent – already created
       end
 
+      # Bug #4 fix: lock-free compare-and-update replaces the SELECT FOR UPDATE +
+      # transaction pattern.  MySQL serialises concurrent UPDATEs to the same row
+      # internally so the increment is atomic without an explicit lock.  This
+      # eliminates the hot-path row-lock contention at 500 pods × batch.push rate.
       def add_jobs(id, count)
-        result = nil
-        batch_record_class.transaction do
-          record = batch_record_class.lock.find_by(id: id)
-          if record.nil?
-            result = :not_found
-          elsif record.status == "cancelled"
-            result = :cancelled
-          elsif %w[success complete].include?(record.status) || record.callback_dispatched_at
-            # Completed/closed – cannot accept more jobs. An open batch (even one
-            # that is sealed and currently running jobs) always accepts more.
-            result = :closed
-          else
-            batch_record_class.where(id: id).update_all("total_jobs = total_jobs + #{count.to_i}")
-            result = :ok
-          end
-        end
-        result
+        affected = batch_record_class
+          .where(id: id, status: "running")
+          .where(callback_dispatched_at: nil)
+          .update_all("total_jobs = total_jobs + #{count.to_i}")
+        return :ok if affected == 1
+
+        # Determine why the guard rejected the update (one extra SELECT, only on
+        # the slow path — i.e. when the batch is closed or missing).
+        record = batch_record_class
+          .select(:id, :status, :callback_dispatched_at)
+          .find_by(id: id)
+        return :not_found  if record.nil?
+        return :cancelled  if record.status == "cancelled"
+        :closed
       end
 
       def seal_batch(id)
@@ -129,12 +130,19 @@ module KafkaBatch
 
       # Dedup by a monotonic per-partition cursor over the job message's source
       # coordinates. One row per (topic, partition), independent of batch size.
+      #
+      # Bug #4 fix: the cursor lookup is now a plain SELECT (no FOR UPDATE).
+      # Kafka's partition-assignment model guarantees that only ONE consumer
+      # processes each (topic, partition) at a time, so there is no concurrent
+      # writer on the offset row and the lock was purely defensive overhead.
+      # apply_completion still holds a FOR UPDATE on the batch row to ensure
+      # at-most-once finalization when multiple consumers share the same batch.
       def record_completion_by_offset(batch_id:, source_topic:, source_partition:, source_offset:, status:)
         offset = source_offset.to_i
         result = nil
 
         batch_record_class.transaction do
-          cursor = consumer_offset_class.lock.find_by(
+          cursor = consumer_offset_class.find_by(
             source_topic: source_topic, source_partition: source_partition
           )
 
@@ -163,17 +171,24 @@ module KafkaBatch
       #   3. apply one UPDATE per batch (rows locked in sorted id order to avoid
       #      deadlocks) and finalize any batch that reached its total.
       # @return [Array<Hash>] { batch:, outcome: } for batches that just finished
+      #
+      # Bug #4 fixes applied here:
+      #   Phase 1: plain SELECT (no FOR UPDATE) on cursor rows — Kafka partition
+      #            ownership ensures no concurrent writers on the same row.
+      #   Phase 3: compute new counts in-memory instead of calling record.reload
+      #            after update_all, eliminating one extra SELECT inside the lock.
       def record_completions_batch(events)
         return [] if events.empty?
 
         finalized = []
         batch_record_class.transaction do
-          # ── Phase 1: dedup + advance cursors (sorted for stable lock order) ──
+          # ── Phase 1: dedup + advance cursors (no FOR UPDATE on cursor rows) ──
           applicable = []
           events.group_by { |e| [e[:source_topic], e[:source_partition]] }
                 .sort_by { |(t, p), _| [t.to_s, p.to_i] }
                 .each do |(topic, partition), evs|
-            cursor = consumer_offset_class.lock.find_by(source_topic: topic, source_partition: partition)
+            # Bug #4: plain find_by — no .lock — cursor rows are partition-owned.
+            cursor = consumer_offset_class.find_by(source_topic: topic, source_partition: partition)
             last   = cursor ? cursor.last_offset : -1
             maxoff = last
             seen   = {}
@@ -197,21 +212,25 @@ module KafkaBatch
             incr[e[:batch_id]][idx] += 1
           end
 
-          # ── Phase 3: apply per batch + finalize (sorted id => no deadlocks) ──
+          # ── Phase 3: apply per batch + finalize (sorted id => stable lock order) ──
           incr.keys.sort.each do |batch_id|
-            done, failed = incr[batch_id]
+            done, n_failed = incr[batch_id]
             record = batch_record_class.lock.find_by(id: batch_id)
             next if record.nil?
             next if %w[success complete cancelled].include?(record.status)
 
             sets = []
-            sets << "completed_count = completed_count + #{done.to_i}" if done.positive?
-            sets << "failed_count = failed_count + #{failed.to_i}"     if failed.positive?
+            sets << "completed_count = completed_count + #{done.to_i}"     if done.positive?
+            sets << "failed_count = failed_count + #{n_failed.to_i}"       if n_failed.positive?
             batch_record_class.where(id: batch_id).update_all(sets.join(", ")) unless sets.empty?
-            record.reload
 
-            if record.locked_at && record.completed_count + record.failed_count >= record.total_jobs
-              outcome = record.failed_count.positive? ? "complete" : "success"
+            # Bug #4: compute new values in-memory — avoids record.reload (an extra
+            # SELECT round-trip) while the FOR UPDATE lock is still held.
+            new_completed = record.completed_count + done
+            new_failed    = record.failed_count    + n_failed
+
+            if record.locked_at && new_completed + new_failed >= record.total_jobs
+              outcome = new_failed.positive? ? "complete" : "success"
               record.update!(status: outcome, finished_at: Time.now)
               finalized << { batch: record_to_hash(record), outcome: outcome }
             end
@@ -302,20 +321,33 @@ module KafkaBatch
 
       # ── Liveness (:store backend) ────────────────────────────────────────────
 
+      # #13 fix: replace SELECT + conditional INSERT/UPDATE (with unbounded retry)
+      # with a single-statement INSERT … ON DUPLICATE KEY UPDATE via Rails upsert.
+      # Eliminates the SELECT round-trip, the create/update race window, and the
+      # bare `retry` that had no cap and could spin indefinitely under contention.
       def record_heartbeat(consumer_id, data)
         attrs = data.slice(
           :hostname, :pid, :topic, :current_job_id, :current_worker,
           :current_batch_id, :current_topic, :current_partition, :jobs_done
-        ).merge(last_seen: Time.now)
+        ).merge(last_seen: Time.now, consumer_id: consumer_id)
 
-        rec = heartbeat_class.find_by(consumer_id: consumer_id)
-        if rec
-          rec.update!(attrs)
-        else
-          heartbeat_class.create!(attrs.merge(consumer_id: consumer_id))
+        # heartbeat_class.primary_key == "consumer_id", so upsert conflicts on it.
+        heartbeat_class.upsert(attrs)
+      rescue NotImplementedError
+        # Fallback for ActiveRecord versions that don't support upsert (< 6.0).
+        retries = 0
+        begin
+          attrs_no_pk = attrs.except(:consumer_id)
+          rec = heartbeat_class.find_by(consumer_id: consumer_id)
+          rec ? rec.update!(attrs_no_pk) : heartbeat_class.create!(attrs)
+        rescue ActiveRecord::RecordNotUnique
+          retries += 1
+          retry if retries < 3
+          KafkaBatch.logger.error(
+            "[KafkaBatch][MysqlStore] record_heartbeat upsert fallback failed after " \
+            "#{retries} retries for consumer_id=#{consumer_id}"
+          )
         end
-      rescue ActiveRecord::RecordNotUnique
-        retry
       end
 
       def list_heartbeats(since)
@@ -408,14 +440,23 @@ module KafkaBatch
       # Bug #9 fix: cache batch_counts for 5 seconds to avoid a full-table GROUP BY
       # on every web request. The store instance is a singleton so the cache is
       # process-wide and consistent with the instance's connection.
+      #
+      # Fix #19: guard @batch_counts_cache with a dedicated mutex. The store
+      # instance is shared across all threads (JRuby / TruffleRuby run truly
+      # parallel threads), so two threads doing a simultaneous read-then-write
+      # can race: both see a stale cache, both hit the DB, both write back —
+      # harmless on MRI (GIL) but a genuine data race on multi-threaded runtimes.
+      # A single Mutex adds negligible overhead (the DB query itself dominates).
       def batch_counts
         now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        if @batch_counts_cache && (now - @batch_counts_cache[:at]) < 5
-          return @batch_counts_cache[:counts]
+        counts_mutex.synchronize do
+          if @batch_counts_cache && (now - @batch_counts_cache[:at]) < 5
+            return @batch_counts_cache[:counts]
+          end
+          counts = batch_record_class.group(:status).count
+          @batch_counts_cache = { counts: counts, at: now }
+          counts
         end
-        counts = batch_record_class.group(:status).count
-        @batch_counts_cache = { counts: counts, at: now }
-        counts
       end
 
       def mark_finished(id, outcome)
@@ -481,6 +522,10 @@ module KafkaBatch
 
       private
 
+      def counts_mutex
+        @counts_mutex ||= Mutex.new
+      end
+
       def heartbeat_to_hash(r)
         {
           consumer_id:       r.consumer_id,
@@ -515,10 +560,14 @@ module KafkaBatch
       end
 
       # Increment the batch counter and detect completion. MUST be called from
-      # within a transaction. FOR UPDATE locks the row so two processes can't
-      # both observe completion and both fire the callback. Returning from this
-      # helper is a normal method return (not a non-local return out of the
-      # transaction block), so it does not roll the transaction back.
+      # within a transaction. FOR UPDATE locks the batch row so two concurrent
+      # processes don't both observe completion and both fire the callback.
+      #
+      # Bug #4 fix: compute new counts in-memory instead of calling record.reload
+      # after update_all. update_all issues one SQL UPDATE; AR's in-memory
+      # representation is stale but we know exactly what changed (+1 on one
+      # counter), so we compute the new values without an extra SELECT round-trip
+      # inside the lock window.
       def apply_completion(batch_id, status)
         record = batch_record_class.lock.find_by(id: batch_id)
         return { status: :not_found } if record.nil?
@@ -526,13 +575,17 @@ module KafkaBatch
 
         field = status == "success" ? "completed_count" : "failed_count"
         batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
-        record.reload
+
+        # Bug #4: compute new values without reload.
+        new_completed = record.completed_count + (status == "success" ? 1 : 0)
+        new_failed    = record.failed_count    + (status != "success" ? 1 : 0)
 
         # Only finalize (and fire callbacks) once the batch is sealed – a held
         # (block-form, not-yet-sealed) batch may still receive more jobs even if
         # currently at its total. locked_at doubles as the "sealed_at" marker.
-        if record.locked_at && record.completed_count + record.failed_count >= record.total_jobs
-          outcome = record.failed_count.positive? ? "complete" : "success"
+        if record.locked_at && new_completed + new_failed >= record.total_jobs
+          outcome = new_failed.positive? ? "complete" : "success"
+          # record.update! refreshes the model's attributes in-place (no extra SELECT).
           record.update!(status: outcome, finished_at: Time.now)
           { status: :done, outcome: outcome, batch: record_to_hash(record) }
         else

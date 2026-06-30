@@ -69,11 +69,17 @@ module KafkaBatch
 
         desc "Create all KafkaBatch Kafka topics (idempotent). " \
              "Env: PARTITIONS=N forces every topic to N partitions; " \
-             "REPLICATION_FACTOR=N (default 1)."
+             "REPLICATION_FACTOR=N (default 1); " \
+             "INCLUDE_FAIRNESS=false skips ingest/ready topics."
         task create_topics: :environment do
+          # Topics is part of the full backend — not loaded when only
+          # kafka_batch/ui is required (dashboard-only processes). Require it
+          # lazily here so the task works from any process type.
+          require "kafka_batch/topics"
+
           # Worker classes register their job topics on load. In dev/test Zeitwerk
-          # loads them lazily, so eager-load first to discover every job topic
-          # (non-fairness mode). Best-effort: never fail provisioning over this.
+          # loads them lazily, so eager-load first to discover every job topic.
+          # Best-effort: never fail provisioning over this.
           begin
             Rails.application.eager_load! if defined?(Rails) && Rails.respond_to?(:application) && Rails.application
           rescue StandardError => e
@@ -82,18 +88,49 @@ module KafkaBatch
 
           partitions = ENV["PARTITIONS"] && !ENV["PARTITIONS"].empty? ? ENV["PARTITIONS"].to_i : nil
           rf         = (ENV["REPLICATION_FACTOR"] || 1).to_i
+          cfg        = KafkaBatch.config
 
-          puts "[KafkaBatch] Creating topics " \
-               "(partitions=#{partitions || 'per-topic defaults'} replication_factor=#{rf})…"
+          puts ""
+          puts "[KafkaBatch] Creating topics"
+          puts "  store              : #{cfg.store}"
+          puts "  brokers            : #{Array(cfg.brokers).join(', ')}"
+          puts "  partitions         : #{partitions || 'per-topic defaults'}"
+          puts "  replication_factor : #{rf}"
+          puts ""
+
           result = KafkaBatch::Topics.create_all!(partitions: partitions, replication_factor: rf)
 
-          puts "  created: #{result[:created].size}  #{result[:created].join(', ')}"
-          puts "  skipped: #{result[:skipped].size}  #{result[:skipped].join(', ')}"
+          result[:created].each { |n| puts "  \e[32m[created]\e[0m  #{n}" }
+          result[:skipped].each { |n| puts "  \e[33m[skip]\e[0m     #{n}" }
+          result[:failed].each  { |f| puts "  \e[31m[FAILED]\e[0m   #{f[:name]}: #{f[:error]}" }
+
+          puts ""
+          puts "  Summary: #{result[:created].size} created, " \
+               "#{result[:skipped].size} skipped, #{result[:failed].size} failed."
+          puts ""
+
           unless result[:failed].empty?
-            puts "  FAILED:  #{result[:failed].size}"
-            result[:failed].each { |f| puts "    - #{f[:name]}: #{f[:error]}" }
-            abort "[KafkaBatch] topic creation had failures"
+            abort "[KafkaBatch] topic creation had failures — see above"
           end
+        end
+
+        desc "Print all topics that would be created by rake kafka_batch:create_topics (dry-run)"
+        task topics: :environment do
+          require "kafka_batch/topics"
+
+          begin
+            Rails.application.eager_load! if defined?(Rails) && Rails.respond_to?(:application) && Rails.application
+          rescue StandardError => e
+            warn "[KafkaBatch] eager_load skipped: #{e.message}"
+          end
+
+          puts ""
+          puts "[KafkaBatch] Topic plan (dry-run — nothing created):"
+          puts ""
+          KafkaBatch::Topics.specs.each do |s|
+            puts "  %-50s  partitions=%-3d  rf=%-2d" % [s[:name], s[:partitions], s[:replication_factor]]
+          end
+          puts ""
         end
 
         desc "Generate KafkaBatch migrations (MySQL store only)"

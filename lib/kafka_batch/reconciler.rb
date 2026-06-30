@@ -16,21 +16,46 @@ module KafkaBatch
   # Or schedule with cron / Whenever / a Karafka scheduled consumer.
   module Reconciler
     # @param older_than [Integer] seconds – only inspect batches older than this
+    #
+    # #10 fix: the distributed lock is held ONLY while identifying which batches
+    # need work and sweeping heartbeats (fast store reads + one DELETE).  All
+    # produce_sync calls (slow Kafka broker round-trips) happen OUTSIDE the lock
+    # so we never hold the distributed lock across network I/O.
+    # The store's own claim_callback guard (HSETNX / conditional UPDATE) prevents
+    # double-dispatch even if two processes reach the produce phase concurrently.
     def self.run(older_than: KafkaBatch.config.reconciliation_interval, triggered_by: :rake)
       start_time = Time.now
+      stale      = nil
+      lost       = nil
 
       KafkaBatch.store.with_reconciler_lock(ttl: KafkaBatch.config.reconciler_lock_ttl) do
         threshold = Time.now - older_than
+        # Fix #20: cap per-run work so an incident spike (thousands of batches
+        # going stale at once) doesn't hold the distributed lock for minutes or
+        # produce a callback burst. Remaining batches are picked up next tick.
+        max = [KafkaBatch.config.max_reconcile_per_run.to_i, 1].max
 
-        # ── 1. Stuck-running batches ─────────────────────────────────────────
-        stale = KafkaBatch.store.stale_batches(older_than: threshold)
-        KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{stale.size} stuck-running batch(es)")
-        stale.each { |b| reconcile_running(b) }
+        # ── 1. Identify stuck-running batches ─────────────────────────────────
+        stale_all = KafkaBatch.store.stale_batches(older_than: threshold)
+        if stale_all.size > max
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][Reconciler] #{stale_all.size} stuck-running batches found; " \
+            "processing first #{max} this run (config.max_reconcile_per_run=#{max})"
+          )
+        end
+        stale = stale_all.first(max)
+        KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{stale_all.size} stuck-running batch(es), processing #{stale.size}")
 
-        # ── 2. Done batches with lost callbacks ──────────────────────────────
-        lost = KafkaBatch.store.done_batches_without_callback(older_than: threshold)
-        KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{lost.size} lost-callback batch(es)")
-        lost.each { |b| refire_callback(b) }
+        # ── 2. Identify done batches with lost callbacks ───────────────────────
+        lost_all = KafkaBatch.store.done_batches_without_callback(older_than: threshold)
+        if lost_all.size > max
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][Reconciler] #{lost_all.size} lost-callback batches found; " \
+            "processing first #{max} this run (config.max_reconcile_per_run=#{max})"
+          )
+        end
+        lost = lost_all.first(max)
+        KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{lost_all.size} lost-callback batch(es), processing #{lost.size}")
 
         # ── 3. Sweep stale consumer heartbeats (:store liveness backend) ─────
         if KafkaBatch.config.liveness_backend == :store
@@ -40,16 +65,25 @@ module KafkaBatch
             KafkaBatch.logger.warn("[KafkaBatch][Reconciler] heartbeat sweep failed: #{e.message}")
           end
         end
-
-        duration = Time.now - start_time
-        KafkaBatch::Instrumentation.reconciler_ran(
-          stale_count:  stale.size,
-          lost_count:   lost.size,
-          duration:     duration,
-          triggered_by: triggered_by
-        )
-        KafkaBatch.logger.info("[KafkaBatch][Reconciler] Done in #{duration.round(2)}s")
       end
+
+      # Lock was not acquired (another process holds it) – nothing to do.
+      return unless stale
+
+      # ── Produce callbacks OUTSIDE the lock ─────────────────────────────────
+      # mark_finished + produce_callback run here; both are idempotent and safe
+      # to call from multiple processes thanks to the claim_callback HSETNX guard.
+      stale.each { |b| reconcile_running(b) }
+      lost.each  { |b| refire_callback(b)   }
+
+      duration = Time.now - start_time
+      KafkaBatch::Instrumentation.reconciler_ran(
+        stale_count:  stale.size,
+        lost_count:   lost.size,
+        duration:     duration,
+        triggered_by: triggered_by
+      )
+      KafkaBatch.logger.info("[KafkaBatch][Reconciler] Done in #{duration.round(2)}s")
     end
 
     # Re-evaluates a batch that's been stuck in "running" too long.

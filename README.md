@@ -30,6 +30,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 - [Priority queues](#priority-queues)
   - [Multi-tenant fairness (WFQ)](#multi-tenant-fairness-wfq)
     - [Enqueuing fair jobs](#enqueuing-fair-jobs)
+    - [Optional: Redis-backed WFQ Scheduler (strict weighted shares)](#optional-redis-backed-wfq-scheduler-strict-weighted-shares)
 - [Web UI](#web-ui)
 - [Reconciler](#reconciler)
 - [Instrumentation](#instrumentation)
@@ -39,6 +40,9 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 - [Migrating from Sidekiq Pro Batches](#migrating-from-sidekiq-pro-batches)
 - [Architecture deep-dive](#architecture-deep-dive)
 - [Topic reference](#topic-reference)
+- [Data reference](#data-reference)
+  - [Redis keys](#redis-keys)
+  - [MySQL tables](#mysql-tables)
 - [Contributing](#contributing)
 
 ---
@@ -133,19 +137,37 @@ gem "kafka-batch"  # require: "kafka_batch" is the default
 gem "kafka-batch", require: "kafka_batch/ui"
 ```
 
+> **Why `require: "kafka_batch/ui"` and not `require: false` or `require: true`?**
+>
+> - `require: true` — Bundler calls `require "kafka-batch"` (the literal gem name with a dash). Ruby can't find a file called `kafka-batch.rb`, so boot raises `LoadError: cannot load such file -- kafka-batch`.
+> - `require: false` — Bundler skips the gem entirely. The explicit `require "kafka_batch/ui"` in your initializer *does* load it, but only during the `:environment` Rake task — too late for `load_tasks` to discover the Railtie's rake tasks. Result: `rake aborted! Don't know how to build task 'kafka_batch:create_topics'`.
+> - `require: "kafka_batch/ui"` — Bundler calls the correct `require` at startup, the Railtie registers its rake tasks before Rake runs, and the initializer's own `require "kafka_batch/ui"` is a no-op (already in `$LOADED_FEATURES`).
+
 The web service still gets the full dashboard (all tabs, pause/resume, cancel/delete) — it just doesn't load any consumer or producer code. Configure it with the same store + topic settings and it reads live data straight from Redis/MySQL and the Kafka Admin API.
 
 Run the installer:
 
 ```bash
+# MySQL store (default) — persists to your RDBMS, needs migrations
 bundle exec rails generate kafka_batch:install
-# or with Redis store:
+
+# Redis store — no migrations, TTL-based retention
 bundle exec rails generate kafka_batch:install --store redis
 ```
 
 This creates:
-- `config/initializers/kafka_batch.rb`
-- Database migrations (MySQL store only)
+- `config/initializers/kafka_batch.rb` — pre-populated with store-appropriate defaults and all config options
+- `bin/create_kafka_topics.sh` — standalone bash script for CI/Docker topic provisioning (no Rails required)
+- Database migrations (MySQL store only, copied to `db/migrate/`)
+
+The two stores generate different defaults in the initializer. Key differences:
+
+| Setting | `--store mysql` | `--store redis` |
+|---|---|---|
+| `liveness_backend` | `:store` (consumer heartbeats in MySQL) | `:redis` (per-job tracking) |
+| `failures_ttl` | 7 days (reconciler purge) | 1 day (Redis auto-expire) |
+| Redis block | commented-out (optional) | enabled (`redis_url`, `batch_ttl`, `all_index_max_size`) |
+| Reconciler lock note | `GET_LOCK` advisory lock | distributed `SET NX EX` |
 
 Run migrations if using the MySQL store:
 
@@ -153,10 +175,17 @@ Run migrations if using the MySQL store:
 bundle exec rails db:migrate
 ```
 
-Create the required Kafka topics. The easiest way is the built-in rake task, which derives the full topic set from your config and creates whatever is missing (see [Provisioning topics](#provisioning-topics-the-migration-for-kafka)):
+Create the required Kafka topics. Choose the approach that fits your environment:
 
 ```bash
+# Rake task — derives the full topic set from your config (requires Rails + Kafka broker):
 bundle exec rake kafka_batch:create_topics
+
+# Shell script — works without Rails, ideal for CI/Docker init containers:
+KAFKA_BROKERS=localhost:9092 ./bin/create_kafka_topics.sh
+
+# Dry-run first to see what would be created:
+bundle exec rake kafka_batch:topics
 ```
 
 Or create them manually (adjust partitions to your throughput):
@@ -234,6 +263,10 @@ KafkaBatch.configure do |config|
   config.retry_jitter          = 0.1          # +/- 10% randomization
   config.retry_tiers           = { short: 30, medium: 7 * 60, large: 20 * 60 } # seconds
   config.retry_tier_progression = %i[short medium large]
+  # Maximum single-pause duration (seconds) in RetryConsumer. When a retry message
+  # is further in the future than this, the consumer pauses for this long then
+  # re-checks, so a partition is never suspended for extreme durations.
+  config.retry_max_pause_seconds = 30
   # After this many retries a still-failing job counts toward on_complete while
   # it keeps retrying in the background up to max_retries (per-Worker override).
   # Default == max_retries default, so default behaviour is unchanged.
@@ -264,10 +297,21 @@ KafkaBatch.configure do |config|
   config.liveness_heartbeat_interval = 5   # :store throttle: 1 write/consumer/N s
   config.track_running_jobs          = true # gate :redis per-job running-state writes
 
-  # ── Multi-tenant fairness (per-worker opt-in via `fairness true`; see the
-  #    Fairness section). These settings configure the shared fair lane. ──
+  # ── Multi-tenant fairness ────────────────────────────────────────────────
+  # The default fairness path (ingest → dispatcher → ready) is Kafka-only; no
+  # Redis is required for `fairness true` workers to process jobs.
   config.fairness_ready_lag_high = 5000 # dispatcher pauses forwarding above this depth
   config.fairness_ready_lag_low  = 1000 # ...resumes below this depth
+
+  # ── Optional Redis-backed WFQ Scheduler (strict weighted shares) ─────────
+  # Active only when config.redis_url is set. Auto-disabled (KafkaBatch.scheduler
+  # returns nil) when redis_url is blank; the Weights UI shows "inactive".
+  # config.fairness_mode                    = :time_fairness  # or :job_count_fairness
+  # config.fairness_weight_cache_ttl        = 120  # seconds; weight changes propagate within this window
+  # config.fairness_global_concurrency      = 50
+  # config.fairness_max_inflight_per_tenant = 3    # per-tenant in-flight cap (0 = disabled)
+  # config.fairness_ready_window            = 500
+  # config.fairness_default_weight          = 1.0
 
   # ── Priority queues (non-fair; 4-topic 2-group design) ───────────────────
   # Workers opt in by setting kafka_topic to one of these four names.
@@ -313,6 +357,7 @@ Every option on `KafkaBatch.config`:
 | `retry_jitter` | Float | `0.1` | ± randomization on retry delays |
 | `retry_tiers` | Hash | `{short: 30, medium: 420, large: 1200}` | Tier → delay (seconds) |
 | `retry_tier_progression` | Array | `[:short, :medium, :large]` | Default tier per retry index (clamps to last) |
+| `retry_max_pause_seconds` | Integer (s) | `30` | Maximum single Karafka `pause()` duration in `RetryConsumer`; when a retry is further in the future the consumer re-pauses in increments until due |
 | `complete_after_retries` | Integer | `3` | Count a still-failing job toward `on_complete` after N retries (keeps retrying in bg; per-Worker override) |
 | `event_emit_retries` | Integer | `3` | Inline retries when producing a completion event |
 | `event_emit_backoff` | Integer (s) | `2` | Linear backoff for event-emit retries (`attempt × backoff`) |
@@ -332,10 +377,14 @@ Every option on `KafkaBatch.config`:
 | `fairness_ready_lag_high` | Integer | `5000` | Dispatcher pauses forwarding above this ready-topic depth |
 | `fairness_ready_lag_low` | Integer | `1000` | Dispatcher resumes forwarding below this depth |
 | `fairness_min_ingest_partitions` | Integer | `2` | Warns (raises when `validate_topics_on_boot`) if the ingest topic has fewer partitions; set near max concurrent tenants |
+| `fairness_mode` | Symbol | `:time_fairness` | **Optional `Scheduler` only** — `:time_fairness` (vtime advances by `actual_duration / weight` at completion — fair wall-clock slot-time per hour) or `:job_count_fairness` (vtime advances by `1/weight` at dispatch — fair over dispatch count). Has no effect when the Scheduler is disabled (no Redis). |
+| `fairness_weight_cache_ttl` | Integer (s) | `120` | **Optional `Scheduler` only** — how long each dispatcher process caches the tenant-weight map; weight changes propagate within this window |
 | `fairness_global_concurrency` | Integer | `50` | **Optional `Scheduler` only** — total in-flight slots |
-| `fairness_max_inflight_per_tenant` | Integer | `0` | **Optional `Scheduler` only** — per-tenant cap (`0` = none) |
+| `fairness_max_inflight_per_tenant` | Integer | `3` | **Optional `Scheduler` only** — per-tenant in-flight cap; prevents one slow-job tenant holding all budget slots; `0` disables |
 | `fairness_ready_window` | Integer | `500` | **Optional `Scheduler` only** — bounded ready jobs/tenant in Redis |
-| `fairness_default_weight` | Float | `1.0` | **Optional `Scheduler` only** — default tenant weight |
+| `fairness_default_weight` | Float | `1.0` | **Optional `Scheduler` only** — default tenant weight when no override is set |
+| `max_reconcile_per_run` | Integer | `100` | Max batches the reconciler processes per sweep (both stuck-running and lost-callback independently); caps callback bursts during incidents |
+| `max_message_bytes` | Integer | `1_048_576` | Raise `ProducerError` if an encoded payload exceeds this size (1 MiB default, matches Kafka's `message.max.bytes`); `0` disables the guard |
 | `fast_p0_topic` | String | `"kafka_batch.jobs.fast_p0"` | Fast-group critical topic; set `kafka_topic` to this value on a worker to enroll it |
 | `fast_p1_topic` | String | `"kafka_batch.jobs.fast_p1"` | Fast-group normal topic |
 | `slow_p0_topic` | String | `"kafka_batch.jobs.slow_p0"` | Slow-group critical topic |
@@ -780,7 +829,7 @@ The message is produced to the retry topic **for its delay tier** (`<retry_topic
 
 The `JobConsumer` partition is immediately freed for the next message. No thread blocking occurs.
 
-**RetryConsumer** (subscribed to all tier topics) picks up the message. If `retry_after` is still in the future, it calls Karafka's `pause(offset, ms)` to suspend that partition for up to `MAX_PAUSE_SECONDS` (30s) at a time, then checks again. When the message is due it re-enqueues to `retry_to` and commits.
+**RetryConsumer** (subscribed to all tier topics) picks up the message. If `retry_after` is still in the future, it calls Karafka's `pause(offset, ms)` to suspend that partition for up to `config.retry_max_pause_seconds` seconds (default 30s) at a time, then checks again. When the message is due it re-enqueues to `retry_to` and commits.
 
 **Exhausted (attempt == max_retries):**
 A `failed` event is emitted to the events topic (so the batch counter is updated) and the message is forwarded to the dead-letter topic.
@@ -998,7 +1047,13 @@ The fair lane gives you:
 - The durable backlog stays in **Kafka** (the ingest topic), so memory is bounded regardless of backlog size. Nothing is stored in Redis on the fairness path.
 - Fairness is **approximate** ("good enough"): it relies on Kafka's balanced per-partition fetch plus a shallow, throttled ready topic.
 
-> **Does fairness need Redis? No.** The default fairness path (ingest → dispatcher → ready → swarm) uses Kafka only. Redis is involved **only** if you opt into the standalone `KafkaBatch::Fairness::Scheduler` (a virtual-time WFQ engine for *strict weighted* shares), which is **not** wired into the default path.
+> **Does `fairness true` need Redis? No.** The default fairness path (ingest → dispatcher → ready → swarm) is 100% Kafka-native. **Jobs process normally and approximate fairness still works even if Redis is absent.** No code breaks — there is no error, no fallback warning, no degraded behaviour on the job-processing side.
+>
+> Redis is involved **only** if you opt into the standalone `KafkaBatch::Fairness::Scheduler` (the optional virtual-time WFQ engine for *strict weighted* shares). The Scheduler requires Redis and is **automatically disabled** (`KafkaBatch.scheduler` returns `nil`) when `config.redis_url` is blank. When disabled:
+> - The **⚖ Weights** UI page shows "Scheduler inactive".
+> - `config.fairness_mode` (`:time_fairness` / `:job_count_fairness`) has **no effect** — it only governs how the Scheduler advances virtual time.
+> - `config.fairness_weight_cache_ttl` and `config.fairness_default_weight` are similarly ignored.
+> - Everything else — job dispatch, retries, callbacks, the batch dashboard — is unaffected.
 
 ### Enqueuing fair jobs
 
@@ -1115,7 +1170,141 @@ Two things make this fair, with no Redis and no extra process:
 
 `draw_routes` wires this automatically when **any** registered worker declares `fairness true`. The durable backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees. **Retries for fair workers** go back to the **ready** topic (not ingest), so they skip the dispatcher on retry.
 
-Fairness here is **approximate** ("good enough"): granularity is the fetch batch, and it assumes ~even partition assignment per tenant and similar job sizes. For **strict weighted shares**, `KafkaBatch::Fairness::Scheduler` is available as a standalone Redis-backed virtual-time WFQ engine (`enqueue`/`checkout`/`complete`/`set_weight`/`stats`) you can build a custom dispatcher/worker around.
+Fairness here is **approximate** ("good enough"): granularity is the fetch batch, and it assumes ~even partition assignment per tenant and similar job sizes. For **strict weighted shares**, `KafkaBatch::Fairness::Scheduler` is available as a standalone Redis-backed virtual-time WFQ engine — see [Optional: Redis-backed WFQ Scheduler](#optional-redis-backed-wfq-scheduler-strict-weighted-shares) below.
+
+### Optional: Redis-backed WFQ Scheduler (strict weighted shares)
+
+`KafkaBatch::Fairness::Scheduler` is a standalone engine for **strict, weighted** fairness. It is completely independent of the Kafka-native Dispatcher above — you can use either one, or both. The Scheduler has no Karafka dependency: it is pure Redis Lua.
+
+**Important for the `/weights` dashboard:** the "In-flight now" and "Queued" metric cards (and the per-tenant In-flight / Status columns) are **always 0 when using the Kafka-native Dispatcher**. Those counters live in the `kafka_batch:fair:inflight` Redis hash and the `kafka_batch:fair:ring` ZSET, and they are only written by the Scheduler's `checkout` and `complete` Lua scripts. The Kafka-native Dispatcher never calls those — it forwards jobs directly through Kafka without touching the Scheduler's WFQ ring. The `vtime` column and the tenant list still populate correctly (via `touch_tenants`), and weights can still be set and will propagate to any process running the Scheduler. But inflight/queued will read 0 until you build and deploy a custom Scheduler-based dispatcher.
+
+#### When to use the Scheduler instead of (or alongside) the Kafka-native path
+
+| | Kafka-native Dispatcher | Scheduler (WFQ) |
+|---|---|---|
+| Redis required | No | Yes |
+| Fairness | Approximate (fetch-batch granularity) | Exact (per-job virtual time) |
+| Weighted shares | No | Yes — per-tenant weight via `set_weight` |
+| In-flight cap | No | Yes — `fairness_max_inflight_per_tenant` |
+| Global concurrency cap | No | Yes — `fairness_global_concurrency` |
+| Backlog storage | Kafka (durable, unbounded) | Redis LIST per tenant (bounded by `fairness_ready_window`) |
+| Suitable for | Any scale; no extra infrastructure | When you need provably weighted shares or per-tenant concurrency caps |
+
+The Scheduler's API:
+
+```ruby
+sched = KafkaBatch.scheduler   # configured via KafkaBatch.configure; nil when redis_url is blank
+
+sched.enqueue(tenant_id, payload)     # push a job into the tenant's ready queue; returns :ok or :full
+sched.checkout                         # pull the next job fairly; returns { tenant_id:, payload: } or nil
+sched.complete(tenant_id, duration: n) # release the in-flight slot; advances vtime in :time_fairness mode
+sched.set_weight(tenant_id, 2.0)      # give tenant double throughput share
+sched.delete_weight(tenant_id)        # revert to default_weight
+sched.all_tenants                      # Array<Hash> — powers the /weights page
+sched.stats                            # global snapshot (active tenants, total in-flight, budget)
+```
+
+#### Custom dispatcher example
+
+Below is a minimal Karafka consumer that feeds the Scheduler (`enqueue`) from the ingest topic and then drives `checkout`/`complete` in a tight worker loop. In practice you would likely run the enqueue side inside `Fairness::Dispatcher` (or your own Karafka consumer) and the checkout/complete side inside a separate worker thread pool — but both halves are shown here for clarity.
+
+```ruby
+# app/consumers/wfq_dispatcher_consumer.rb
+#
+# Karafka consumer: reads from the fairness ingest topic and loads
+# each job into the Scheduler's bounded per-tenant ready queue.
+# A separate thread (WfqWorkerThread below) drains jobs via checkout.
+class WfqDispatcherConsumer < Karafka::BaseConsumer
+  def consume
+    sched = KafkaBatch.scheduler
+    return unless sched   # Redis not configured — no-op
+
+    messages.each do |message|
+      payload    = message.raw_payload             # already JSON string
+      tenant_id  = Oj.load(payload)["tenant_id"].to_s
+
+      result = sched.enqueue(tenant_id, payload)   # :ok or :full
+      if result == :full
+        # Ready window is at capacity for this tenant — apply backpressure.
+        # Pause this partition for a moment so the worker thread can drain it.
+        pause(message.offset, 500)
+        return
+      end
+    end
+
+    mark_as_consumed!(messages.last)
+  end
+end
+```
+
+```ruby
+# app/workers/wfq_worker_thread.rb
+#
+# A plain Ruby thread (start it from an initializer or a Karafka
+# lifecycle hook) that continuously pulls jobs from the Scheduler
+# and runs them.  Nothing Karafka-specific here — the Scheduler is
+# pure Ruby + Redis.
+class WfqWorkerThread
+  POLL_INTERVAL = 0.05   # seconds to sleep when nothing is ready
+
+  def self.start(concurrency: 5)
+    concurrency.times.map { new.tap(&:run_async) }
+  end
+
+  def run_async
+    Thread.new { run }
+  end
+
+  def run
+    sched = KafkaBatch.scheduler
+    loop do
+      job = sched.checkout    # { tenant_id:, payload: } or nil
+      if job.nil?
+        sleep POLL_INTERVAL
+        next
+      end
+
+      tenant_id = job[:tenant_id]
+      payload   = Oj.load(job[:payload])
+      started   = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+      begin
+        worker_class = Object.const_get(payload["worker_class"])
+        worker_class.new.perform(payload)
+      rescue => e
+        KafkaBatch.logger.error("[WfqWorker] #{tenant_id} failed: #{e.message}")
+        # production code: emit a failure event, forward to DLT, etc.
+      ensure
+        duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+        # complete MUST be called even on failure so the in-flight slot is released.
+        # Pass duration: so :time_fairness mode accounts for actual wall-clock usage.
+        sched.complete(tenant_id, duration: duration)
+      end
+    end
+  end
+end
+```
+
+```ruby
+# config/initializers/wfq_worker.rb
+#
+# Start the worker threads after Rails has fully booted.
+# Adjust concurrency to match fairness_global_concurrency.
+Rails.application.config.after_initialize do
+  if KafkaBatch.scheduler && !Rails.env.test?
+    WfqWorkerThread.start(concurrency: KafkaBatch.config.fairness_global_concurrency)
+    KafkaBatch.logger.info("[WfqWorker] started #{KafkaBatch.config.fairness_global_concurrency} threads")
+  end
+end
+```
+
+With this in place, `checkout` and `complete` write to `kafka_batch:fair:inflight` and `kafka_batch:fair:ring`, so the **In-flight now** and **Queued** counters on the `/weights` page become live. Weights set via the UI propagate to all dispatcher processes within `fairness_weight_cache_ttl` seconds.
+
+> **Checkout returns `nil` when:**
+> - The global concurrency budget (`fairness_global_concurrency`) is exhausted — all slots full.
+> - No tenant currently has jobs in its ready queue — everything is drained or waiting on `enqueue`.
+>
+> In both cases the worker thread sleeps `POLL_INTERVAL` and retries. In production, use a proper semaphore or condition variable instead of `sleep` to avoid busy-waiting.
 
 ### Scaling fair vs plain jobs
 
@@ -1323,9 +1512,12 @@ When `ActiveSupport` is not available (non-Rails environments), all instrumentat
 | Task | Description |
 |---|---|
 | `kafka_batch:create_topics` | Create all configured Kafka topics (idempotent). `PARTITIONS=N` forces every topic to N partitions; `REPLICATION_FACTOR=N` (default 1) |
+| `kafka_batch:topics` | Dry-run: print the full topic plan (names, partition counts, replication factor) without creating anything |
 | `kafka_batch:reconcile` | Run both reconciler sweeps (stuck-running + lost-callback) |
 | `kafka_batch:install_migrations` | Copy all migrations to `db/migrate/` |
 | `kafka_batch:workers` | Print all registered workers, topics, and retry config |
+
+> **Use `bundle exec rake`, not `rails`.** The `rails` command only dispatches built-in Rails commands (like `db:migrate`) — gem-provided Rake tasks must be run with `bundle exec rake kafka_batch:*`.
 
 ### Provisioning topics (the "migration" for Kafka)
 
@@ -1482,6 +1674,231 @@ Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, th
 | `kafka_batch.ready` *(fairness only)* | `{consumer_group}-jobs-fair` | `Fairness::Dispatcher` | `JobConsumer` | Fairly-ordered, throttled execution queue |
 
 For a **fair worker** (`fairness true`), jobs flow `ingest → ready → JobConsumer` in the `-dispatch` / `-jobs-fair` groups instead of straight to the worker's own topic. For a **priority worker** (topic set to one of the four `fast_*/slow_*` topics), jobs flow straight to that topic and are consumed by the matching priority consumer in the `-jobs-fast` or `-jobs-slow` group. See [Priority queues](#priority-queues), [Multi-tenant fairness](#multi-tenant-fairness-wfq), and [Scaling consumer groups independently](#scaling-consumer-groups-independently).
+
+---
+
+## Data reference
+
+A complete map of every Redis key and MySQL table the gem owns — useful when debugging unexpected behavior or inspecting state directly.
+
+---
+
+### Redis keys
+
+All keys use the `kafka_batch:` namespace. The gem never writes outside it.
+
+#### Batch state (`config.store = :redis`)
+
+| Key pattern | Type | TTL | Contents |
+|---|---|---|---|
+| `kafka_batch:b:<batch_id>` | HASH | `batch_ttl` (refreshed on each completion) | All batch state — see fields below |
+| `kafka_batch:b:<batch_id>:failures` | HASH | `failures_ttl` | field = `job_id`, value = JSON failure record — see fields below |
+| `kafka_batch:offsets:<source_topic>` | HASH | none | field = `"<topic>/<partition>"`, value = last applied source offset (monotonic dedup cursor) |
+| `kafka_batch:index:all` | ZSET | none (pruned lazily) | All batch IDs; score = `created_at` epoch. Powers the UI batch list. Capped to `all_index_max_size` |
+| `kafka_batch:index:running` | ZSET | none | Running batch IDs; score = `created_at` epoch. Used by the reconciler to find stuck-running batches |
+| `kafka_batch:index:done` | ZSET | none | Finished-but-uncallbacked batch IDs; score = `finished_at` epoch. Used by the reconciler to find lost-callback batches |
+| `kafka_batch:index:cancelled` | ZSET | none (pruned by age) | Cancelled batch IDs; score = cancellation epoch. Read by `CancellationCache` to skip remaining jobs |
+| `kafka_batch:counts` | HASH | none | O(1) status counters: fields `running`, `success`, `complete`, `cancelled`. Maintained atomically with every status transition |
+| `kafka_batch:b:reconciler_lock` | STRING | `reconciler_lock_ttl` | Distributed lock token (SET NX EX). Only one reconciler sweep runs cluster-wide at a time |
+
+**`kafka_batch:b:<batch_id>` hash fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | String | Batch UUID |
+| `total_jobs` | Integer | Total expected jobs (grows as jobs are pushed) |
+| `completed_count` | Integer | Jobs that succeeded |
+| `failed_count` | Integer | Jobs that failed or were counted via `complete_after_retries` |
+| `status` | String | `running` → `success` / `complete` / `cancelled` |
+| `on_success` | String | Callback class name (nil = no callback) |
+| `on_complete` | String | Callback class name (nil = no callback) |
+| `meta` | JSON | Caller-supplied metadata Hash |
+| `description` | String | Human label shown in the dashboard |
+| `tenant_id` | String | Tenant identifier (fairness path) |
+| `created_at` | ISO8601 | When the batch was created |
+| `finished_at` | ISO8601 | When all jobs completed |
+| `locked_at` | ISO8601 | When the batch was sealed (block-form population finished); empty while open |
+| `callback_dispatched_at` | ISO8601 | When `CallbackConsumer` claimed dispatch; nil = callback not yet fired |
+| `callback_dispatched_by` | String | Consumer pod/process that ran the callbacks |
+
+**`kafka_batch:b:<batch_id>:failures` hash fields (value is JSON):**
+
+| JSON key | Description |
+|---|---|
+| `job_id` | Job UUID |
+| `worker_class` | Worker class name |
+| `error_class` | Exception class |
+| `error_message` | Exception message |
+| `attempt` | 0-based retry attempt number |
+| `status` | `retrying` while retries remain; `failed` once exhausted |
+| `next_retry_at` | ISO8601 timestamp of the next retry (nil once exhausted) |
+| `failed_at` | ISO8601 timestamp of this failure event |
+
+---
+
+#### Liveness (`config.liveness_backend = :redis`)
+
+| Key pattern | Type | TTL | Contents |
+|---|---|---|---|
+| `kafka_batch:live:job:<job_id>` | STRING | `liveness_ttl` (default 30s) | JSON: `job_id`, `batch_id`, `worker_class`, `consumer_id`, `topic`, `partition`, `started_at`. Written when a job starts; expires automatically if the consumer crashes |
+| `kafka_batch:live:consumer:<consumer_id>` | STRING | `liveness_ttl` | JSON: `consumer_id`, `hostname`, `pid`, `topic`, `started_at`. One key per active consumer thread |
+| `kafka_batch:heartbeats` | HASH | none | field = `consumer_id`, value = JSON heartbeat. Used by liveness_backend `:redis` **and** `:store` for consumer-level tracking. Stale entries swept by the reconciler |
+
+---
+
+#### Consumption control (pause/resume)
+
+| Key | Type | Contents |
+|---|---|---|
+| `kafka_batch:consumption:topics` | SET | Members: `"<group>\x1f<topic>"` — entire topics paused via the `/lag` UI |
+| `kafka_batch:consumption:partitions` | SET | Members: `"<group>\x1f<topic>\x1f<partition>"` — individual partitions paused |
+
+---
+
+#### Fairness Scheduler (`KafkaBatch::Fairness::Scheduler`)
+
+These keys only exist when `config.redis_url` is set. They are **independent of `config.store`** — the Scheduler always uses Redis for its WFQ mechanics regardless of whether your store is MySQL or Redis.
+
+| Key | Type | Contents |
+|---|---|---|
+| `kafka_batch:fair:weight` | HASH | field = `tenant_id`, value = Float weight override. Only custom weights stored here; default weight (`fairness_default_weight`) is applied in code. **Only used when `config.store = :redis`** |
+| `kafka_batch:fair:vtime` | HASH | field = `tenant_id`, value = Float accumulated virtual time. Persists across idle periods so a returning tenant can't exploit accrued capacity |
+| `kafka_batch:fair:ring` | ZSET | member = `tenant_id`, score = vtime. Only **currently active** tenants (with queued ready jobs). The Scheduler always picks the lowest score |
+| `kafka_batch:fair:inflight` | HASH | field = `tenant_id`, value = Integer in-flight job count for this tenant |
+| `kafka_batch:fair:inflight_total` | STRING | Global in-flight counter across all tenants. Capped by `fairness_global_concurrency` |
+| `kafka_batch:fair:ready:<tenant_id>` | LIST | Queued job payloads (JSON strings) for this tenant. LPOP'd at checkout; RPUSH'd at enqueue. Bounded by `fairness_ready_window` |
+
+> **Quick debug commands:**
+> ```bash
+> redis-cli HGETALL kafka_batch:fair:weight        # all custom weights
+> redis-cli HGETALL kafka_batch:fair:vtime         # accumulated vtime per tenant
+> redis-cli ZRANGE  kafka_batch:fair:ring 0 -1 WITHSCORES  # active tenants + their vtime
+> redis-cli HGETALL kafka_batch:fair:inflight      # in-flight counts
+> redis-cli GET     kafka_batch:fair:inflight_total # global in-flight
+> redis-cli HGETALL kafka_batch:counts             # batch status summary
+> redis-cli ZCARD   kafka_batch:index:running      # how many batches are running
+> redis-cli ZCARD   kafka_batch:index:done         # batches done but awaiting callback
+> ```
+
+---
+
+### MySQL tables
+
+All tables use the `kafka_batch_` prefix. Run the single bundled migration to create them all.
+
+#### `kafka_batch_records` — core batch ledger
+
+One row per batch. The source of truth for all batch state, job counts, and callback tracking.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | VARCHAR(36) PK | Batch UUID |
+| `total_jobs` | INT | Total expected jobs; grows as jobs are pushed |
+| `completed_count` | INT | Successful job count (incremented atomically with `UPDATE … SET completed_count = completed_count + 1`) |
+| `failed_count` | INT | Failed job count (same atomic increment pattern) |
+| `status` | VARCHAR(20) | `running` → `success` / `complete` / `cancelled` |
+| `on_success` | VARCHAR(255) | Callback class name; nil = no callback |
+| `on_complete` | VARCHAR(255) | Callback class name; nil = no callback |
+| `meta` | TEXT | JSON metadata supplied by the caller |
+| `description` | VARCHAR(1000) | Human label shown in the dashboard |
+| `tenant_id` | VARCHAR(255) | Tenant identifier (fairness / multi-tenant filtering) |
+| `created_at` | DATETIME | Batch creation time |
+| `finished_at` | DATETIME | When all jobs completed (null while running) |
+| `locked_at` | DATETIME | Set when the block-form population finishes; null while batch is still open |
+| `callback_dispatched_at` | DATETIME | Set when `CallbackConsumer` claims dispatch; null = callback not yet fired |
+| `callback_dispatched_by` | VARCHAR(255) | Consumer pod/process that ran the callbacks |
+
+**Indexes:** `status`, `created_at`, `(status, created_at)` (reconciler), `(status, callback_dispatched_at, finished_at)` (reconciler lost-callback query), `tenant_id` (dashboard filter).
+
+---
+
+#### `kafka_batch_consumer_offsets` — completion dedup cursors
+
+One row per `(source_topic, source_partition)`. The `EventConsumer` advances `last_offset` monotonically to deduplicate redelivered or re-produced completion events. State is `O(num_partitions)`, never growing with job count.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | BIGINT PK | Auto-increment |
+| `source_topic` | VARCHAR(255) | The worker's Kafka topic |
+| `source_partition` | INT | Partition index within that topic |
+| `last_offset` | BIGINT | Highest source offset applied so far; incremented on every valid completion event |
+| `updated_at` | DATETIME | Last update time |
+
+**Index:** unique on `(source_topic, source_partition)`.
+
+---
+
+#### `kafka_batch_failures` — per-job failure log
+
+One row per failing job (upserted on each failure event). Surfaced in the dashboard immediately as `retrying`, flipped to `failed` once the retry budget is exhausted. Bounded by `max_failures_per_batch`.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | BIGINT PK | Auto-increment |
+| `batch_id` | VARCHAR(36) | Parent batch UUID |
+| `job_id` | VARCHAR(36) | Job UUID |
+| `worker_class` | VARCHAR(255) | Worker class name |
+| `error_class` | VARCHAR(255) | Exception class |
+| `error_message` | TEXT | Exception message |
+| `attempt` | INT | 0-based retry attempt when this record was written |
+| `status` | VARCHAR(20) | `retrying` while retries remain; `failed` once exhausted |
+| `next_retry_at` | DATETIME | Scheduled retry time (null once exhausted) |
+| `failed_at` | DATETIME | Time of this failure event |
+
+**Indexes:** unique on `(batch_id, job_id)`, `(batch_id, failed_at)` (per-batch listing), `failed_at` (cross-batch `/failures` view).
+
+---
+
+#### `kafka_batch_consumer_heartbeats` — live consumer view
+
+One row per active consumer pod/thread (upserted on a throttled heartbeat). Used only when `liveness_backend: :store`. No auto-increment PK — consumer_id is the natural key.
+
+| Column | Type | Description |
+|---|---|---|
+| `consumer_id` | VARCHAR(128) | Unique consumer identifier (`hostname:pid:topic:partition`) |
+| `hostname` | VARCHAR(255) | Machine hostname |
+| `pid` | INT | Process ID |
+| `topic` | VARCHAR(255) | Topic this consumer is assigned to |
+| `current_job_id` | VARCHAR(36) | Job currently being processed (sampled) |
+| `current_worker` | VARCHAR(255) | Worker class of the current job |
+| `current_batch_id` | VARCHAR(36) | Batch of the current job |
+| `current_topic` | VARCHAR(255) | Source topic of the current job |
+| `current_partition` | INT | Source partition of the current job |
+| `jobs_done` | INT | Jobs processed by this consumer since startup |
+| `last_seen` | DATETIME | Last heartbeat time; rows with `last_seen < now - liveness_ttl` are considered stale |
+
+**Indexes:** unique on `consumer_id`, `last_seen` (stale sweep).
+
+---
+
+#### `kafka_batch_consumption_pauses` — pause/resume state
+
+Pause/resume state for the `/lag` dashboard when Redis is unavailable and `config.store = :mysql`. A row's existence means that group/topic/partition is paused. `partition_id = -1` pauses the whole topic.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | BIGINT PK | Auto-increment |
+| `consumer_group` | VARCHAR(255) | Karafka consumer group name |
+| `topic_name` | VARCHAR(255) | Kafka topic name |
+| `partition_id` | INT | Partition index, or `-1` for whole-topic pause |
+| `created_at` | DATETIME | When the pause was applied |
+
+**Index:** unique on `(consumer_group, topic_name, partition_id)`.
+
+---
+
+#### `kafka_batch_tenant_weights` — WFQ weight overrides
+
+Per-tenant weight overrides for the Fairness Scheduler. Only used when `config.store = :mysql`; when `store: :redis` weights live in `kafka_batch:fair:weight` instead. The Scheduler caches this table in-process for `fairness_weight_cache_ttl` seconds to avoid a round-trip per job.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | BIGINT PK | Auto-increment |
+| `tenant_id` | VARCHAR(255) | Tenant identifier (matches the `tenant_id` passed to `Batch.create`) |
+| `weight` | DECIMAL(10,4) | Weight multiplier (e.g. `2.0` = double throughput share). Must be > 0 |
+| `updated_at` | DATETIME | Last update time |
+
+**Index:** unique on `tenant_id`.
 
 ---
 

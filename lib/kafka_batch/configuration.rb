@@ -91,6 +91,14 @@ module KafkaBatch
     # ── TTL for batch metadata in Redis ─────────────────────────────────────
     attr_accessor :batch_ttl        # Integer – seconds; default 7 days
 
+    # ── Batch index sizing (Redis store) ────────────────────────────────────
+    # Maximum number of batch IDs kept in the ALL_INDEX ZSET used by the web
+    # UI.  When the cap is reached the oldest entries are evicted automatically
+    # so the ZSET never grows unbounded.  Increase if you need a longer
+    # dashboard history; at 500 pods × 1 batch/min × 7-day TTL the natural
+    # size would be ~5 M entries — this cap keeps it practical.
+    attr_accessor :all_index_max_size  # Integer – default 200_000
+
     # ── Failure metadata retention (Redis store) ────────────────────────────
     # Failure records are only a convenience view for the dashboard – the real
     # job data is durable in Kafka (retry topic / dead-letter topic). To bound
@@ -109,9 +117,28 @@ module KafkaBatch
     # → ready topic → JobConsumer swarm). The durable backlog stays in Kafka.
     # The settings below configure that lane (shared by all fair workers).
     #
-    # The four settings below apply ONLY to the optional Redis-backed
+    # The settings below apply ONLY to the optional Redis-backed
     # KafkaBatch::Fairness::Scheduler (strict weighted shares), NOT the default
     # dispatcher, which uses the ingest/ready topics + watermarks above.
+
+    # Fairness accounting mode for the Redis Scheduler:
+    #   :time_fairness      – (recommended) vtime advances at *completion* by
+    #                         actual_job_seconds / weight. Tenants that consistently
+    #                         submit long jobs (20-60s) are correctly charged for the
+    #                         wall-clock time they consume. Fair per-hour slot-time.
+    #   :job_count_fairness – (original) vtime advances by 1/weight at *dispatch*.
+    #                         Fair over dispatch count, not duration. Simpler; fine
+    #                         when all tenants' jobs have similar runtimes.
+    # Default: :time_fairness. In :time_fairness mode, callers must pass
+    # `duration:` to Scheduler#complete so the actual run time is recorded.
+    attr_accessor :fairness_mode                    # Symbol – default :time_fairness
+
+    # How long (seconds) each dispatcher process caches the full tenant-weight
+    # map fetched from Redis. Updates written via the weights UI propagate to all
+    # dispatchers within this window. Lower values = faster propagation but more
+    # Redis HGETALL calls. 60s is a good balance for a settings-page workflow.
+    attr_accessor :fairness_weight_cache_ttl        # Integer – seconds; default 60
+
     attr_accessor :fairness_global_concurrency      # Integer – (Scheduler) total in-flight slots; default 50
     attr_accessor :fairness_max_inflight_per_tenant # Integer – (Scheduler) per-tenant cap; 0 = none (default)
     attr_accessor :fairness_ready_window            # Integer – (Scheduler) bounded ready jobs/tenant in Redis; default 500
@@ -161,6 +188,14 @@ module KafkaBatch
     # lock. Kept independent of the staleness threshold above.
     attr_accessor :reconciler_lock_ttl      # Integer – seconds; default 600
 
+    # Maximum number of batches the reconciler will process per run (across
+    # both stuck-running and lost-callback categories combined independently).
+    # During an incident, thousands of batches can become stale simultaneously;
+    # without a cap the reconciler holds the distributed lock for minutes and
+    # produces a callback burst that overwhelms downstream consumers.
+    # The next reconciler tick will handle the remainder.
+    attr_accessor :max_reconcile_per_run    # Integer – default 100
+
     # ── Producer safety ──────────────────────────────────────────────────────
     # Raise a clear ProducerError when an encoded payload exceeds this size so
     # the caller gets an actionable error instead of an opaque rdkafka failure.
@@ -207,14 +242,18 @@ module KafkaBatch
       @retry_max_pause_seconds  = 30
       @complete_after_retries   = 3    # == max_retries default → no early completion by default
       @event_emit_retries       = 3
-      @event_emit_backoff       = 2
+      @event_emit_backoff       = 1  # #17: reduced from 2 → 1 to limit inline sleep on consumer thread
       @redis_url                = "redis://localhost:6379/0"
       @redis_pool_size          = 5
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
       @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
+      @fairness_mode                    = :time_fairness
+      @fairness_weight_cache_ttl        = 60
       @fairness_global_concurrency      = 50
-      @fairness_max_inflight_per_tenant = 0     # 0 = no per-tenant cap (rely on WFQ)
+      @fairness_max_inflight_per_tenant = 3     # cap per-tenant concurrency; prevents one slow
+                                                # tenant monopolising all slots for 20-60s in
+                                                # time_fairness mode. Set 0 to disable.
       @fairness_ready_window            = 500   # bounded ready jobs per tenant in Redis
       @fairness_default_weight          = 1.0
       @fairness_ingest_topic            = "kafka_batch.ingest"
@@ -229,6 +268,8 @@ module KafkaBatch
       @priority_lag_check_interval = 2
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600
+      @max_reconcile_per_run    = 100
+      @all_index_max_size       = 200_000
       @max_message_bytes        = 1_048_576  # 1 MiB; set to 0 to disable
       @producer_config          = {}
       @consumer_config          = {}

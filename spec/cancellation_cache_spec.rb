@@ -49,4 +49,54 @@ RSpec.describe KafkaBatch::CancellationCache do
     expect(described_class.cancelled?("b1")).to be(true) # first load
     expect(described_class.cancelled?("b1")).to be(true) # refresh fails → keep previous
   end
+
+  # ── CancellationCache#add optimistic insertion ────────────────────────────
+  describe "#add optimistic insertion" do
+    it "makes a newly cancelled batch visible immediately without waiting for TTL" do
+      KafkaBatch.config.cancellation_cache_ttl = 300  # long TTL → no auto-refresh
+      allow(store).to receive(:cancelled_batch_ids).and_return([])  # store doesn't know yet
+
+      # Warm the cache with an empty set
+      expect(described_class.cancelled?("fresh")).to be(false)
+
+      # Optimistically add the id (e.g. just after writing to the store)
+      described_class.add("fresh")
+
+      # Should be visible immediately without a store round-trip
+      expect(described_class.cancelled?("fresh")).to be(true)
+      # The store was only called once (the initial warm-up), not again
+      expect(store).to have_received(:cancelled_batch_ids).once
+    end
+
+    it "preserves existing cached ids when adding a new one" do
+      allow(store).to receive(:cancelled_batch_ids).and_return(%w[b1 b2])
+      described_class.cancelled?("b1")  # warm cache
+
+      described_class.add("b3")
+
+      expect(described_class.cancelled?("b1")).to be(true)
+      expect(described_class.cancelled?("b2")).to be(true)
+      expect(described_class.cancelled?("b3")).to be(true)
+    end
+
+    it "is a no-op for nil batch_id" do
+      expect { described_class.add(nil) }.not_to raise_error
+    end
+
+    it "does not modify the previously-stored set object (immutable snapshot)" do
+      allow(store).to receive(:cancelled_batch_ids).and_return(%w[b1])
+      described_class.cancelled?("b1")  # prime cache
+
+      old_snap = described_class.instance_variable_get(:@snapshot)
+      old_ids  = old_snap[:ids].dup
+
+      described_class.add("b_new")
+
+      # The snapshot was replaced, not mutated
+      new_snap = described_class.instance_variable_get(:@snapshot)
+      expect(new_snap[:ids]).not_to equal(old_snap[:ids])
+      # The OLD ids set is unchanged
+      expect(old_ids).not_to include("b_new")
+    end
+  end
 end

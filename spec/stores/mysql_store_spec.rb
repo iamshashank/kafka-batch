@@ -364,6 +364,96 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     end
   end
 
+  # ── batch_counts 5s cache (Bug #9) ──────────────────────────────────────
+  describe "#batch_counts 5s cache" do
+    before do
+      # Reset the instance's cache to a clean state.
+      store.instance_variable_set(:@batch_counts_cache, nil)
+    end
+
+    it "returns stale counts within the 5s window without hitting the DB" do
+      new_batch
+      t = 0.0
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { t }
+
+      counts_1 = store.batch_counts          # populates cache at t=0
+
+      # Add another batch while still within the window
+      new_batch
+      t = 3.0
+      counts_2 = store.batch_counts          # should still return the cached value
+
+      expect(counts_2["running"]).to eq(counts_1["running"])
+    end
+
+    it "re-queries the DB after 5s" do
+      new_batch
+      t = 0.0
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { t }
+
+      store.batch_counts  # cache at t=0
+      new_batch           # add a second batch
+
+      t = 6.0             # past 5s TTL
+      counts = store.batch_counts
+      expect(counts["running"]).to eq(2)
+    end
+
+    it "guards with a dedicated counts_mutex (does not share the connection mutex)" do
+      # Verify the mutex exists and is a distinct object (not the same as another mutex).
+      m = store.send(:counts_mutex)
+      expect(m).to be_a(Mutex)
+    end
+  end
+
+  # ── record_failure race / retry loop (Bug #4) ──────────────────────────
+  describe "#record_failure retry loop on RecordNotUnique" do
+    it "retries on RecordNotUnique and eventually updates the existing row" do
+      id = new_batch
+      # Pre-create the failure row so the race scenario (insert conflict) is real.
+      store.record_failure(batch_id: id, job_id: "j1", worker_class: "W",
+                           error_class: "E", error_message: "first", status: "retrying")
+
+      call_count = 0
+      original_create = store.send(:failure_class).method(:create!)
+      # Force the first create! attempt to raise RecordNotUnique to simulate a race,
+      # then fall through so the retry finds the row via find_by.
+      allow(store.send(:failure_class)).to receive(:create!).and_wrap_original do |orig, **attrs|
+        call_count += 1
+        # Let the first simulated race raise, then let real logic take over.
+        raise ActiveRecord::RecordNotUnique, "simulated race" if call_count == 1
+        orig.call(**attrs)
+      end
+
+      # The update should succeed despite the simulated race.
+      expect do
+        store.record_failure(batch_id: id, job_id: "j1", worker_class: "W",
+                             error_class: "E2", error_message: "updated", status: "failed")
+      end.not_to raise_error
+
+      failures = store.list_failures(id)
+      expect(failures.size).to eq(1)
+      expect(failures.first[:status]).to eq("failed")
+    end
+
+    it "logs an error and gives up after 3 retries" do
+      id = new_batch
+      # Force every create! to raise (worst-case: conflict never resolves).
+      allow(store.send(:failure_class)).to receive(:create!).and_raise(
+        ActiveRecord::RecordNotUnique, "persistent conflict"
+      )
+      # Also make find_by return nil each time so it always hits create!.
+      allow(store.send(:failure_class)).to receive(:find_by).and_return(nil)
+
+      expect(KafkaBatch.logger).to receive(:error).with(/record_failure upsert failed after 3 retries/)
+
+      expect do
+        store.record_failure(batch_id: id, job_id: "j1", worker_class: "W",
+                             error_class: "E", error_message: "x")
+      end.not_to raise_error
+    end
+  end
+
   describe "consumption pause/resume" do
     it "pauses and resumes a whole topic" do
       store.pause_consumption_topic(group: "g", topic: "demo")

@@ -341,6 +341,73 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     end
   end
 
+  # ── batch_counts empty-key fallback (Bug #2) ─────────────────────────────
+  describe "#batch_counts empty-key fallback" do
+    it "rebuilds counts from ALL_INDEX when COUNTS_KEY is absent" do
+      # Create two batches; let the normal Lua scripts populate COUNTS_KEY.
+      a = new_batch(total: 1)
+      b = new_batch(total: 1)
+      store.update_batch_status(b, "cancelled")
+
+      # Delete COUNTS_KEY to simulate a first-deploy / eviction scenario.
+      Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+           .del(KafkaBatch::Stores::RedisStore::COUNTS_KEY)
+
+      # batch_counts must fall back to scanning ALL_INDEX and reconstruct.
+      counts = store.batch_counts
+      expect(counts["running"]).to eq(1)
+      expect(counts["cancelled"]).to eq(1)
+    end
+
+    it "returns {} when both COUNTS_KEY and ALL_INDEX are empty" do
+      # After a full flush there are no batches and no keys.
+      expect(store.batch_counts).to eq({})
+    end
+
+    it "prunes expired batch keys from ALL_INDEX during the fallback scan" do
+      a = new_batch(total: 1)
+
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      # Manually inject a ghost id into ALL_INDEX (simulates a key that expired)
+      ghost = SecureRandom.uuid
+      redis.zadd(KafkaBatch::Stores::RedisStore::ALL_INDEX, Time.now.to_f, ghost)
+      redis.del(KafkaBatch::Stores::RedisStore::COUNTS_KEY)
+
+      store.batch_counts  # runs the fallback path
+
+      # Ghost id should have been pruned from ALL_INDEX
+      remaining = redis.zrange(KafkaBatch::Stores::RedisStore::ALL_INDEX, 0, -1)
+      expect(remaining).not_to include(ghost)
+      expect(remaining).to include(a)
+    end
+  end
+
+  # ── cancelled_batch_ids WRONGTYPE migration (Bug #6) ─────────────────────
+  describe "#cancelled_batch_ids WRONGTYPE legacy SET migration" do
+    it "migrates a plain-SET CANCELLED_INDEX to ZSET on the first read after upgrade" do
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      key   = KafkaBatch::Stores::RedisStore::CANCELLED_INDEX
+
+      # Plant a legacy plain SET (pre-Bug#6 data shape)
+      redis.del(key)
+      redis.sadd(key, "legacy-batch-1")
+      redis.sadd(key, "legacy-batch-2")
+
+      # cancelled_batch_ids should gracefully migrate and return the ids
+      ids = store.cancelled_batch_ids
+      expect(ids).to include("legacy-batch-1", "legacy-batch-2")
+
+      # The key must now be a ZSET (type migrated)
+      expect(redis.type(key)).to eq("zset")
+    end
+
+    it "works normally when CANCELLED_INDEX is already a ZSET" do
+      id = new_batch(total: 1)
+      store.update_batch_status(id, "cancelled")
+      expect(store.cancelled_batch_ids).to include(id)
+    end
+  end
+
   describe "#with_reconciler_lock" do
     it "yields when the lock is free and is mutually exclusive" do
       ran = false

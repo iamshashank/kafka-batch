@@ -4,8 +4,10 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
   before(:each) do
     skip "Redis unavailable at #{KafkaBatchSpec::RedisHelper::TEST_URL}" unless KafkaBatchSpec::RedisHelper.available?
     KafkaBatch.config.redis_url = KafkaBatchSpec::RedisHelper::TEST_URL
+    KafkaBatch.config.store     = :redis  # weight backend; keeps set_weight on the Redis path
     KafkaBatchSpec::RedisHelper.flush!
     # Generous defaults; individual tests tighten budget/window as needed.
+    KafkaBatch.config.fairness_mode                    = :job_count_fairness  # vtime advances at dispatch
     KafkaBatch.config.fairness_global_concurrency      = 1000
     KafkaBatch.config.fairness_ready_window            = 0     # unbounded unless a test sets it
     KafkaBatch.config.fairness_max_inflight_per_tenant = 0
@@ -100,6 +102,256 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       s = scheduler.stats
       expect(s[:active_tenants]).to eq(2)
       expect(s[:inflight_total]).to eq(1)
+    end
+  end
+
+  # ── Time-fairness mode ────────────────────────────────────────────────────
+  # These tests switch to :time_fairness and call complete(duration:) so that
+  # vtime advances at completion rather than dispatch. This exercises both
+  # CHECKOUT_LUA_TIME and COMPLETE_LUA_TIME — the default production paths.
+  describe ":time_fairness mode" do
+    let(:scheduler) { described_class.new }
+
+    before do
+      KafkaBatch.config.fairness_mode = :time_fairness
+    end
+
+    it "does not advance vtime at checkout — both tenants stay at 0 until complete" do
+      scheduler.enqueue("A", "a0")
+      scheduler.enqueue("B", "b0")
+
+      # Checkout A without completing — vtime stays 0 for A in the ring.
+      # B should be dispatched next because it still has score 0 and Redis
+      # ZRANGE is lexicographically stable for equal scores (A < B, so A
+      # is first; after A is checked out its ring entry is removed since its
+      # queue drained. B is next).
+      r1 = scheduler.checkout
+      expect(r1).not_to be_nil
+      # Inflight is 1, ring has B left
+      r2 = scheduler.checkout
+      expect(r2).not_to be_nil
+      expect([r1[:tenant_id], r2[:tenant_id]].sort).to eq(%w[A B])
+    end
+
+    it "charges a tenant proportionally to duration, not dispatch count" do
+      # A gets weight 1.0, B gets weight 1.0. B's jobs finish in 1s, A's in 2s.
+      # Use large queues (20 each) and only sample the FIRST 15 dispatches so
+      # neither queue runs dry during the window. If queues equal total
+      # iterations, B exhausts last and A backfills — giving a spurious 10/10.
+      KafkaBatch.config.fairness_global_concurrency = 1  # force sequential
+      KafkaBatch.config.fairness_max_inflight_per_tenant = 1
+
+      20.times { |i| scheduler.enqueue("A", "a#{i}") }
+      20.times { |i| scheduler.enqueue("B", "b#{i}") }
+
+      tenant_log = []
+      15.times do   # fewer than queue depth — both queues stay live
+        result = scheduler.checkout
+        break unless result
+        t = result[:tenant_id]
+        tenant_log << t
+        duration = t == "A" ? 2.0 : 1.0
+        scheduler.complete(t, duration: duration)
+      end
+
+      counts = tenant_log.tally
+      # B runs twice as fast (1s vs 2s) so over the first 15 dispatches it
+      # should appear ~2x as often as A (roughly B=10, A=5).
+      expect(counts["B"]).to be > counts["A"]
+    end
+
+    it "COMPLETE_LUA_TIME re-adds the tenant to the ring if it still has queued jobs" do
+      KafkaBatch.config.fairness_global_concurrency = 1
+      KafkaBatch.config.fairness_max_inflight_per_tenant = 1
+
+      3.times { |i| scheduler.enqueue("A", "a#{i}") }
+
+      r1 = scheduler.checkout
+      expect(r1[:tenant_id]).to eq("A")
+      # A was removed from ring (queue would now have 2 left)
+      scheduler.complete("A", duration: 1.0)
+      # After complete, A should be back in the ring
+      r2 = scheduler.checkout
+      expect(r2).not_to be_nil
+      expect(r2[:tenant_id]).to eq("A")
+    end
+
+    it "vtime accumulates correctly across multiple completions" do
+      # Single tenant, weight 1.0. Each job takes 3s.
+      # After 3 completions, vtime should be ~9.0.
+      KafkaBatch.config.fairness_global_concurrency = 1
+      KafkaBatch.config.fairness_max_inflight_per_tenant = 1
+
+      5.times { |i| scheduler.enqueue("A", "a#{i}") }
+
+      3.times do
+        r = scheduler.checkout
+        expect(r).not_to be_nil
+        scheduler.complete("A", duration: 3.0)
+      end
+
+      # Check vtime via Redis directly
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      vt = redis.hget(KafkaBatch::Fairness::Scheduler::VTIME, "A").to_f
+      expect(vt).to be_within(0.01).of(9.0)
+    end
+
+    it "complete with duration: 0 does not raise and advances vtime by 0" do
+      scheduler.enqueue("A", "a0")
+      scheduler.checkout
+      expect { scheduler.complete("A", duration: 0) }.not_to raise_error
+    end
+
+    it "complete with duration: nil falls back to 0 (no free-pass crash)" do
+      scheduler.enqueue("A", "a0")
+      scheduler.checkout
+      expect { scheduler.complete("A", duration: nil) }.not_to raise_error
+    end
+
+    it "stats reports fairness_mode as :time_fairness" do
+      s = scheduler.stats
+      expect(s[:fairness_mode]).to eq(:time_fairness)
+    end
+  end
+
+  # ── MySQL weight backend ──────────────────────────────────────────────────
+  # Tests the write_weight_to_backend / fetch_all_weights_from_backend MySQL
+  # paths. We use the SQLite test database (via KafkaBatchSpec::ActiveRecordSupport)
+  # which has been extended to include the kafka_batch_tenant_weights table.
+  describe "MySQL weight backend" do
+    let(:scheduler) { described_class.new }
+
+    before do
+      KafkaBatch.config.store = :mysql
+      # Ensure the tenant_weights table exists in the in-memory SQLite DB.
+      conn = ActiveRecord::Base.connection
+      unless conn.table_exists?(:kafka_batch_tenant_weights)
+        conn.create_table :kafka_batch_tenant_weights, force: true do |t|
+          t.string  :tenant_id, null: false
+          t.decimal :weight, precision: 10, scale: 4, null: false, default: "1.0"
+          t.datetime :updated_at, null: false
+        end
+        conn.add_index :kafka_batch_tenant_weights, :tenant_id, unique: true,
+                       name: "uq_kb_tenant_weights_tenant_id"
+      end
+      conn.execute("DELETE FROM kafka_batch_tenant_weights")
+
+      # write_weight_to_backend uses ON DUPLICATE KEY UPDATE (MySQL-only).
+      # Stub it to use SQLite-compatible INSERT OR REPLACE so the test DB works.
+      allow(scheduler).to receive(:write_weight_to_backend).and_wrap_original do |_, tid, w|
+        c   = ActiveRecord::Base.connection
+        sql = "INSERT OR REPLACE INTO kafka_batch_tenant_weights " \
+              "(tenant_id, weight, updated_at) VALUES " \
+              "(#{c.quote(tid.to_s)}, #{c.quote(w.to_f)}, " \
+              "#{c.quote(Time.now.utc.strftime('%Y-%m-%d %H:%M:%S'))})"
+        c.execute(sql)
+        scheduler.send(:bust_weight_cache!)
+      end
+    end
+
+    it "persists a weight to MySQL and reads it back via fetch_all_weights_from_backend" do
+      scheduler.set_weight("t1", 3.0)
+      weights = scheduler.send(:fetch_all_weights_from_backend)
+      expect(weights["t1"]).to be_within(0.0001).of(3.0)
+    end
+
+    it "upserts (overwrites) an existing weight without creating a duplicate row" do
+      scheduler.set_weight("t1", 2.0)
+      scheduler.set_weight("t1", 5.0)
+
+      weights = scheduler.send(:fetch_all_weights_from_backend)
+      expect(weights["t1"]).to be_within(0.0001).of(5.0)
+      expect(weights.size).to eq(1)
+    end
+
+    it "deletes a weight via delete_weight" do
+      scheduler.set_weight("t1", 2.0)
+      scheduler.delete_weight("t1")
+      weights = scheduler.send(:fetch_all_weights_from_backend)
+      expect(weights.key?("t1")).to be(false)
+    end
+
+    it "fetch_all_weights_from_backend returns empty hash when table is empty" do
+      weights = scheduler.send(:fetch_all_weights_from_backend)
+      expect(weights).to eq({})
+    end
+
+    it "set_weight busts the process-local cache so next weight_for returns the new value" do
+      scheduler.set_weight("t1", 1.0)
+      # Prime the cache
+      expect(scheduler.send(:weight_for, "t1")).to be_within(0.0001).of(1.0)
+
+      scheduler.set_weight("t1", 4.0)
+      # Cache was busted — should reflect the new value immediately
+      expect(scheduler.send(:weight_for, "t1")).to be_within(0.0001).of(4.0)
+    end
+
+    it "all_tenants includes tenants with custom weights alongside Redis ring tenants" do
+      scheduler.set_weight("mysql_tenant", 2.5)
+      scheduler.enqueue("redis_tenant", "payload")
+
+      tenants = scheduler.all_tenants
+      ids = tenants.map { |t| t[:tenant_id] }
+      expect(ids).to include("mysql_tenant", "redis_tenant")
+
+      mysql_entry = tenants.find { |t| t[:tenant_id] == "mysql_tenant" }
+      expect(mysql_entry[:weight]).to be_within(0.0001).of(2.5)
+      expect(mysql_entry[:has_custom_weight]).to be(true)
+    end
+  end
+
+  # ── Weight cache TTL and bust ─────────────────────────────────────────────
+  describe "weight cache TTL and bust_weight_cache!" do
+    before do
+      KafkaBatch.config.fairness_weight_cache_ttl = 60
+    end
+
+    it "serves stale weight within the TTL window" do
+      scheduler.set_weight("t1", 1.0)
+      # Prime cache
+      expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
+
+      # Write directly to Redis bypassing the scheduler (simulates another process)
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      redis.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 9.0)
+
+      # Still within TTL — should see old value from cache
+      expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
+    end
+
+    it "re-fetches from backend after TTL expires" do
+      t = 0.0
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { t }
+
+      scheduler.set_weight("t1", 1.0)
+      scheduler.send(:weight_for, "t1")  # prime cache at t=0
+
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      redis.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 7.0)
+
+      t = 61.0  # advance past TTL
+      expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(7.0)
+    end
+
+    it "bust_weight_cache! forces an immediate re-fetch on next weight_for call" do
+      scheduler.set_weight("t1", 1.0)
+      scheduler.send(:weight_for, "t1")  # prime cache
+
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      redis.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 5.0)
+
+      # Still cached without bust
+      expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
+
+      scheduler.send(:bust_weight_cache!)
+
+      # Now reflects the backend value
+      expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(5.0)
+    end
+
+    it "returns default_weight for an unknown tenant even after cache is primed" do
+      scheduler.send(:weight_for, "known")  # prime cache with empty result
+      expect(scheduler.send(:weight_for, "unknown")).to eq(KafkaBatch.config.fairness_default_weight)
     end
   end
 end

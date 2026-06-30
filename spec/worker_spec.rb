@@ -33,6 +33,22 @@ RSpec.describe KafkaBatch::Worker do
       klass = Class.new { include KafkaBatch::Worker }
       expect(klass.kafka_topic).to eq(KafkaBatch.config.jobs_topic)
     end
+
+    describe "complete_after_retries" do
+      it "falls back to the global config default when not overridden" do
+        KafkaBatch.config.complete_after_retries = 7
+        klass = Class.new { include KafkaBatch::Worker }
+        expect(klass.complete_after_retries).to eq(7)
+      end
+
+      it "can be pinned per worker, independently of max_retries" do
+        klass = Class.new do
+          include KafkaBatch::Worker
+          complete_after_retries 1
+        end
+        expect(klass.complete_after_retries).to eq(1)
+      end
+    end
   end
 
   it "registers including classes in the global registry" do
@@ -43,5 +59,40 @@ RSpec.describe KafkaBatch::Worker do
   it "raises NotImplementedError when #perform is not overridden" do
     klass = Class.new { include KafkaBatch::Worker }
     expect { klass.new.perform({}) }.to raise_error(NotImplementedError)
+  end
+
+  # ── Instance helpers (kafka_batch_id / batch) ─────────────────────────────
+  describe "#batch instance helper" do
+    it "returns nil when kafka_batch_id is nil" do
+      worker = SuccessfulWorker.new
+      worker.kafka_batch_id = nil
+      expect(worker.batch).to be_nil
+    end
+
+    it "returns nil when kafka_batch_id is an empty string" do
+      worker = SuccessfulWorker.new
+      worker.kafka_batch_id = ""
+      expect(worker.batch).to be_nil
+    end
+
+    it "returns a Batch with the correct id when kafka_batch_id is set" do
+      id = SecureRandom.uuid
+      KafkaBatch.store.create_batch(id: id, total_jobs: 1)
+
+      worker = SuccessfulWorker.new
+      worker.kafka_batch_id = id
+      b = worker.batch
+      expect(b).to be_a(KafkaBatch::Batch)
+      expect(b.id).to eq(id)
+    end
+
+    it "memoizes the Batch on repeated calls (no extra store round-trips)" do
+      id = SecureRandom.uuid
+      KafkaBatch.store.create_batch(id: id, total_jobs: 1)
+
+      worker = SuccessfulWorker.new
+      worker.kafka_batch_id = id
+      expect(worker.batch).to equal(worker.batch)  # same object identity
+    end
   end
 end

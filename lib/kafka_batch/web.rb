@@ -70,11 +70,14 @@ module KafkaBatch
       # Validate CSRF on mutating POSTs: submitted token must match the cookie.
       # Non-browser clients that send no cookie value bypass the check (no cookie
       # means no session, no cross-site vector).
+      #
+      # IMPORTANT: ALL destructive forms embed _csrf in the action URL's query
+      # string (not the POST body). This avoids reading rack.input, which may be
+      # already consumed and non-rewindable by upstream middleware (e.g.
+      # ActionDispatch::Request in Rails). params is always parsed from
+      # QUERY_STRING, which middleware never consumes.
       if method == "POST" && request_cookies.key?(CSRF_COOKIE)
-        # Parse POST body for hidden-field submissions (cancel / delete forms).
-        body        = env["rack.input"]&.read.to_s ; env["rack.input"]&.rewind
-        body_params = parse_query(body)
-        submitted   = params[CSRF_FIELD] || body_params[CSRF_FIELD]
+        submitted = params[CSRF_FIELD]
         unless submitted && submitted == @csrf_token
           return inject_csrf_cookie(csrf_forbidden)
         end
@@ -95,6 +98,12 @@ module KafkaBatch
           lag_consumption_control(:resume, params)
         elsif method == "GET" && path == "/fairness"
           html(render_fairness(params))
+        elsif method == "GET" && path == "/weights"
+          html(render_weights(params))
+        elsif method == "POST" && path == "/weights"
+          weights_set(params.merge(body_params(env)))
+        elsif method == "POST" && path == "/weights/reset"
+          weights_reset(params.merge(body_params(env)))
         elsif method == "GET" && (m = path.match(%r{\A/batches/([^/]+)\z}))
           batch = KafkaBatch.store.find_batch(m[1])
           batch ? html(render_show(batch, params)) : not_found
@@ -125,11 +134,6 @@ module KafkaBatch
 
     def csrf_token
       @csrf_token
-    end
-
-    # A hidden <input> that submits the CSRF token in POST bodies.
-    def csrf_hidden
-      "<input type='hidden' name='#{CSRF_FIELD}' value='#{h(csrf_token)}'>"
     end
 
     # Stamp the CSRF cookie onto any Rack response triple.
@@ -211,14 +215,6 @@ module KafkaBatch
       redirect_to_lag(non_empty(params["tenant_id"]))
     end
 
-    # Full-page auto-reload used by the always-live pages (/live, /lag, /fairness).
-    # Each response is a fresh server render (cache-control: no-store), so a reload
-    # simply shows current data. Included on their transient "unavailable" states
-    # too, so those pages self-recover once the backend comes back.
-    def auto_reload_script
-      '<script>setTimeout(function(){ location.reload(); }, 5000);</script>'
-    end
-
     # ── Pages ──────────────────────────────────────────────────────────────
 
     def render_index(params)
@@ -241,7 +237,6 @@ module KafkaBatch
 
       <<~HTML
         #{summary}
-        <div class="toolbar"><button id="kb-live-toggle" type="button" class="btn">○ Live</button> <a class="btn" href="#{failures_path}">⚠ View all failures</a> <a class="btn" href="#{live_path}">▶ Live activity</a> <a class="btn" href="#{lag_path}">▦ Topic lag</a> <a class="btn" href="#{fairness_path}">⚖ Fairness</a></div>
         <div class="filterbar">#{filters}#{search_box(search, status)}</div>
         <div class="card">
           <table>
@@ -255,7 +250,6 @@ module KafkaBatch
           </table>
         </div>
         #{pager}
-        #{live_toggle_script}
       HTML
     end
 
@@ -358,11 +352,11 @@ module KafkaBatch
         end
         return <<~HTML
           <p><a class="back" href="#{index_path}">← All batches</a></p>
+
           <div class="card">
             <h2>Live activity</h2>
             <p class="muted">#{msg}</p>
           </div>
-          #{auto_reload_script}
         HTML
       end
 
@@ -385,6 +379,7 @@ module KafkaBatch
 
       <<~HTML
         <p><a class="back" href="#{index_path}">← All batches</a></p>
+
         <div class="metrics">
           <div class="metric"><div class="metric-value">#{consumers.size}</div><div class="metric-label">Consumers</div></div>
           <div class="metric"><div class="metric-value">#{jobs.size}</div><div class="metric-label">Running jobs</div></div>
@@ -404,7 +399,6 @@ module KafkaBatch
             <tbody>#{job_rows}</tbody>
           </table>
         </div>
-        #{auto_reload_script}
       HTML
     end
 
@@ -414,12 +408,12 @@ module KafkaBatch
       unless KafkaBatch::Lag.available?
         return <<~HTML
           <p><a class="back" href="#{index_path}">← All batches</a></p>
+
           #{ingest_partition_lookup_widget(tenant_q)}
           <div class="card">
             <h2>Topic lag</h2>
             <p class="muted">Lag requires Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p>
           </div>
-          #{auto_reload_script}
         HTML
       end
 
@@ -429,12 +423,12 @@ module KafkaBatch
         KafkaBatch.logger.warn("[KafkaBatch::Web] lag fetch failed: #{e.message}")
         return <<~HTML
           <p><a class="back" href="#{index_path}">← All batches</a></p>
+
           #{ingest_partition_lookup_widget(tenant_q)}
           <div class="card">
             <h2>Topic lag</h2>
             <p class="muted">Could not read lag from Kafka: <code>#{h(e.message)}</code></p>
           </div>
-          #{auto_reload_script}
         HTML
       end
 
@@ -482,6 +476,7 @@ module KafkaBatch
 
       <<~HTML
         <p><a class="back" href="#{index_path}">← All batches</a></p>
+
         #{lookup_html}
         <div class="metrics">
           <div class="metric"><div class="metric-value">#{total}</div><div class="metric-label">Total pending</div></div>
@@ -504,7 +499,6 @@ module KafkaBatch
             <tbody>#{part_rows}</tbody>
           </table>
         </div>
-        #{auto_reload_script}
       HTML
     end
 
@@ -561,7 +555,7 @@ module KafkaBatch
           "<div class='card'><p class='muted'>No registered workers opt into multi-tenant fairness yet (set <code>fairness true</code> on a Worker class). Lag below reflects the configured ingest/ready topics.</p></div>"
         end
       unless KafkaBatch::Lag.available?
-        return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path)}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>#{auto_reload_script}"
+        return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path)}<div class='card'><h2>Fairness</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>"
       end
 
       cfg            = KafkaBatch.config
@@ -571,7 +565,7 @@ module KafkaBatch
            lag_partitions(KafkaBatch.jobs_fair_consumer_group, cfg.fairness_ready_topic)]
         rescue StandardError => e
           KafkaBatch.logger.warn("[KafkaBatch::Web] fairness lag read failed: #{e.message}")
-          return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path)}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>#{auto_reload_script}"
+          return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path)}<div class='card'><h2>Fairness</h2><p class='muted'>Could not read lag from Kafka: <code>#{h(e.message)}</code></p></div>"
         end
 
       # Augment ingest rows with :group and :topic so ingest_partition_lookup_result
@@ -628,8 +622,195 @@ module KafkaBatch
             <tbody>#{ready_rows}</tbody>
           </table>
         </div>
-        #{auto_reload_script}
       HTML
+    end
+
+    # ── Tenant weight management ───────────────────────────────────────────
+
+    # GET /weights — shows all known tenants with their current weight and
+    # runtime state (in-flight, queued, accumulated vtime). Tenants appear
+    # automatically as soon as they enqueue their first job — no manual setup.
+    def render_weights(_params = {})
+      back = "<p><a class=\"back\" href=\"#{index_path}\">← All batches</a></p>"
+      cfg  = KafkaBatch.config
+
+      mode_label = cfg.fairness_mode == :time_fairness ? "Time fairness" : "Job-count fairness"
+      mode_badge_color = cfg.fairness_mode == :time_fairness ? "#10b981" : "#3b82f6"
+      mode_desc =
+        if cfg.fairness_mode == :time_fairness
+          "Vtime advances at <strong>completion</strong> by <code>actual_seconds / weight</code>. " \
+          "Each tenant receives proportional wall-clock time per hour (recommended for 20–60s jobs)."
+        else
+          "Vtime advances at <strong>dispatch</strong> by <code>1 / weight</code>. " \
+          "Fair over job count, not duration. Correct when all tenants' jobs have similar runtimes."
+        end
+
+      sched = KafkaBatch.scheduler
+
+      unless sched
+        return <<~HTML
+          #{back}
+          <div class="card">
+            <h2>Tenant Weights</h2>
+            <p class="muted">The Redis-backed Scheduler is not available in this process. Ensure
+            <code>config.redis_url</code> is set and <code>kafka_batch/fairness/scheduler</code>
+            is loaded.</p>
+          </div>
+        HTML
+      end
+
+      tenants = begin
+        sched.all_tenants
+      rescue => e
+        KafkaBatch.logger.warn("[KafkaBatch::Web] weights: all_tenants failed: #{e.message}")
+        []
+      end
+
+      default_w = sched.default_weight
+
+      tenant_rows = tenants.map do |t|
+        tid    = t[:tenant_id]
+        w      = t[:weight]
+        custom = t[:has_custom_weight]
+        inf    = t[:inflight]
+        queued = t[:queued]
+        vtime  = t[:vtime]
+
+        custom_badge = custom \
+          ? "<span class='badge' style='background:#6366f1'>custom</span>"
+          : "<span class='muted'>default</span>"
+        inf_cell   = inf.positive? ? "<strong>#{inf}</strong>" : inf.to_s
+        queue_cell = queued \
+          ? "<span class='badge' style='background:#10b981'>queued</span>"
+          : "<span class='muted'>idle</span>"
+        vtime_cell = vtime > 0 ? ("%.1f" % vtime) + "s" : "<span class='muted'>—</span>"
+
+        csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
+
+        set_form = <<~FORM.gsub(/\n\s*/, "")
+          <form class="inline-form" method="POST" action="#{weights_path}?#{csrf_qs}">
+            <input type="hidden" name="tenant_id" value="#{h(tid)}">
+            <input type="number" name="weight" value="#{w}" step="0.1" min="0.1" class="weight-input">
+            <button type="submit" class="btn btn-sm">Set</button>
+          </form>
+        FORM
+
+        reset_form =
+          if custom
+            <<~FORM.gsub(/\n\s*/, "")
+              <form class="inline-form" method="POST" action="#{weights_reset_path}?#{csrf_qs}">
+                <input type="hidden" name="tenant_id" value="#{h(tid)}">
+                <button type="submit" class="btn btn-sm">Reset</button>
+              </form>
+            FORM
+          else
+            ""
+          end
+
+        weight_display = "<strong>#{w}</strong>"
+
+        <<~ROW.gsub(/\n\s*/, "")
+          <tr>
+            <td class="mono">#{h(tid)}</td>
+            <td class="mono" style="text-align:right">#{weight_display}</td>
+            <td>#{set_form}</td>
+            <td>#{custom_badge}</td>
+            <td>#{inf_cell}</td>
+            <td>#{queue_cell}</td>
+            <td class="mono">#{vtime_cell}</td>
+            <td>#{reset_form}</td>
+          </tr>
+        ROW
+      end.join
+
+      tenant_rows = "<tr><td colspan='8' class='empty'>No active tenants yet. Tenants appear automatically as soon as they enqueue their first job.</td></tr>" if tenants.empty?
+
+      csrf_qs = "#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
+      add_form = <<~FORM
+        <form class="weight-add-form" method="POST" action="#{weights_path}?#{csrf_qs}">
+          <input type="text" name="tenant_id" placeholder="Tenant ID" required class="weight-add-id">
+          <input type="number" name="weight" value="#{default_w}" step="0.1" min="0.1" class="weight-input">
+          <button type="submit" class="btn">Set weight</button>
+        </form>
+      FORM
+
+      <<~HTML
+        #{back}
+        <div class="metrics">
+          <div class="metric"><div class="metric-value">#{tenants.size}</div><div class="metric-label">Known tenants</div></div>
+          <div class="metric"><div class="metric-value">#{tenants.count { |t| t[:has_custom_weight] }}</div><div class="metric-label">Custom weights</div></div>
+          <div class="metric metric-info" title="Tenants with jobs currently checked out via Scheduler#checkout but not yet completed. Tracks active WFQ concurrency. Always 0 with the Kafka-native Dispatcher — only non-zero when driving the Scheduler directly with checkout/complete."><div class="metric-value">#{tenants.count { |t| t[:inflight].positive? }}</div><div class="metric-label">In-flight now ⓘ</div></div>
+          <div class="metric metric-info" title="Tenants currently in the WFQ ring — they have jobs in their Scheduler ready queue awaiting checkout. Always 0 with the Kafka-native Dispatcher — only non-zero when using the Scheduler-based WFQ dispatch path."><div class="metric-value">#{tenants.count { |t| t[:queued] }}</div><div class="metric-label">Queued ⓘ</div></div>
+        </div>
+        <div class="card">
+          <p>
+            <span class="badge" style="background:#{mode_badge_color}">#{mode_label}</span>
+            &nbsp;#{mode_desc}
+            &nbsp;<span class="muted">Default weight: <code>#{default_w}</code> &nbsp;|&nbsp; Per-tenant cap: <code>#{cfg.fairness_max_inflight_per_tenant == 0 ? "none" : cfg.fairness_max_inflight_per_tenant}</code> &nbsp;|&nbsp; Cache TTL: <code>#{cfg.fairness_weight_cache_ttl}s</code></span>
+          </p>
+        </div>
+        <div class="card">
+          <h3>Tenant weights</h3>
+          <p class="muted">
+            Higher weight = proportionally more throughput.
+            Weights are persisted in Redis and propagate to all dispatcher processes within the cache TTL
+            (<code>#{cfg.fairness_weight_cache_ttl}s</code>). New tenants appear here automatically.
+          </p>
+          <table>
+            <thead>
+              <tr>
+                <th>Tenant ID</th>
+                <th style="text-align:right">Current Weight</th>
+                <th>Set Weight</th>
+                <th>Override</th>
+                <th title="Jobs currently checked out from the WFQ Scheduler but not yet completed. Always 0 with the Kafka-native Dispatcher.">In-flight ⓘ</th>
+                <th title="Whether this tenant has jobs in its Scheduler ready queue (queued = in the WFQ ring). Always idle with the Kafka-native Dispatcher.">Status ⓘ</th>
+                <th>Vtime (slot-s)</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>#{tenant_rows}</tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h3>Add / pre-configure tenant weight</h3>
+          <p class="muted">Pre-set a weight for a tenant before it appears, or override an existing one.</p>
+          #{add_form}
+        </div>
+      HTML
+    end
+
+    # POST /weights — set a tenant weight, then redirect back to /weights.
+    def weights_set(params)
+      tid    = non_empty(params["tenant_id"])
+      weight = params["weight"].to_f
+
+      if tid.nil?
+        return [302, { "location" => weights_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
+      end
+
+      if weight <= 0
+        weight = KafkaBatch.config.fairness_default_weight
+      end
+
+      begin
+        KafkaBatch.scheduler&.set_weight(tid, weight)
+      rescue => e
+        KafkaBatch.logger.error("[KafkaBatch::Web] weights_set failed: #{e.message}")
+      end
+
+      [302, { "location" => weights_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
+    end
+
+    # POST /weights/reset — remove a custom weight override (revert to default).
+    def weights_reset(params)
+      tid = non_empty(params["tenant_id"])
+      begin
+        KafkaBatch.scheduler&.delete_weight(tid) if tid
+      rescue => e
+        KafkaBatch.logger.error("[KafkaBatch::Web] weights_reset failed: #{e.message}")
+      end
+      [302, { "location" => weights_path, "cache-control" => "no-store", "content-type" => "text/html" }, []]
     end
 
     def lag_topic_status(group, topic, paused)
@@ -741,9 +922,22 @@ module KafkaBatch
       end
       lag_note  =
         if lag_row
-          " Pending on this partition (dispatch group): #{lag_badge(lag_row[:lag])}."
+          if lag_row[:never_consumed]
+            # Dispatcher has never committed to this partition — messages may be
+            # accumulating here but the consumer group has no committed offset yet.
+            " <span class='badge' style='background:#f59e0b'>Dispatch group has never consumed this partition</span>" \
+            " — Dispatcher may not be running or hasn't reached it yet."
+          elsif lag_row[:lag].to_i.zero?
+            # lag=0 means the Dispatcher has consumed everything here. Jobs are now
+            # on the ready topic awaiting execution — check ready-topic lag below.
+            " Ingest drained (lag: 0). Jobs forwarded to ready topic — check ready-topic lag."
+          else
+            " Pending on this partition (dispatch group): #{lag_badge(lag_row[:lag])}."
+          end
         elsif lag_rows
-          " No dispatch-group lag row for this partition (may be zero or not yet consumed)."
+          # Partition not in lag data at all — dispatch group unknown to Kafka (never ran).
+          " <span class='badge' style='background:#f59e0b'>Dispatch group not found</span>" \
+          " — Dispatcher has never consumed this topic. Jobs may be accumulating on partition #{partition}."
         end
 
       <<~HTML
@@ -752,11 +946,17 @@ module KafkaBatch
     end
 
     # Per-partition lag rows for a (group, topic), sorted by lag desc.
+    # Preserves :never_consumed so the ingest lookup can distinguish "drained"
+    # from "group has never committed here".
     def lag_partitions(group, topic)
       data  = KafkaBatch::Lag.read_group(group, [topic])
       parts = (data[group] || {})[topic] || {}
-      parts.map { |partition, info| { partition: partition.to_i, lag: [info[:lag].to_i, 0].max } }
-           .sort_by { |p| -p[:lag] }
+      parts.map do |partition, info|
+        never_consumed = info[:offset].to_i < 0
+        lag            = info[:lag].to_i
+        lag            = 0 if lag.negative?
+        { partition: partition.to_i, lag: lag, never_consumed: never_consumed }
+      end.sort_by { |p| -p[:lag] }
     end
 
     # Colour the lag number: grey at 0, amber when backed up.
@@ -951,9 +1151,16 @@ module KafkaBatch
     end
 
     def form_button(action, label, css, confirm)
-      # #23: embed CSRF token as a hidden field on all destructive forms.
-      "<form method='post' action='#{action}' onsubmit=\"return confirm('#{h(confirm)}')\" style='display:inline'>" \
-      "#{csrf_hidden}<button type='submit' class='btn #{css}'>#{label}</button></form>"
+      # #23: embed CSRF token in the action URL's query string, NOT in the POST
+      # body. When this app is mounted inside Rails, middleware (e.g.
+      # ActionDispatch::Request) reads and exhausts rack.input before our handler
+      # runs, so body_params would always be empty. QUERY_STRING is never consumed
+      # by middleware, so params[CSRF_FIELD] is always readable. This matches the
+      # pattern used by lag_control_form (pause/resume), which has always worked.
+      sep = action.include?("?") ? "&" : "?"
+      action_with_csrf = "#{action}#{sep}#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
+      "<form method='post' action='#{action_with_csrf}' onsubmit=\"return confirm('#{h(confirm)}')\" style='display:inline'>" \
+      "<button type='submit' class='btn #{css}'>#{label}</button></form>"
     end
 
     def progress_bar(b)
@@ -1041,6 +1248,14 @@ module KafkaBatch
       "#{@script_name}/fairness"
     end
 
+    def weights_path
+      "#{@script_name}/weights"
+    end
+
+    def weights_reset_path
+      "#{@script_name}/weights/reset"
+    end
+
     def show_path(id)
       "#{@script_name}/batches/#{CGI.escape(id.to_s)}"
     end
@@ -1059,6 +1274,26 @@ module KafkaBatch
 
     def parse_query(qs)
       CGI.parse(qs.to_s).transform_values(&:first)
+    end
+
+    # Safely read URL-encoded params from the request body (rack.input).
+    # Used only for POST /weights and POST /weights/reset, where tenant_id
+    # and weight arrive in the body (standard HTML form fields).
+    #
+    # The normal params hash is parsed from QUERY_STRING to avoid consuming
+    # rack.input (which middleware like ActionDispatch::Request may exhaust).
+    # However, Rails wraps rack.input in Rack::RewindableInput, so calling
+    # rewind after Rails has read it is always safe. We rescue any error
+    # (e.g. raw Rack without rewindable input) and fall back to {}.
+    def body_params(env)
+      input = env["rack.input"]
+      return {} unless input
+
+      input.rewind
+      raw = input.read
+      parse_query(raw)
+    rescue StandardError
+      {}
     end
 
     def h(text)
@@ -1118,8 +1353,20 @@ module KafkaBatch
           <style>#{CSS}</style>
         </head>
         <body>
-          <header><a href="#{index_path}" class="logo">KafkaBatch</a><span class="tag">batches</span></header>
+          <header>
+            <a href="#{index_path}" class="logo">KafkaBatch</a>
+            <span class="tag">batches</span>
+            <nav class="header-nav">
+              <button id="kb-live-toggle" type="button" class="btn">○ Live</button>
+              <a class="btn" href="#{failures_path}">⚠ Failures</a>
+              <a class="btn" href="#{live_path}">▶ Live</a>
+              <a class="btn" href="#{lag_path}">▦ Lag</a>
+              <a class="btn" href="#{fairness_path}">⚖ Fairness</a>
+              <a class="btn" href="#{weights_path}">⚖ Weights</a>
+            </nav>
+          </header>
           <main>#{body}</main>
+          #{live_toggle_script}
         </body>
         </html>
       HTML
@@ -1129,9 +1376,12 @@ module KafkaBatch
       * { box-sizing: border-box; }
       body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
              background: #f3f4f6; color: #111827; }
-      header { background: #111827; color: #fff; padding: 14px 24px; display: flex; align-items: baseline; gap: 10px; }
+      header { background: #111827; color: #fff; padding: 10px 24px; display: flex; align-items: center; gap: 10px; }
       header .logo { color: #fff; text-decoration: none; font-weight: 700; font-size: 18px; }
       header .tag { color: #9ca3af; font-size: 13px; }
+      .header-nav { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+      header .btn { background: transparent; border-color: #4b5563; color: #e5e7eb; font-size: 12px; padding: 4px 10px; }
+      header .btn.live-on { border-color: #10b981; background: #10b981; color: #fff; }
       main { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
       .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
       table { width: 100%; border-collapse: collapse; font-size: 14px; }
@@ -1143,7 +1393,6 @@ module KafkaBatch
       .metric { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 18px; min-width: 110px; }
       .metric-value { font-size: 26px; font-weight: 700; }
       .metric-label { color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-      .toolbar { margin-bottom: 12px; }
       .chips { margin-bottom: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
       .chip { text-decoration: none; color: #374151; background: #fff; border: 1px solid #e5e7eb;
               padding: 5px 12px; border-radius: 999px; font-size: 13px; }
@@ -1177,6 +1426,13 @@ module KafkaBatch
       h2 { margin-top: 0; }
       .tenant-chip { display:inline-block; font-size:11px; font-weight:600; padding:1px 8px;
                      border-radius:999px; white-space:nowrap; }
+      .weight-input { width:72px; padding:4px 8px; border:1px solid #d1d5db; border-radius:6px;
+                      font-size:13px; text-align:right; }
+      .weight-add-form { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+      .weight-add-id { padding:6px 12px; border:1px solid #d1d5db; border-radius:7px;
+                       font-size:14px; width:220px; }
+      .metric-info { cursor:help; }
+      th[title] { cursor:help; }
     CSS
   end
 end

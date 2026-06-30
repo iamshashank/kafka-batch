@@ -5,6 +5,7 @@
 /tmp/
 /.bundle/
 /vendor/bundle/
+/vendor/bundle-linux/
 # Gemspec-based libraries do not commit their lockfile
 /Gemfile.lock
 .DS_Store

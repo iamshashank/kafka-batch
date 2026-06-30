@@ -69,7 +69,7 @@ RSpec.describe KafkaBatch::Configuration do
 
     it "exposes configurable event-emission retry knobs" do
       expect(config.event_emit_retries).to eq(3)
-      expect(config.event_emit_backoff).to eq(2)
+      expect(config.event_emit_backoff).to eq(1)
     end
 
     it "bounds failure-metadata retention separately from batch_ttl" do
@@ -81,7 +81,7 @@ RSpec.describe KafkaBatch::Configuration do
     it "ships sane fairness-lane defaults (fairness is a per-worker opt-in)" do
       expect(config).not_to respond_to(:fairness_enabled)
       expect(config.fairness_global_concurrency).to eq(50)
-      expect(config.fairness_max_inflight_per_tenant).to eq(0)
+      expect(config.fairness_max_inflight_per_tenant).to eq(3)
       expect(config.fairness_ready_window).to eq(500)
       expect(config.fairness_default_weight).to eq(1.0)
       expect(config.fairness_ingest_topic).to eq("kafka_batch.ingest")
@@ -89,6 +89,26 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.fairness_ready_lag_high).to eq(5000)
       expect(config.fairness_ready_lag_low).to eq(1000)
       expect(config.fairness_min_ingest_partitions).to eq(2)
+    end
+
+    it "defaults fairness_mode to :time_fairness" do
+      expect(config.fairness_mode).to eq(:time_fairness)
+    end
+
+    it "defaults retry_max_pause_seconds to 30 (caps partition pause to ~1 poll cycle)" do
+      expect(config.retry_max_pause_seconds).to eq(30)
+    end
+
+    it "defaults max_message_bytes to 1 MiB (Kafka's typical broker default)" do
+      expect(config.max_message_bytes).to eq(1_048_576)
+    end
+
+    it "defaults liveness_backend to :redis" do
+      expect(config.liveness_backend).to eq(:redis)
+    end
+
+    it "defaults max_reconcile_per_run to 100" do
+      expect(config.max_reconcile_per_run).to eq(100)
     end
   end
 
@@ -113,6 +133,27 @@ RSpec.describe KafkaBatch::Configuration do
       config.store     = :redis
       config.redis_url = ""
       expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /redis_url/)
+    end
+
+    it "accepts :off as a valid liveness_backend" do
+      config.store            = :mysql
+      config.brokers          = ["localhost:9092"]
+      config.liveness_backend = :off
+      expect { config.validate! }.not_to raise_error
+    end
+
+    it "accepts :store as a valid liveness_backend" do
+      config.store            = :mysql
+      config.brokers          = ["localhost:9092"]
+      config.liveness_backend = :store
+      expect { config.validate! }.not_to raise_error
+    end
+
+    it "rejects an unknown liveness_backend" do
+      config.store            = :mysql
+      config.brokers          = ["localhost:9092"]
+      config.liveness_backend = :kafka
+      expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /liveness_backend/)
     end
   end
 end

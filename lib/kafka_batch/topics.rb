@@ -46,7 +46,11 @@ module KafkaBatch
         }
       end
 
-      workers       = KafkaBatch.workers
+      # KafkaBatch.workers is defined by the full backend (kafka_batch.rb).
+      # In UI-only processes (kafka_batch/ui only) the method doesn't exist yet —
+      # treat that as no workers loaded so all infrastructure topics are still
+      # provisioned via the fallback below.
+      workers       = KafkaBatch.respond_to?(:workers) ? KafkaBatch.workers : []
       fair_workers  = workers.select { |w| w.respond_to?(:fairness?) && w.fairness? }
       plain_workers = workers - fair_workers
 

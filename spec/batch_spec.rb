@@ -207,4 +207,59 @@ RSpec.describe KafkaBatch::Batch do
       expect { batch.push(SuccessfulWorker, {}) }.to raise_error(KafkaBatch::BatchClosedError)
     end
   end
+
+  # ── Meta and callback payload propagation ─────────────────────────────────
+  describe "meta hash and callback payload" do
+    it "persists the meta hash and makes it findable" do
+      meta  = { "report_type" => "nightly", "requester" => "ops@example.com" }
+      batch = described_class.create(meta: meta)
+      expect(KafkaBatch.store.find_batch(batch.id)[:meta]).to include(meta)
+    end
+
+    it "carries meta into the callback payload produced at seal time" do
+      # Complete the job INSIDE the block so the batch is drained when seal!
+      # runs on block return — that's when Batch#produce_callback fires.
+      # Completing after seal! does NOT auto-produce a callback (the EventConsumer
+      # pipeline handles that path; the Batch object handles the block-form path).
+      meta  = { "run_id" => "42" }
+      described_class.create(on_complete: "RecordingCallback", meta: meta) do |b|
+        b.push(SuccessfulWorker, {})
+        KafkaBatch.store.record_completion_by_offset(
+          batch_id: b.id, source_topic: "test.success",
+          source_partition: 0, source_offset: 1, status: "success"
+        )
+      end
+      # seal! fires now that the batch is drained; callback produced above.
+
+      cb = FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)
+      expect(cb.last).not_to be_nil
+      expect(cb.last.payload["meta"]).to include("run_id" => "42")
+    end
+
+    it "stores tenant_id on the batch record" do
+      batch = described_class.create(tenant_id: "acme-corp")
+      expect(KafkaBatch.store.find_batch(batch.id)[:tenant_id]).to eq("acme-corp")
+    end
+  end
+
+  # ── push tenant_id override ───────────────────────────────────────────────
+  describe "push with per-job tenant_id" do
+    it "uses batch-level tenant_id for fair workers when no per-job override is given" do
+      batch = described_class.create(tenant_id: "batch-tenant")
+      batch.push(FairWorker, {})
+
+      msg = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic).first
+      expect(msg.key).to eq("batch-tenant")
+      expect(msg.payload["tenant_id"]).to eq("batch-tenant")
+    end
+
+    it "embeds tenant_id in every job message on the fair lane" do
+      batch = described_class.create(tenant_id: "acme")
+      batch.push_many(FairWorker, [{}, {}])
+
+      msgs = FakeProducer.for_topic(KafkaBatch.config.fairness_ingest_topic)
+      expect(msgs.size).to eq(2)
+      expect(msgs.map { |m| m.payload["tenant_id"] }.uniq).to eq(["acme"])
+    end
+  end
 end

@@ -13,7 +13,8 @@
 #   - Web (the Rack dashboard app)
 #
 # Does NOT load: Worker DSL, Batch (creation/push), Producer, consumers,
-# Reconciler, Topics provisioning, Fairness dispatcher/scheduler.
+# Reconciler, Topics provisioning, Fairness::Dispatcher.
+# DOES load: Fairness::Scheduler (Redis-only; needed for the /weights UI).
 #
 # Usage in Gemfile (web service):
 #   gem "kafka-batch", require: "kafka_batch/ui"
@@ -50,6 +51,7 @@ require_relative "lag"
 require_relative "partition"
 require_relative "consumption_control"
 require_relative "cancellation_cache"
+require_relative "fairness/scheduler"
 require_relative "web"
 
 require_relative "railtie" if defined?(Rails::Railtie)
