@@ -152,6 +152,25 @@ module KafkaBatch
     # of the dynamic fair share. 0 = rely on the dynamic share only.
     attr_accessor :fairness_max_inflight_per_tenant # Integer – default 0
 
+    # Active-tenant view — the denominator of the per-tenant fair-share cap.
+    # The raw WFQ ring count (tenants with queued jobs *right now*) flickers as
+    # tenants briefly drain their ready window, which would make caps jump around.
+    # Instead the active count is cached in-process for this TTL and used as a
+    # FLOOR (max with the instantaneous ring), so caps respond immediately to load
+    # increases but don't balloon on transient drains. Source:
+    #   :inflight_plus_ready – (default) distinct tenants with in-flight OR queued
+    #                          work (Redis only; accurate; also yields the weighted
+    #                          weight-sum so weighted concurrency stays smoothed).
+    #   :ingest_lag          – count of ingest partitions with lag > 0 via the
+    #                          Karafka Admin API (reflects Kafka-side backlog;
+    #                          undercounts once the Dispatcher has drained ingest
+    #                          into the Redis window, and can't supply per-tenant
+    #                          weights — weighted mode then falls back to the ring
+    #                          weight sum). Use only if you specifically want the
+    #                          Kafka-backlog notion of "active".
+    attr_accessor :fairness_active_count_ttl     # Integer – seconds; default 5
+    attr_accessor :fairness_active_count_source  # Symbol – default :inflight_plus_ready
+
     # Weighted concurrency. When false (default), every active tenant gets an
     # EQUAL slice of the in-flight window (ceil(global/active)); per-tenant weight
     # then only affects selection ORDER, so it is masked under full saturation.
@@ -259,6 +278,8 @@ module KafkaBatch
       @fairness_global_concurrency      = 50
       @fairness_max_inflight_per_tenant = 0      # 0 = dynamic fair share only (ceil(window/active))
       @fairness_weighted_concurrency    = false  # true = per-tenant cap proportional to weight
+      @fairness_active_count_ttl        = 5      # seconds to cache the smoothed active-tenant count
+      @fairness_active_count_source     = :inflight_plus_ready  # or :ingest_lag
       @fairness_ready_window            = 500    # bounded ready jobs per tenant in Redis
       @fairness_default_weight          = 1.0
       @fairness_weight_cache_ttl        = 60

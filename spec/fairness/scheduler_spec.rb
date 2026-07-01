@@ -102,6 +102,53 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
     end
   end
 
+  describe "smoothed active-tenant view" do
+    it "counts distinct tenants with queued OR in-flight work (not just the ring)" do
+      scheduler.enqueue("A", "a0")   # 1 job each
+      scheduler.enqueue("B", "b0")
+      scheduler.checkout             # A checked out → A's ready list empties → A leaves the ring
+
+      view = scheduler.send(:compute_active_view)
+      # A is in-flight (not in ring), B is queued (in ring) → both count as active.
+      expect(view[:count]).to eq(2)
+    end
+
+    it "uses the cached active count as a cap FLOOR so a lone tenant doesn't balloon" do
+      KafkaBatch.config.fairness_global_concurrency = 8
+      # Pretend 4 tenants are active even though only one has work right now.
+      allow(scheduler).to receive(:active_view).and_return(count: 4, sum_weight: 0.0)
+      10.times { |i| scheduler.enqueue("solo", "s#{i}") }
+
+      # equal cap = ceil(8 / max(ZCARD=1, hint=4)) = ceil(8/4) = 2
+      expect(drain(20).size).to eq(2)
+    end
+
+    it "caches the view within fairness_active_count_ttl (one compute per window)" do
+      t = 0.0
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { t }
+      KafkaBatch.config.fairness_active_count_ttl = 5
+
+      scheduler.enqueue("A", "a0")
+      expect(scheduler).to receive(:compute_active_view).once.and_call_original
+      scheduler.active_view           # computes at t=0
+      t = 3.0
+      scheduler.active_view           # within TTL → cached, no recompute
+    end
+
+    it "supports the :ingest_lag source (counts ingest partitions with lag)" do
+      KafkaBatch.config.fairness_active_count_source = :ingest_lag
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      allow(KafkaBatch::Lag).to receive(:read_group).and_return(
+        KafkaBatch.dispatch_consumer_group => {
+          KafkaBatch.config.fairness_ingest_topic => {
+            0 => { lag: 5 }, 1 => { lag: 0 }, 2 => { lag: 3 }
+          }
+        }
+      )
+      expect(scheduler.send(:compute_active_view)[:count]).to eq(2)  # partitions 0 and 2
+    end
+  end
+
   describe "global concurrency budget" do
     it "stops dispatching at the budget and resumes after complete" do
       KafkaBatch.config.fairness_global_concurrency = 2

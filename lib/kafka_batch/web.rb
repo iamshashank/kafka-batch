@@ -1368,9 +1368,17 @@ module KafkaBatch
       # The interactive "Live" countdown toggle is only meaningful on the batch
       # list (index). Monitoring pages (/live, /lag, /fairness) auto-reload on a
       # fixed 5s timer; other pages (failures, weights, batch detail) are static.
-      live_toggle_button = %(<button id="kb-live-toggle" type="button" class="btn">○ Live</button>)
+      live_toggle_button =
+        is_index ? %(<button id="kb-live-toggle" type="button" class="btn">○ Live</button>) : ""
 
-      foot_script = live_toggle_script
+      foot_script =
+        if is_index
+          live_toggle_script
+        elsif AUTO_RELOAD_PATHS.include?(@path)
+          "<script>setTimeout(function(){ location.reload(); }, 5000)</script>"
+        else
+          ""
+        end
 
       <<~HTML
         <!DOCTYPE html>

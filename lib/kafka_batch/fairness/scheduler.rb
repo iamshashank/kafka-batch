@@ -124,6 +124,8 @@ module KafkaBatch
         local dw       = tonumber(ARGV[4])
         local fetch_n  = tonumber(ARGV[5]) - 1
         local weighted = tonumber(ARGV[6])
+        local ahint    = tonumber(ARGV[7]) or 0   -- smoothed active-tenant count (cached in Ruby)
+        local shint    = tonumber(ARGV[8]) or 0   -- smoothed sum of active weights (cached in Ruby)
 
         local total = tonumber(redis.call('GET', inftot) or '0')
         if budget > 0 and total >= budget then return {0, 'budget'} end
@@ -135,18 +137,26 @@ module KafkaBatch
         --                   full saturation. One active tenant → whole budget
         --                   (work-conserving). The configured cap is an optional
         --                   HARD ceiling layered on top (0 = none).
+        -- active / sum_w use the caller's smoothed hint as a FLOOR (max with the
+        -- instantaneous ring) so caps track the real active set instead of
+        -- flickering as tenants briefly drain. Hint <= 0 → compute from the ring.
         local active = redis.call('ZCARD', ring)
         if active < 1 then active = 1 end
+        if ahint > active then active = ahint end
 
         local sum_w = 0
         if weighted == 1 and budget > 0 then
-          local all = redis.call('ZRANGE', ring, 0, -1)
-          for i = 1, #all do
-            local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
-            if wi == nil or wi <= 0 then wi = dw end
-            sum_w = sum_w + wi
+          if shint > 0 then
+            sum_w = shint
+          else
+            local all = redis.call('ZRANGE', ring, 0, -1)
+            for i = 1, #all do
+              local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
+              if wi == nil or wi <= 0 then wi = dw end
+              sum_w = sum_w + wi
+            end
+            if sum_w <= 0 then sum_w = dw end
           end
-          if sum_w <= 0 then sum_w = dw end
         end
 
         local members = redis.call('ZRANGE', ring, 0, fetch_n)
@@ -209,6 +219,8 @@ module KafkaBatch
         local fetch_n  = tonumber(ARGV[4]) - 1
         local dw       = tonumber(ARGV[5])
         local weighted = tonumber(ARGV[6])
+        local ahint    = tonumber(ARGV[7]) or 0   -- smoothed active-tenant count (cached in Ruby)
+        local shint    = tonumber(ARGV[8]) or 0   -- smoothed sum of active weights (cached in Ruby)
 
         local total = tonumber(redis.call('GET', inftot) or '0')
         if budget > 0 and total >= budget then return {0, 'budget'} end
@@ -219,18 +231,26 @@ module KafkaBatch
         --   weighted == 1 : WEIGHTED share = floor(budget * w_t / sum_active_w),
         --                   min 1 — enforces the intended time distribution even
         --                   under full saturation. Lone tenant → whole budget.
+        -- active / sum_w use the caller's smoothed hint as a FLOOR (max with the
+        -- instantaneous ring) so caps track the real active set instead of
+        -- flickering as tenants briefly drain. Hint <= 0 → compute from the ring.
         local active = redis.call('ZCARD', ring)
         if active < 1 then active = 1 end
+        if ahint > active then active = ahint end
 
         local sum_w = 0
         if weighted == 1 and budget > 0 then
-          local all = redis.call('ZRANGE', ring, 0, -1)
-          for i = 1, #all do
-            local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
-            if wi == nil or wi <= 0 then wi = dw end
-            sum_w = sum_w + wi
+          if shint > 0 then
+            sum_w = shint
+          else
+            local all = redis.call('ZRANGE', ring, 0, -1)
+            for i = 1, #all do
+              local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
+              if wi == nil or wi <= 0 then wi = dw end
+              sum_w = sum_w + wi
+            end
+            if sum_w <= 0 then sum_w = dw end
           end
-          if sum_w <= 0 then sum_w = dw end
         end
 
         local members = redis.call('ZRANGE', ring, 0, fetch_n)
@@ -330,6 +350,8 @@ module KafkaBatch
         @cap              = cfg.fairness_max_inflight_per_tenant.to_i
         @default_weight   = cfg.fairness_default_weight.to_f
         @weighted         = cfg.fairness_weighted_concurrency ? 1 : 0
+        @active_count_ttl    = cfg.fairness_active_count_ttl.to_f
+        @active_count_source = cfg.fairness_active_count_source.to_sym
         @fairness_mode    = cfg.fairness_mode.to_sym   # :time_fairness | :job_count_fairness
         @weight_cache_ttl = cfg.fairness_weight_cache_ttl.to_f
 
@@ -355,6 +377,29 @@ module KafkaBatch
         @weights_mutex    = Mutex.new
         @weights_cache    = nil
         @weights_cache_at = 0.0
+
+        # Process-local smoothed active-tenant view (see active_view).
+        @active_mutex     = Mutex.new
+        @active_view      = nil
+        @active_view_at   = 0.0
+      end
+
+      # Smoothed active-tenant view used as the cap denominator in #checkout.
+      # Returns { count:, sum_weight: }, refreshed at most once per
+      # fairness_active_count_ttl seconds (default 5s) per process so the cap
+      # tracks the real active set instead of the flickering instantaneous ring.
+      # `count` is used as a floor (max with ZCARD(ring)) inside the Lua so it is
+      # responsive to load increases but stable against transient drains.
+      # @return [Hash{count: Integer, sum_weight: Float}]
+      def active_view
+        now = monotonic
+        @active_mutex.synchronize do
+          if @active_view.nil? || (now - @active_view_at) >= @active_count_ttl
+            @active_view    = compute_active_view
+            @active_view_at = now
+          end
+          @active_view
+        end
       end
 
       # Add a job to a tenant's bounded ready window.
@@ -373,15 +418,18 @@ module KafkaBatch
       # nothing ready.
       # @return [Hash{tenant_id:, payload:}, nil]
       def checkout
+        view  = active_view                       # smoothed, cached (see active_view)
+        ahint = view[:count].to_s
+        shint = view[:sum_weight].to_s
         res = with do |r|
           if @fairness_mode == :time_fairness
             r.eval(CHECKOUT_LUA_TIME,
               keys: [RING, INFLIGHT, INFLIGHT_TOTAL, WEIGHT],
-              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @fetch_n.to_s, @default_weight.to_s, @weighted.to_s])
+              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @fetch_n.to_s, @default_weight.to_s, @weighted.to_s, ahint, shint])
           else
             r.eval(CHECKOUT_LUA_COUNT,
               keys: [RING, VTIME, INFLIGHT, INFLIGHT_TOTAL, WEIGHT],
-              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @default_weight.to_s, @fetch_n.to_s, @weighted.to_s])
+              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @default_weight.to_s, @fetch_n.to_s, @weighted.to_s, ahint, shint])
           end
         end
         code, a, b = res
@@ -567,6 +615,53 @@ module KafkaBatch
 
       def bust_weight_cache!
         @weights_mutex.synchronize { @weights_cache_at = 0.0 }
+      end
+
+      # ── Active-tenant view ─────────────────────────────────────────────────
+      # Compute the current active-tenant count (and, for weighted mode, the sum
+      # of their weights). Called at most once per fairness_active_count_ttl.
+      def compute_active_view
+        if @active_count_source == :ingest_lag
+          # Kafka-backlog notion: number of ingest partitions with lag > 0.
+          # Cannot supply per-tenant weights → sum_weight 0 (weighted mode then
+          # falls back to the ring weight sum inside the Lua).
+          { count: ingest_active_count, sum_weight: 0.0 }
+        else
+          # Default: distinct tenants with in-flight OR queued (ready) work.
+          ring_members, inflight = with do |r|
+            r.pipelined do |pipe|
+              pipe.zrange(RING, 0, -1)
+              pipe.hgetall(INFLIGHT)
+            end
+          end
+          active_ids = ring_members.to_a
+          inflight.each { |t, n| active_ids << t if n.to_i > 0 }
+          active_ids.uniq!
+          sum_w = @weighted == 1 ? active_ids.sum { |t| weight_for(t) } : 0.0
+          { count: active_ids.size, sum_weight: sum_w }
+        end
+      rescue => e
+        KafkaBatch.logger.warn("[KafkaBatch][Scheduler] active_view compute failed: #{e.message}")
+        { count: 0, sum_weight: 0.0 }
+      end
+
+      # Count of ingest-topic partitions with lag > 0 (≈ tenants with Kafka-side
+      # backlog). Requires the Karafka Admin API; returns 0 if unavailable.
+      def ingest_active_count
+        return 0 unless defined?(KafkaBatch::Lag) && KafkaBatch::Lag.available?
+
+        group = KafkaBatch.dispatch_consumer_group
+        topic = KafkaBatch.config.fairness_ingest_topic
+        data  = KafkaBatch::Lag.read_group(group, [topic])
+        parts = (data[group] || {})[topic] || {}
+        parts.values.count { |i| i[:lag].to_i > 0 }
+      rescue => e
+        KafkaBatch.logger.warn("[KafkaBatch][Scheduler] ingest_active_count failed: #{e.message}")
+        0
+      end
+
+      def monotonic
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
       end
 
       # ── Weight backend helpers ────────────────────────────────────────────────
