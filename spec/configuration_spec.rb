@@ -81,14 +81,41 @@ RSpec.describe KafkaBatch::Configuration do
     it "ships sane fairness-lane defaults (fairness is a per-worker opt-in)" do
       expect(config).not_to respond_to(:fairness_enabled)
       expect(config.fairness_global_concurrency).to eq(50)
-      expect(config.fairness_max_inflight_per_tenant).to eq(3)
       expect(config.fairness_ready_window).to eq(500)
       expect(config.fairness_default_weight).to eq(1.0)
       expect(config.fairness_ingest_topic).to eq("kafka_batch.ingest")
       expect(config.fairness_ready_topic).to eq("kafka_batch.ready")
-      expect(config.fairness_ready_lag_high).to eq(5000)
-      expect(config.fairness_ready_lag_low).to eq(1000)
       expect(config.fairness_min_ingest_partitions).to eq(2)
+    end
+
+    it "defaults fairness_max_inflight_per_tenant to 0 (dynamic fair share only)" do
+      expect(config.fairness_max_inflight_per_tenant).to eq(0)
+    end
+
+    it "derives all topic names and the consumer group from topic_prefix" do
+      config.topic_prefix = "myapp"
+      expect(config.jobs_topic).to eq("myapp.kafka_batch.jobs")
+      expect(config.events_topic).to eq("myapp.kafka_batch.events")
+      expect(config.callbacks_topic).to eq("myapp.kafka_batch.callbacks")
+      expect(config.dead_letter_topic).to eq("myapp.kafka_batch.dead_letter")
+      expect(config.retry_topic).to eq("myapp.kafka_batch.jobs.retry")
+      expect(config.consumer_group).to eq("myapp.kafka-batch")
+      expect(config.fairness_ingest_topic).to eq("myapp.kafka_batch.ingest")
+      expect(config.fairness_ready_topic).to eq("myapp.kafka_batch.ready")
+      expect(config.fast_p0_topic).to eq("myapp.kafka_batch.jobs.fast_p0")
+    end
+
+    it "lets an explicit topic name override the prefix" do
+      config.topic_prefix = "myapp"
+      config.jobs_topic   = "custom.jobs"
+      expect(config.jobs_topic).to eq("custom.jobs")
+      expect(config.events_topic).to eq("myapp.kafka_batch.events")  # others still derived
+    end
+
+    it "uses bare (unprefixed) names when topic_prefix is empty" do
+      expect(config.topic_prefix).to eq("")
+      expect(config.jobs_topic).to eq("kafka_batch.jobs")
+      expect(config.consumer_group).to eq("kafka-batch")
     end
 
     it "defaults fairness_mode to :time_fairness" do
@@ -142,17 +169,10 @@ RSpec.describe KafkaBatch::Configuration do
       expect { config.validate! }.not_to raise_error
     end
 
-    it "accepts :store as a valid liveness_backend" do
-      config.store            = :mysql
-      config.brokers          = ["localhost:9092"]
-      config.liveness_backend = :store
-      expect { config.validate! }.not_to raise_error
-    end
-
     it "rejects an unknown liveness_backend" do
       config.store            = :mysql
       config.brokers          = ["localhost:9092"]
-      config.liveness_backend = :kafka
+      config.liveness_backend = :store   # :store was removed — Redis is mandatory
       expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /liveness_backend/)
     end
   end

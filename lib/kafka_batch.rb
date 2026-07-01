@@ -15,6 +15,7 @@ require_relative "kafka_batch/producer"
 require_relative "kafka_batch/consumers/consumption_gate"
 require_relative "kafka_batch/topics"
 require_relative "kafka_batch/fairness/scheduler"
+require_relative "kafka_batch/fairness/forwarder"
 require_relative "kafka_batch/fairness/dispatcher"
 require_relative "kafka_batch/worker"
 require_relative "kafka_batch/batch"
@@ -116,7 +117,17 @@ module KafkaBatch
 
         if any_fair
           consumer_group "#{cfg.consumer_group}-dispatch" do
-            topic(cfg.fairness_ingest_topic) { consumer KafkaBatch::Fairness::Dispatcher }
+            # Karafka OSS concurrency is global (Karafka::App.config.concurrency).
+            # On the dispatch process, set it >= config.fairness_dispatcher_concurrency
+            # so multiple ingest partitions can forward in parallel.
+
+            topic(cfg.fairness_ingest_topic) do
+              consumer KafkaBatch::Fairness::Dispatcher
+              # Bound how many ingest messages the Dispatcher drains into the
+              # Redis WFQ window per consume call. Fairness ordering is done by
+              # the Scheduler/Forwarder, not by this batch size.
+              max_messages cfg.fairness_dispatcher_batch_size
+            end
           end
           consumer_group "#{cfg.consumer_group}-jobs-fair" do
             topic(cfg.fairness_ready_topic) { consumer KafkaBatch::Consumers::JobConsumer }
@@ -172,6 +183,34 @@ module KafkaBatch
 
       logger.info("[KafkaBatch] All #{required.size} required topics verified.")
       validate_fairness_partitions!(strict: true)
+      warn_dispatcher_concurrency!
+    end
+
+    # Karafka concurrency is a top-level app setting (not settable per consumer
+    # group from within draw_routes). Warn at boot if it looks too low for the
+    # dispatch group to forward all active partitions in parallel.
+    def warn_dispatcher_concurrency!
+      return unless fairness?
+      return unless defined?(Karafka::App)
+
+      karafka_concurrency =
+        begin
+          Karafka::App.config.concurrency.to_i
+        rescue StandardError
+          nil
+        end
+      return if karafka_concurrency.nil?
+
+      needed = config.fairness_dispatcher_concurrency.to_i
+      return if karafka_concurrency >= needed
+
+      logger.warn(
+        "[KafkaBatch] Karafka concurrency=#{karafka_concurrency} is lower than " \
+        "config.fairness_dispatcher_concurrency=#{needed}. " \
+        "Ingest partitions will be processed sequentially instead of in parallel, " \
+        "which breaks per-tenant fairness under load. " \
+        "Set `config.concurrency = #{needed}` (or higher) in your karafka.rb."
+      )
     end
 
     def validate_fairness_partitions!(strict: config.validate_topics_on_boot)
@@ -205,6 +244,7 @@ module KafkaBatch
       CancellationCache.reset!
       Liveness.reset!
       ConsumptionControl.reset!
+      Fairness::Forwarder.stop! if defined?(Fairness::Forwarder)
     end
 
     private

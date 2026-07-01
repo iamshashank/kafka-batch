@@ -350,4 +350,53 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
       expect(FakeProducer.for_topic(KafkaBatch.config.dead_letter_topic).size).to eq(1)
     end
   end
+
+  # ── Fair-lane in-flight slot release (Scheduler#complete) ──────────────────
+  describe "fair-lane slot release" do
+    let(:scheduler) { instance_double(KafkaBatch::Fairness::Scheduler) }
+
+    before do
+      allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
+      allow(scheduler).to receive(:complete)
+    end
+
+    def fair_message(worker:, tenant:, batch_id: nil, attempt: 0, job_id: "j1")
+      FakeMessage.new(
+        topic:   KafkaBatch.config.fairness_ready_topic,
+        offset:  1,
+        payload: {
+          "job_id"       => job_id,
+          "batch_id"     => batch_id,
+          "worker_class" => worker.name,
+          "payload"      => {},
+          "attempt"      => attempt,
+          "max_retries"  => worker.max_retries,
+          "tenant_id"    => tenant,
+          "_fair_slot"   => true
+        }
+      )
+    end
+
+    it "releases the tenant's slot with a duration after a successful fair job" do
+      consumer.send(:process_message, fair_message(worker: SuccessfulWorker, tenant: "acme"))
+      expect(scheduler).to have_received(:complete).with("acme", hash_including(:duration)).once
+    end
+
+    it "releases the slot when a fair job fails and is scheduled for retry" do
+      consumer.send(:process_message, fair_message(worker: FailingWorker, tenant: "globex", attempt: 0))
+      expect(scheduler).to have_received(:complete).with("globex", hash_including(:duration)).once
+    end
+
+    it "strips _fair_slot from the retry message so it is not released twice" do
+      consumer.send(:process_message, fair_message(worker: FailingWorker, tenant: "globex", job_id: "jx"))
+      retried = retry_for("jx")
+      expect(retried).not_to be_nil
+      expect(retried.payload).not_to have_key("_fair_slot")
+    end
+
+    it "does NOT call complete for a plain (non-fair) message" do
+      consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: "b1"))
+      expect(scheduler).not_to have_received(:complete)
+    end
+  end
 end

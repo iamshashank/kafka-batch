@@ -82,7 +82,7 @@ module KafkaBatch
         say "   - fairness_mode  (:time_fairness or :job_count_fairness)\n"
         say "   - max_message_bytes  (1 MiB default; match your broker limit)\n"
         say "   - reconciliation_interval / max_reconcile_per_run\n"
-        say "   - liveness_backend  (:redis / :store / :off)\n"
+        say "   - liveness_backend  (:redis / :off)\n"
         if @store == "redis"
           say "   - redis_url / redis_pool_size / batch_ttl\n"
           say "   - all_index_max_size  (batch list page history cap)\n"

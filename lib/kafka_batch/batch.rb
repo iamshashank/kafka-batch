@@ -148,6 +148,10 @@ module KafkaBatch
       fair     = worker_class.fairness?
       topic    = fair ? KafkaBatch.config.fairness_ingest_topic : worker_class.kafka_topic
 
+      # Resolve explicit partition once for the whole batch (all messages share
+      # the same tenant_id, so the partition is constant across the batch).
+      explicit_partition = fair ? KafkaBatch.tenant_ingest_partition(tid) : nil
+
       job_ids  = []
       messages = payloads.map do |payload|
         job_id  = SecureRandom.uuid
@@ -156,10 +160,17 @@ module KafkaBatch
           worker_class: worker_class, payload: payload,
           job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid
         )
-        # Fairness: key by tenant so one partition per tenant in the ingest topic.
-        # Normal: key by job_id for even partition spread.
-        key = fair ? (tid || @id).to_s : job_id
-        { topic: topic, payload: message, key: key }
+        if fair
+          if explicit_partition
+            # Explicit map: bypass partitioner — partition number is definitive.
+            { topic: topic, payload: message, partition: explicit_partition }
+          else
+            # Key-hash fallback: murmur2_random ensures widget and producer agree.
+            { topic: topic, payload: message, key: (tid || @id).to_s }
+          end
+        else
+          { topic: topic, payload: message, key: job_id }
+        end
       end
 
       begin
@@ -207,11 +218,20 @@ module KafkaBatch
         job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id
       )
       if worker_class.fairness?
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.fairness_ingest_topic,
-          payload: message,
-          key:     (tenant_id || job_id).to_s
-        )
+        explicit_partition = KafkaBatch.tenant_ingest_partition(tenant_id)
+        if explicit_partition
+          KafkaBatch::Producer.produce_sync(
+            topic:     KafkaBatch.config.fairness_ingest_topic,
+            payload:   message,
+            partition: explicit_partition
+          )
+        else
+          KafkaBatch::Producer.produce_sync(
+            topic:   KafkaBatch.config.fairness_ingest_topic,
+            payload: message,
+            key:     (tenant_id || job_id).to_s
+          )
+        end
       else
         KafkaBatch::Producer.produce_sync(
           topic: worker_class.kafka_topic, payload: message, key: job_id
@@ -296,13 +316,20 @@ module KafkaBatch
       )
 
       if worker_class.fairness?
-        # Land on the ingest topic keyed by tenant (per-tenant ordering); the
-        # Dispatcher fairly schedules from there onto the ready topic.
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.fairness_ingest_topic,
-          payload: message,
-          key:     (tenant_id || @id).to_s
-        )
+        explicit_partition = KafkaBatch.tenant_ingest_partition(tenant_id)
+        if explicit_partition
+          KafkaBatch::Producer.produce_sync(
+            topic:     KafkaBatch.config.fairness_ingest_topic,
+            payload:   message,
+            partition: explicit_partition
+          )
+        else
+          KafkaBatch::Producer.produce_sync(
+            topic:   KafkaBatch.config.fairness_ingest_topic,
+            payload: message,
+            key:     (tenant_id || @id).to_s
+          )
+        end
       else
         KafkaBatch::Producer.produce_sync(
           topic: worker_class.kafka_topic, payload: message, key: job_id

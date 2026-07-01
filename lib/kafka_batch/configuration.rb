@@ -8,21 +8,41 @@ module KafkaBatch
     # ── Kafka connection ─────────────────────────────────────────────────────
     attr_accessor :brokers          # Array<String>  e.g. ["localhost:9092"]
 
-    # ── Topic names ──────────────────────────────────────────────────────────
-    attr_accessor :jobs_topic       # String  default: "kafka_batch.jobs"
-    attr_accessor :events_topic     # String  default: "kafka_batch.events"
-    attr_accessor :callbacks_topic  # String  default: "kafka_batch.callbacks"
-    attr_accessor :dead_letter_topic # String  default: "kafka_batch.dead_letter"
+    # ── Topic namespace ────────────────────────────────────────────────────────
+    # All KafkaBatch topic names AND the consumer group derive from this prefix
+    # unless set explicitly. e.g. `config.topic_prefix = "myapp"` →
+    # "myapp.kafka_batch.jobs" and consumer group "myapp.kafka-batch". Default: "".
+    attr_reader :topic_prefix
 
-    # ── Retry topic ──────────────────────────────────────────────────────────
-    # Failed jobs are forwarded here with a retry_after timestamp instead of
-    # sleeping inside the job consumer (which would block the Kafka partition).
-    # The RetryConsumer waits via Karafka pause() then re-enqueues to the
-    # original topic.
-    attr_accessor :retry_topic       # String  default: "kafka_batch.jobs.retry"
+    def topic_prefix=(value)
+      @topic_prefix = value.to_s.strip
+    end
 
-    # ── Consumer ─────────────────────────────────────────────────────────────
-    attr_accessor :consumer_group   # String
+    # Prefix-aware name settings. Each getter derives "<prefix>.<base>" from
+    # topic_prefix; assigning a value overrides it verbatim (no prefix applied).
+    # Defaults (empty prefix) are the bare base names below.
+    PREFIXED_SETTINGS = {
+      jobs_topic:            "kafka_batch.jobs",        # shared default worker topic
+      events_topic:          "kafka_batch.events",      # completion events
+      callbacks_topic:       "kafka_batch.callbacks",   # batch callbacks
+      dead_letter_topic:     "kafka_batch.dead_letter", # exhausted / poison jobs
+      retry_topic:           "kafka_batch.jobs.retry",  # base; per-tier is <this>.short/.medium/.large
+      consumer_group:        "kafka-batch",             # base consumer group (suffixed -control/-dispatch/…)
+      fairness_ingest_topic: "kafka_batch.ingest",      # durable per-tenant intake (fairness)
+      fairness_ready_topic:  "kafka_batch.ready",       # fairly-ordered execution queue (fairness)
+      fast_p0_topic:         "kafka_batch.jobs.fast_p0",
+      fast_p1_topic:         "kafka_batch.jobs.fast_p1",
+      slow_p0_topic:         "kafka_batch.jobs.slow_p0",
+      slow_p1_topic:         "kafka_batch.jobs.slow_p1"
+    }.freeze
+
+    PREFIXED_SETTINGS.each do |name, base|
+      define_method(name) do
+        v = instance_variable_get(:"@#{name}")
+        v.nil? ? prefixed(base) : v
+      end
+      define_method(:"#{name}=") { |val| instance_variable_set(:"@#{name}", val) }
+    end
 
     # ── Cancellation ─────────────────────────────────────────────────────────
     # When true, JobConsumer skips execution of jobs whose batch was cancelled.
@@ -34,17 +54,14 @@ module KafkaBatch
     attr_accessor :cancellation_cache_ttl  # Integer – seconds; default 120
 
     # ── Liveness (running jobs / consumers dashboard) ─────────────────────────
-    # Visibility into currently-running jobs and live consumer processes.
-    #   :redis – (default) full per-job tracking in Redis (config.redis_url),
-    #            short TTL, best-effort. Most detailed; needs Redis.
-    #   :store – consumer heartbeat + sampled "current job" in the configured
-    #            store (e.g. MySQL). Bounded, low-impact (writes scale with
-    #            consumers, NOT job throughput); reliable via last_seen + sweep.
+    # Visibility into currently-running jobs and live consumer processes. Backed
+    # by Redis (config.redis_url), which is a required dependency of the gem.
+    #   :redis – (default) full per-job + per-consumer tracking in Redis, short
+    #            TTL, best-effort behind a circuit breaker.
     #   :off   – disabled.
     attr_accessor :liveness_backend            # Symbol – default :redis
     attr_accessor :track_running_jobs          # Boolean – default true (gates :redis writes)
     attr_accessor :liveness_ttl                # Integer – seconds; default 30 (staleness window)
-    attr_accessor :liveness_heartbeat_interval # Integer – seconds; default 5 (:store write throttle)
 
     # ── Consumption pause/resume (/lag dashboard) ─────────────────────────────
     # Karafka consumers reload pause state from Redis (or MySQL when store is
@@ -64,7 +81,6 @@ module KafkaBatch
     # Maximum single pause duration (seconds) in RetryConsumer. When a retry is
     # further in the future than this, the consumer pauses for this long and then
     # re-checks, so the partition is never suspended for an extreme duration.
-    # Previously this was a hardcoded constant (MAX_PAUSE_SECONDS = 30).
     attr_accessor :retry_max_pause_seconds # Integer – default 30
 
     # After this many retries a still-failing job counts toward its batch's
@@ -78,163 +94,154 @@ module KafkaBatch
     # ── Completion-event emission retries ────────────────────────────────────
     # After a job succeeds, the consumer produces a completion event. If that
     # produce fails (transient Kafka issue) it is retried inline before giving
-    # up and leaving the offset uncommitted for redelivery. These tune that
-    # inline retry. NOTE: the backoff sleeps on the Karafka worker thread, so
-    # keep the product (retries * backoff) modest.
+    # up and leaving the offset uncommitted for redelivery. The backoff sleeps on
+    # the Karafka worker thread, so keep (retries * backoff) modest.
     attr_accessor :event_emit_retries  # Integer – attempts; default 3
     attr_accessor :event_emit_backoff  # Integer – seconds; linear: attempt * backoff
 
-    # ── Redis (only when store: :redis) ─────────────────────────────────────
+    # ── Redis ────────────────────────────────────────────────────────────────
+    # Redis is a REQUIRED dependency (fairness scheduler + liveness). The :redis
+    # store also keeps all batch state here.
     attr_accessor :redis_url        # String  e.g. "redis://localhost:6379/0"
     attr_accessor :redis_pool_size  # Integer
 
-    # ── TTL for batch metadata in Redis ─────────────────────────────────────
+    # ── TTL for batch metadata in Redis (:redis store) ──────────────────────
     attr_accessor :batch_ttl        # Integer – seconds; default 7 days
 
-    # ── Batch index sizing (Redis store) ────────────────────────────────────
-    # Maximum number of batch IDs kept in the ALL_INDEX ZSET used by the web
-    # UI.  When the cap is reached the oldest entries are evicted automatically
-    # so the ZSET never grows unbounded.  Increase if you need a longer
-    # dashboard history; at 500 pods × 1 batch/min × 7-day TTL the natural
-    # size would be ~5 M entries — this cap keeps it practical.
+    # Maximum number of batch IDs kept in the ALL_INDEX ZSET used by the web UI
+    # (:redis store). Oldest entries are evicted when the cap is reached so the
+    # ZSET never grows unbounded.
     attr_accessor :all_index_max_size  # Integer – default 200_000
 
-    # ── Failure metadata retention (Redis store) ────────────────────────────
-    # Failure records are only a convenience view for the dashboard – the real
-    # job data is durable in Kafka (retry topic / dead-letter topic). To bound
-    # Redis RAM you can keep this metadata for less time and/or cap how many
-    # failing jobs are tracked per batch. When the cap is hit, additional NEW
-    # failing jobs are not recorded (existing ones still update); the feature
-    # keeps working, you just may not see every failure in the UI.
+    # ── Failure metadata retention ───────────────────────────────────────────
+    # Failure records are only a dashboard convenience – the real job data is
+    # durable in Kafka (retry / dead-letter topics). Redis auto-expires via
+    # failures_ttl; MySQL relies on the reconciler purge. max_failures_per_batch
+    # caps how many failing jobs are tracked per batch (0 = unlimited).
     attr_accessor :failures_ttl              # Integer – seconds; default 1 day
     attr_accessor :max_failures_per_batch    # Integer – 0 = unlimited; default 1000
 
-    # ── Multi-tenant fairness (Kafka-only; NO Redis required) ────────────────
+    # ── Multi-tenant fairness (Redis-backed WFQ; Redis REQUIRED) ─────────────
     # Fairness is a PER-WORKER property (`fairness true` on the Worker class) —
     # there is no global enable switch. When a worker opts in, capacity is shared
-    # dynamically across tenants — one active tenant uses 100%, N split ~1/N
-    # (work-conserving, approximate) — using only Kafka (ingest topic → Dispatcher
-    # → ready topic → JobConsumer swarm). The durable backlog stays in Kafka.
-    # The settings below configure that lane (shared by all fair workers).
+    # dynamically across tenants via a Redis Weighted-Fair-Queuing scheduler:
+    # one active tenant uses 100%, N split ~1/N (work-conserving), weighted by
+    # per-tenant weight. Flow:
     #
-    # The settings below apply ONLY to the optional Redis-backed
-    # KafkaBatch::Fairness::Scheduler (strict weighted shares), NOT the default
-    # dispatcher, which uses the ingest/ready topics + watermarks above.
+    #   Batch.push → ingest topic (durable backlog, keyed by tenant)
+    #     → Fairness::Dispatcher   (enqueue into the bounded Redis WFQ window)
+    #     → Fairness::Forwarder     (checkout the fairest job; concurrency-gated;
+    #                                forward to the ready topic)
+    #     → ready topic → JobConsumer swarm → perform → Scheduler#complete
 
-    # Fairness accounting mode for the Redis Scheduler:
-    #   :time_fairness      – (recommended) vtime advances at *completion* by
-    #                         actual_job_seconds / weight. Tenants that consistently
-    #                         submit long jobs (20-60s) are correctly charged for the
-    #                         wall-clock time they consume. Fair per-hour slot-time.
-    #   :job_count_fairness – (original) vtime advances by 1/weight at *dispatch*.
-    #                         Fair over dispatch count, not duration. Simpler; fine
-    #                         when all tenants' jobs have similar runtimes.
-    # Default: :time_fairness. In :time_fairness mode, callers must pass
-    # `duration:` to Scheduler#complete so the actual run time is recorded.
+    # Fairness accounting mode (the REAL, active fairness behaviour):
+    #   :time_fairness      – (default) vtime advances at *completion* by
+    #                         actual_job_seconds / weight. Fair weighted wall-clock
+    #                         time; correct for uneven runtimes (e.g. 20-60s jobs).
+    #   :job_count_fairness – vtime advances by 1/weight at *checkout*. Fair over
+    #                         dispatched job count; use when runtimes are similar.
     attr_accessor :fairness_mode                    # Symbol – default :time_fairness
 
-    # How long (seconds) each dispatcher process caches the full tenant-weight
-    # map fetched from Redis. Updates written via the weights UI propagate to all
-    # dispatchers within this window. Lower values = faster propagation but more
-    # Redis HGETALL calls. 60s is a good balance for a settings-page workflow.
+    # Global in-flight window: max jobs forwarded to the ready topic but not yet
+    # completed. Bounds ready-topic depth (keeps fairness dynamic) AND total
+    # fair-lane concurrency. The per-tenant share is derived dynamically as
+    # ceil(this / active_tenants): 1 active tenant → full window; N → window/N.
+    attr_accessor :fairness_global_concurrency      # Integer – default 50
+
+    # Optional HARD ceiling on a single tenant's in-flight jobs, layered on top
+    # of the dynamic fair share. 0 = rely on the dynamic share only.
+    attr_accessor :fairness_max_inflight_per_tenant # Integer – default 0
+
+    # Weighted concurrency. When false (default), every active tenant gets an
+    # EQUAL slice of the in-flight window (ceil(global/active)); per-tenant weight
+    # then only affects selection ORDER, so it is masked under full saturation.
+    # When true, each active tenant's in-flight cap is proportional to its weight:
+    #   cap_t = floor(fairness_global_concurrency * weight_t / Σ active weights)
+    # (min 1), so a weight-50 tenant runs ~50× the concurrency of a weight-1
+    # tenant even when all tenants are saturated — enforcing the intended
+    # job/time distribution, not just competing for slack. Still work-conserving:
+    # a lone active tenant's slice equals the whole window. Costs one O(active)
+    # weight sum per checkout (negligible at tens/low-hundreds of active tenants).
+    # NOTE: custom weights must be visible to the Redis WFQ Lua — set_weight
+    # mirrors them to Redis for both :redis and :mysql weight backends.
+    attr_accessor :fairness_weighted_concurrency    # Boolean – default false
+
+    # Bounded per-tenant staging window in Redis. When full the Dispatcher pauses
+    # the ingest partition (backpressure) so the durable backlog stays in Kafka.
+    attr_accessor :fairness_ready_window            # Integer – default 500
+    attr_accessor :fairness_default_weight          # Numeric – default 1.0
+
+    # How long each process caches the tenant-weight map from Redis; weight
+    # changes written via the /weights UI propagate within this window.
     attr_accessor :fairness_weight_cache_ttl        # Integer – seconds; default 60
 
-    attr_accessor :fairness_global_concurrency      # Integer – (Scheduler) total in-flight slots; default 50
-    attr_accessor :fairness_max_inflight_per_tenant # Integer – (Scheduler) per-tenant cap; 0 = none (default)
-    attr_accessor :fairness_ready_window            # Integer – (Scheduler) bounded ready jobs/tenant in Redis; default 500
-    attr_accessor :fairness_default_weight          # Numeric – (Scheduler) default share weight; default 1.0
+    # How long the Forwarder sleeps when a checkout yields nothing (idle / window
+    # full) before polling the scheduler again.
+    attr_accessor :fairness_forwarder_idle_sleep    # Float – seconds; default 0.05
 
-    # Kafka-ready-topic design: jobs land on the ingest topic (keyed
-    # one-tenant-per-partition); a Dispatcher forwards them onto the ready topic
-    # which a swarm of normal JobConsumers drains. The dispatcher throttles so the
-    # ready topic's un-consumed depth stays between the low/high watermarks (this
-    # is what keeps fairness dynamic). No Redis on the path.
-    attr_accessor :fairness_ingest_topic   # String – default "kafka_batch.ingest"
-    attr_accessor :fairness_ready_topic    # String – default "kafka_batch.ready"
-    attr_accessor :fairness_ready_lag_high # Integer – pause forwarding above this; default 5000
-    attr_accessor :fairness_ready_lag_low  # Integer – resume forwarding below this; default 1000
+    # Explicit tenant → ingest-partition map. When a tenant_id is present, jobs
+    # are produced directly to that partition (bypassing the hash partitioner).
+    # Out-of-range values fall back to key-hash (murmur2_random). Default {}.
+    attr_accessor :fairness_tenant_partitions       # Hash{String => Integer}
 
-    # Tenants are spread across the ingest topic's partitions by key hash
-    # (key = tenant_id). With too few partitions tenants collide onto the same
-    # partition and fairness degrades (1 partition = none at all). The boot check
-    # warns (or raises under validate_topics_on_boot) if the ingest topic has
-    # fewer partitions than this. Set it near your max concurrent tenant count.
-    attr_accessor :fairness_min_ingest_partitions # Integer – default 2
+    # Max ingest messages the Dispatcher drains into the Redis window per consume
+    # call (wired as Karafka `max_messages`). Fairness ordering is done by the
+    # scheduler, not this batch size.
+    attr_accessor :fairness_dispatcher_batch_size   # Integer – default 50
+
+    # Expected Karafka concurrency on the dispatch process. Boot-warning hint
+    # only (Karafka OSS concurrency is global; set it in karafka.rb).
+    attr_accessor :fairness_dispatcher_concurrency  # Integer – default 5
+
+    # Tenants spread across the ingest topic's partitions by key hash. With too
+    # few partitions tenants collide and fairness degrades. The boot check warns
+    # (or raises under validate_topics_on_boot) if the ingest topic has fewer.
+    attr_accessor :fairness_min_ingest_partitions   # Integer – default 2
 
     # ── Priority queues (non-fair, 4-topic 2-group design) ───────────────────
-    # Two independently-scalable consumer groups:
-    #   fast-group – short-running jobs; p1 yields briefly when p0 has lag
-    #                (weighted: p0 gets priority but p1 never starves)
-    #   slow-group – long-running jobs; p1 pauses entirely when p0 has lag
-    #                (strict: no new p1 jobs while p0 backlog exists)
-    #
-    # Workers opt in by setting kafka_topic to one of these four topic names.
-    # fairness true always takes precedence over kafka_topic.
-    attr_accessor :fast_p0_topic  # default "kafka_batch.jobs.fast_p0"
-    attr_accessor :fast_p1_topic  # default "kafka_batch.jobs.fast_p1"
-    attr_accessor :slow_p0_topic  # default "kafka_batch.jobs.slow_p0"
-    attr_accessor :slow_p1_topic  # default "kafka_batch.jobs.slow_p1"
-
-    # How often (seconds) p1 consumers re-check p0 lag. Smaller = faster p0
-    # response, more Admin API calls. Default 2.
+    # Workers opt in by setting kafka_topic to one of the fast_*/slow_* topic
+    # names (above, prefix-aware). fairness true always takes precedence.
+    #   fast-group – p1 yields briefly when p0 has lag (weighted priority)
+    #   slow-group – p1 pauses entirely while p0 has lag (strict priority)
+    # How often (seconds) p1 consumers re-check p0 lag.
     attr_accessor :priority_lag_check_interval  # Integer – default 2
 
     # ── Reconciliation ───────────────────────────────────────────────────────
-    # A periodic sweep that re-checks "running" batches that look stuck.
+    # A periodic sweep (inside the EventConsumer) that re-checks stuck "running"
+    # batches and recovers lost callbacks.
     attr_accessor :reconciliation_interval  # Integer – seconds; default 300
-
-    # Max time a single reconciler sweep is expected to take. Used purely as
-    # the distributed-lock TTL so a crashed reconciler eventually releases the
-    # lock. Kept independent of the staleness threshold above.
+    # Distributed-lock TTL so a crashed reconciler eventually releases the lock.
     attr_accessor :reconciler_lock_ttl      # Integer – seconds; default 600
-
-    # Maximum number of batches the reconciler will process per run (across
-    # both stuck-running and lost-callback categories combined independently).
-    # During an incident, thousands of batches can become stale simultaneously;
-    # without a cap the reconciler holds the distributed lock for minutes and
-    # produces a callback burst that overwhelms downstream consumers.
-    # The next reconciler tick will handle the remainder.
+    # Max batches processed per sweep (caps callback bursts during incidents).
     attr_accessor :max_reconcile_per_run    # Integer – default 100
 
     # ── Producer safety ──────────────────────────────────────────────────────
-    # Raise a clear ProducerError when an encoded payload exceeds this size so
-    # the caller gets an actionable error instead of an opaque rdkafka failure.
-    # Default 1 MiB (Kafka's typical broker-side message.max.bytes default).
-    # Set to 0 or nil to disable the guard.
-    attr_accessor :max_message_bytes  # Integer – default 1_048_576 (1 MiB); 0 = disabled
+    # Raise a clear ProducerError when an encoded payload exceeds this size.
+    # Default 1 MiB (Kafka's typical message.max.bytes). 0/nil disables the guard.
+    attr_accessor :max_message_bytes  # Integer – default 1_048_576
 
     # ── Passthrough rdkafka config ───────────────────────────────────────────
-    # Merged on top of defaults for the producer.
-    attr_accessor :producer_config  # Hash<String, Object>
-
-    # Merged on top of defaults for every consumer.
-    attr_accessor :consumer_config  # Hash<String, Object>
+    attr_accessor :producer_config  # Hash – merged on top of producer defaults
+    attr_accessor :consumer_config  # Hash – merged on top of consumer defaults
 
     # ── Topic validation ─────────────────────────────────────────────────────
-    # When true, KafkaBatch verifies that all configured topics exist in Kafka
-    # during Rails boot (requires a working broker connection at startup).
-    # Disabled by default to avoid blocking startup in test/CI environments.
-    attr_accessor :validate_topics_on_boot  # Boolean  default: false
+    # When true, verify all configured topics exist in Kafka during boot
+    # (requires a broker connection at startup). Disabled by default.
+    attr_accessor :validate_topics_on_boot  # Boolean – default false
 
     # ── Logging ──────────────────────────────────────────────────────────────
     attr_accessor :logger
 
     def initialize
       @store                    = :mysql
+      @topic_prefix             = ""
+      @brokers                  = ["localhost:9092"]
       @skip_cancelled_jobs      = true
       @cancellation_cache_ttl   = 120
-      @liveness_backend            = :redis
-      @track_running_jobs          = true
-      @liveness_ttl                = 30
-      @liveness_heartbeat_interval = 5
+      @liveness_backend         = :redis
+      @track_running_jobs       = true
+      @liveness_ttl             = 30
       @consumption_control_refresh_interval = 60
-      @brokers                  = ["localhost:9092"]
-      @jobs_topic               = "kafka_batch.jobs"
-      @events_topic             = "kafka_batch.events"
-      @callbacks_topic          = "kafka_batch.callbacks"
-      @dead_letter_topic        = "kafka_batch.dead_letter"
-      @retry_topic              = "kafka_batch.jobs.retry"
-      @consumer_group           = "kafka-batch"
       @max_retries              = 3
       @retry_jitter             = 0.1  # +/- 10%
       @retry_tiers              = { short: 30, medium: 7 * 60, large: 20 * 60 }
@@ -242,29 +249,24 @@ module KafkaBatch
       @retry_max_pause_seconds  = 30
       @complete_after_retries   = 3    # == max_retries default → no early completion by default
       @event_emit_retries       = 3
-      @event_emit_backoff       = 1  # #17: reduced from 2 → 1 to limit inline sleep on consumer thread
+      @event_emit_backoff       = 1
       @redis_url                = "redis://localhost:6379/0"
       @redis_pool_size          = 5
       @batch_ttl                = 7 * 24 * 3600  # 7 days
       @failures_ttl             = 24 * 3600      # 1 day (metadata only; Kafka is the source of truth)
       @max_failures_per_batch   = 1000           # cap tracked failing jobs per batch (0 = unlimited)
       @fairness_mode                    = :time_fairness
-      @fairness_weight_cache_ttl        = 60
       @fairness_global_concurrency      = 50
-      @fairness_max_inflight_per_tenant = 3     # cap per-tenant concurrency; prevents one slow
-                                                # tenant monopolising all slots for 20-60s in
-                                                # time_fairness mode. Set 0 to disable.
-      @fairness_ready_window            = 500   # bounded ready jobs per tenant in Redis
+      @fairness_max_inflight_per_tenant = 0      # 0 = dynamic fair share only (ceil(window/active))
+      @fairness_weighted_concurrency    = false  # true = per-tenant cap proportional to weight
+      @fairness_ready_window            = 500    # bounded ready jobs per tenant in Redis
       @fairness_default_weight          = 1.0
-      @fairness_ingest_topic            = "kafka_batch.ingest"
-      @fairness_ready_topic             = "kafka_batch.ready"
-      @fairness_ready_lag_high          = 5000
-      @fairness_ready_lag_low           = 1000
+      @fairness_weight_cache_ttl        = 60
+      @fairness_forwarder_idle_sleep    = 0.05
+      @fairness_tenant_partitions       = {}
+      @fairness_dispatcher_batch_size   = 50
+      @fairness_dispatcher_concurrency  = 5
       @fairness_min_ingest_partitions   = 2
-      @fast_p0_topic              = "kafka_batch.jobs.fast_p0"
-      @fast_p1_topic              = "kafka_batch.jobs.fast_p1"
-      @slow_p0_topic              = "kafka_batch.jobs.slow_p0"
-      @slow_p1_topic              = "kafka_batch.jobs.slow_p1"
       @priority_lag_check_interval = 2
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600
@@ -314,13 +316,46 @@ module KafkaBatch
       raise ConfigurationError, "store must be :mysql or :redis" unless %i[mysql redis].include?(@store)
       raise ConfigurationError, "brokers must not be empty"       if Array(@brokers).empty?
 
-      unless %i[redis store off].include?(@liveness_backend)
-        raise ConfigurationError, "liveness_backend must be :redis, :store, or :off"
+      unless %i[redis off].include?(@liveness_backend)
+        raise ConfigurationError, "liveness_backend must be :redis or :off"
       end
 
-      if @store == :redis
-        raise ConfigurationError, "redis_url must be set for :redis store" if @redis_url.nil? || @redis_url.empty?
+      # Redis is a HARD dependency: the multi-tenant fairness scheduler (WFQ ring,
+      # in-flight counters, per-tenant ready windows) lives entirely in Redis, and
+      # it drives the default fairness path. redis_url must always be set.
+      if @redis_url.nil? || @redis_url.to_s.empty?
+        raise ConfigurationError,
+          "redis_url must be set — Redis is required by KafkaBatch (multi-tenant " \
+          "fairness scheduler + liveness). Set config.redis_url."
       end
+
+      unless %i[time_fairness job_count_fairness].include?(@fairness_mode.to_sym)
+        raise ConfigurationError,
+          "fairness_mode must be :time_fairness or :job_count_fairness (got #{@fairness_mode.inspect})"
+      end
+
+      # In time-fairness mode vtime only advances at completion, so a tenant is
+      # kept from seizing the whole in-flight window by the dynamic fair-share
+      # cap (ceil(global_concurrency / active_tenants)). That requires a finite
+      # global window; if BOTH the window is unbounded (global_concurrency <= 0)
+      # AND no hard per-tenant cap is set, a single tenant could monopolise.
+      if @fairness_mode.to_sym == :time_fairness &&
+         @fairness_global_concurrency.to_i <= 0 &&
+         @fairness_max_inflight_per_tenant.to_i <= 0
+        raise ConfigurationError,
+          ":time_fairness requires either fairness_global_concurrency > 0 " \
+          "(recommended — enables the dynamic fair-share cap) or " \
+          "fairness_max_inflight_per_tenant > 0. Otherwise a single tenant can " \
+          "monopolise the in-flight window (vtime only advances at completion)."
+      end
+    end
+
+    private
+
+    # Apply topic_prefix to a base name: "" → base, "myapp" → "myapp.base".
+    def prefixed(base)
+      p = @topic_prefix.to_s.strip
+      p.empty? ? base : "#{p}.#{base}"
     end
   end
 end

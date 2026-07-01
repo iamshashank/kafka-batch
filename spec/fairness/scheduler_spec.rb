@@ -59,6 +59,49 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
     end
   end
 
+  describe "weighted concurrency (fairness_weighted_concurrency)" do
+    # Full saturation = check out up to the budget WITHOUT completing, so every
+    # tenant is backlogged and the per-tenant cap (not selection order) decides
+    # the split. This is the scenario where plain weights are masked.
+    before do
+      KafkaBatch.config.fairness_global_concurrency      = 8
+      KafkaBatch.config.fairness_max_inflight_per_tenant = 0
+    end
+
+    it "enforces weight-proportional in-flight caps under saturation when enabled" do
+      KafkaBatch.config.fairness_weighted_concurrency = true
+      scheduler.set_weight("A", 3.0)
+      scheduler.set_weight("B", 1.0)
+      20.times { |i| scheduler.enqueue("A", "a#{i}") }
+      20.times { |i| scheduler.enqueue("B", "b#{i}") }
+
+      counts = drain(20).map { |j| j[:tenant_id] }.tally  # bounded to budget = 8
+      expect(counts.values.sum).to eq(8)
+      expect(counts["A"]).to eq(6)   # floor(8 * 3/4)
+      expect(counts["B"]).to eq(2)   # floor(8 * 1/4)
+    end
+
+    it "masks weight under saturation when disabled (equal fair share)" do
+      KafkaBatch.config.fairness_weighted_concurrency = false
+      scheduler.set_weight("A", 3.0)
+      scheduler.set_weight("B", 1.0)
+      20.times { |i| scheduler.enqueue("A", "a#{i}") }
+      20.times { |i| scheduler.enqueue("B", "b#{i}") }
+
+      counts = drain(20).map { |j| j[:tenant_id] }.tally
+      expect(counts["A"]).to eq(4)   # equal dynamic cap ceil(8/2) = 4
+      expect(counts["B"]).to eq(4)
+    end
+
+    it "still lets a lone active tenant use the whole budget (work-conserving)" do
+      KafkaBatch.config.fairness_weighted_concurrency = true
+      scheduler.set_weight("A", 3.0)
+      20.times { |i| scheduler.enqueue("A", "a#{i}") }
+
+      expect(drain(20).size).to eq(8)  # sum_w == 3 → cap = floor(8*3/3) = 8
+    end
+  end
+
   describe "global concurrency budget" do
     it "stops dispatching at the budget and resumes after complete" do
       KafkaBatch.config.fairness_global_concurrency = 2
@@ -72,7 +115,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
   end
 
   describe "per-tenant in-flight cap" do
-    it "won't exceed the cap for a tenant even with budget available" do
+    it "won't exceed the configured hard cap for a tenant even with budget available" do
       KafkaBatch.config.fairness_max_inflight_per_tenant = 1
       3.times { |i| scheduler.enqueue("A", "a#{i}") }
 
@@ -80,6 +123,31 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       expect(scheduler.checkout).to be_nil       # capped at 1 in-flight
       scheduler.complete("A")
       expect(scheduler.checkout).not_to be_nil   # freed
+    end
+  end
+
+  describe "dynamic fair-share concurrency (work-conserving)" do
+    before do
+      KafkaBatch.config.fairness_max_inflight_per_tenant = 0  # no hard ceiling
+      KafkaBatch.config.fairness_global_concurrency      = 6
+    end
+
+    it "lets a lone active tenant use the entire global budget" do
+      10.times { |i| scheduler.enqueue("A", "a#{i}") }
+      # active_tenants == 1 → dynamic cap == budget (6). All 6 slots to A.
+      expect(drain(10).size).to eq(6)
+      expect(scheduler.checkout).to be_nil  # budget exhausted, not a per-tenant cap
+    end
+
+    it "splits the budget fairly across tenants (budget/N each)" do
+      10.times { |i| scheduler.enqueue("A", "a#{i}") }
+      10.times { |i| scheduler.enqueue("B", "b#{i}") }
+      # active_tenants == 2 → dynamic cap == ceil(6/2) == 3 per tenant.
+      picked = drain(10)
+      counts = picked.map { |j| j[:tenant_id] }.tally
+      expect(picked.size).to eq(6)          # total budget
+      expect(counts["A"]).to eq(3)
+      expect(counts["B"]).to eq(3)
     end
   end
 

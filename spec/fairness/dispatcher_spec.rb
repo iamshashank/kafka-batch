@@ -1,58 +1,67 @@
 RSpec.describe KafkaBatch::Fairness::Dispatcher do
   let(:consumer) { build_consumer(described_class) }
+  let(:scheduler) { instance_double(KafkaBatch::Fairness::Scheduler) }
 
   before do
-    KafkaBatch.config.fairness_ready_topic    = "test.ready"
-    KafkaBatch.config.fairness_ready_lag_high = 100
-    KafkaBatch.config.fairness_ready_lag_low  = 10
+    KafkaBatch.config.fairness_ingest_topic = "test.ingest"
+    # Isolate from any real forwarder thread / scheduler.
+    allow(KafkaBatch::Fairness::Forwarder).to receive(:ensure_running!)
+    allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
   end
 
-  def msg(offset:, tenant: "A", job_id: "j#{offset}")
-    FakeMessage.new(
-      topic:   KafkaBatch.config.fairness_ingest_topic,
-      offset:  offset,
-      payload: { "job_id" => job_id, "tenant_id" => tenant, "worker_class" => "W", "payload" => {} }
-    )
+  def msg(offset:, tenant: "A", job_id: "j#{offset}", batch_id: nil)
+    payload = { "job_id" => job_id, "worker_class" => "W", "payload" => {} }
+    payload["tenant_id"] = tenant if tenant
+    payload["batch_id"]  = batch_id if batch_id
+    FakeMessage.new(topic: KafkaBatch.config.fairness_ingest_topic, offset: offset, payload: payload)
   end
 
-  it "forwards ingest jobs to the ready topic verbatim when not throttled" do
-    allow(consumer).to receive(:cached_ready_lag).and_return(0)
-    m = [msg(offset: 1, job_id: "j1"), msg(offset: 2, job_id: "j2")]
+  it "starts the forwarder and enqueues each ingest job into the scheduler keyed by tenant" do
+    m = [msg(offset: 1, tenant: "acme"), msg(offset: 2, tenant: "globex")]
     allow(consumer).to receive(:messages).and_return(m)
+    allow(scheduler).to receive(:enqueue).and_return(:ok)
 
     consumer.consume
 
-    produced = FakeProducer.for_topic("test.ready")
-    expect(produced.size).to eq(2)
-    expect(produced.first.payload).to eq(m[0].raw_payload)  # raw bytes unchanged
-    expect(produced.first.key).to eq("j1")                  # spread by job_id
-    expect(consumer).to have_received(:mark_as_consumed!).with(m[1])
+    expect(KafkaBatch::Fairness::Forwarder).to have_received(:ensure_running!)
+    expect(scheduler).to have_received(:enqueue).with("acme",   m[0].raw_payload)
+    expect(scheduler).to have_received(:enqueue).with("globex", m[1].raw_payload)
+    expect(consumer).to have_received(:mark_as_consumed!).with(m[1])  # last committed
   end
 
-  it "pauses and forwards nothing while the ready topic is too deep" do
-    allow(consumer).to receive(:cached_ready_lag).and_return(100)  # >= high watermark
+  it "applies backpressure (pause + partial commit) when a tenant window is full" do
+    m = [msg(offset: 1, tenant: "acme"), msg(offset: 2, tenant: "acme"), msg(offset: 3, tenant: "acme")]
+    allow(consumer).to receive(:messages).and_return(m)
+    # First enqueue ok, second reports the window is full.
+    allow(scheduler).to receive(:enqueue).and_return(:ok, :full)
+
+    consumer.consume
+
+    expect(consumer).to have_received(:mark_as_consumed!).with(m[0])       # progress committed
+    expect(consumer).to have_received(:pause).with(2, kind_of(Integer))    # retry from the full msg
+    # The third message must NOT have been enqueued (we bailed out).
+    expect(scheduler).to have_received(:enqueue).twice
+  end
+
+  it "falls back to batch_id then job_id when tenant_id is absent" do
+    m = [msg(offset: 1, tenant: nil, batch_id: "batch-7"), msg(offset: 2, tenant: nil, batch_id: nil, job_id: "solo")]
+    allow(consumer).to receive(:messages).and_return(m)
+    allow(scheduler).to receive(:enqueue).and_return(:ok)
+
+    consumer.consume
+
+    expect(scheduler).to have_received(:enqueue).with("batch-7", m[0].raw_payload)
+    expect(scheduler).to have_received(:enqueue).with("solo",    m[1].raw_payload)
+  end
+
+  it "pauses without committing when the scheduler is unavailable" do
+    allow(KafkaBatch).to receive(:scheduler).and_return(nil)
     m = [msg(offset: 5)]
     allow(consumer).to receive(:messages).and_return(m)
 
     consumer.consume
 
-    expect(FakeProducer.for_topic("test.ready")).to be_empty
     expect(consumer).to have_received(:pause).with(5, kind_of(Integer))
-  end
-
-  it "hysteresis: stays paused until the depth falls below the low watermark" do
-    allow(consumer).to receive(:messages).and_return([msg(offset: 1)])
-
-    allow(consumer).to receive(:cached_ready_lag).and_return(150)  # above high → throttle
-    consumer.consume
-    expect(FakeProducer.for_topic("test.ready")).to be_empty
-
-    allow(consumer).to receive(:cached_ready_lag).and_return(50)   # between → still throttled
-    consumer.consume
-    expect(FakeProducer.for_topic("test.ready")).to be_empty
-
-    allow(consumer).to receive(:cached_ready_lag).and_return(5)    # below low → resume
-    consumer.consume
-    expect(FakeProducer.for_topic("test.ready").size).to eq(1)
+    expect(consumer).not_to have_received(:mark_as_consumed!)
   end
 end

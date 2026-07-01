@@ -139,7 +139,7 @@ RSpec.describe KafkaBatch::Reconciler do
         )
       end
 
-      # Allow any other warn calls (heartbeat sweep etc.) without failing.
+      # Allow any other warn calls without failing.
       allow(KafkaBatch.logger).to receive(:warn)
       expect(KafkaBatch.logger).to receive(:warn).with(/processing first 1/i)
       described_class.run

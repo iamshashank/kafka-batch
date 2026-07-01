@@ -77,17 +77,23 @@ module KafkaBatch
 
     # ── Fairness Scheduler singleton ──────────────────────────────────────
 
-    # Returns the process-wide Fairness::Scheduler instance, or nil when Redis
-    # is not configured or Scheduler is not loaded (e.g. UI-only deployments
-    # that don't require `kafka_batch/fairness/scheduler`).
-    # Thread-safe via double-checked locking (same pattern as #store).
+    # Returns the process-wide Fairness::Scheduler instance. Redis is a hard
+    # dependency of the gem (see Configuration#validate!), so this is expected to
+    # be available in any full-backend process. Returns nil only when the
+    # Scheduler class is not loaded (e.g. a UI-only process that requires
+    # `kafka_batch/ui` but never `kafka_batch/fairness/scheduler`) or if init
+    # genuinely fails — callers on the fairness path treat nil as fatal.
+    # Thread-safe via double-checked locking (same pattern as #store). Because
+    # Redis is mandatory, a nil result means "not built yet / transient build
+    # failure", so we rebuild on the next call rather than caching the nil
+    # (caching nil would make reset! — or a momentary Redis blip at boot —
+    # permanently disable fairness for the process).
     def scheduler
-      return @scheduler if instance_variable_defined?(:@scheduler)
+      return @scheduler if @scheduler
       scheduler_mutex.synchronize do
-        return @scheduler if instance_variable_defined?(:@scheduler)
+        return @scheduler if @scheduler
         @scheduler =
-          if defined?(Fairness::Scheduler) &&
-             config.redis_url && !config.redis_url.to_s.empty?
+          if defined?(Fairness::Scheduler)
             begin
               Fairness::Scheduler.new
             rescue => e
@@ -166,6 +172,42 @@ module KafkaBatch
       return nil if count.nil? || count.zero?
 
       Partition.for_key(tenant_id.to_s, count)
+    end
+
+    # Returns the explicit ingest partition for a tenant, or nil to fall back
+    # to key-hash partitioning.
+    #
+    # Resolution order:
+    #   1. config.fairness_tenant_partitions[tenant_id] — explicit map wins
+    #   2. nil → caller uses murmur2_random key-hash (partition: not set)
+    #
+    # The configured value is validated against the actual partition count so a
+    # mis-configured entry (e.g. partition 11 on an 8-partition topic) never
+    # causes a broker error — it silently falls back to murmur2_random instead.
+    def tenant_ingest_partition(tenant_id)
+      return nil if tenant_id.nil?
+
+      map = config.fairness_tenant_partitions
+      return nil if map.nil? || map.empty?
+
+      configured = map[tenant_id.to_s]
+      return nil if configured.nil?
+
+      n = configured.to_i
+
+      # Bounds-check: reject if out of range for the actual topic.
+      # On failure to read count we let the configured value through — the broker
+      # will error if it's truly invalid and the caller will see a ProducerError.
+      count = fairness_ingest_partition_count
+      if count && n >= count
+        logger.warn(
+          "[KafkaBatch] fairness_tenant_partitions[#{tenant_id}]=#{n} is out of range " \
+          "(topic has #{count} partitions). Falling back to key-hash."
+        )
+        return nil
+      end
+
+      n
     end
 
     # Lazily configure Karafka with the minimum settings needed for

@@ -133,25 +133,6 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#list_all_failures"
       end
 
-      # ── Liveness (:store backend) ────────────────────────────────────────────
-      # Upsert a consumer process heartbeat (one row per consumer_id). +data+ is
-      # a hash of: hostname, pid, topic, current_job_id, current_worker,
-      # current_batch_id, current_topic, current_partition, jobs_done.
-      def record_heartbeat(consumer_id, data)
-        raise NotImplementedError, "#{self.class}#record_heartbeat"
-      end
-
-      # Active consumer heartbeats with last_seen >= +since+ (a Time).
-      # @return [Array<Hash>]
-      def list_heartbeats(since)
-        raise NotImplementedError, "#{self.class}#list_heartbeats"
-      end
-
-      # Delete heartbeats older than +older_than+ (a Time). Returns count.
-      def sweep_stale_heartbeats(older_than)
-        raise NotImplementedError, "#{self.class}#sweep_stale_heartbeats"
-      end
-
       # List batches newest-first for the admin UI.
       # @param status [String, nil] optional status filter
       # @param limit  [Integer]

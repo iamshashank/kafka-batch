@@ -56,6 +56,22 @@ module KafkaBatch
         batch_id      = data["batch_id"]
         payload       = data["payload"] || {}
 
+        # Fair-lane bookkeeping: a message forwarded by Fairness::Forwarder carries
+        # "_fair_slot" => true and a tenant_id. It holds exactly one Scheduler
+        # in-flight slot (fairness_global_concurrency / per-tenant cap) that MUST
+        # be released via Scheduler#complete exactly once when we finish with the
+        # message — whether it succeeds, is scheduled for retry, is DLT'd, or is
+        # skipped (cancelled). In :time_fairness mode complete also advances the
+        # tenant's virtual time by (duration / weight). Retried messages have the
+        # marker stripped (see schedule_retry), so they never double-release.
+        fair_slot     = data["_fair_slot"] ? true : false
+        fair_tenant   = data["tenant_id"]
+        fair_started  = nil  # set right before perform so duration reflects run time
+
+        # Everything below runs inside begin/ensure so the fair-lane in-flight
+        # slot is released exactly once on every exit path (success, retry, DLT,
+        # cancel, unknown worker).
+        begin
         # Resolve the worker class. An unknown/renamed class is a poison pill:
         # without handling it here the ArgumentError would bubble up, the offset
         # would never commit, and Karafka would redeliver forever (blocking the
@@ -117,6 +133,7 @@ module KafkaBatch
         )
 
         started_at = Time.now
+        fair_started = started_at
 
         begin
           # ── Step 1: execute the job ────────────────────────────────────
@@ -177,6 +194,31 @@ module KafkaBatch
         ensure
           KafkaBatch::Liveness.job_finished(job_id)
         end
+        ensure
+          # Release the WFQ in-flight slot for fair-lane messages. In
+          # :time_fairness mode this also advances the tenant's vtime by
+          # (duration / weight); in :job_count_fairness vtime already advanced at
+          # checkout and duration is ignored.
+          if fair_slot
+            dur = fair_started ? (Time.now - fair_started) : 0.0
+            release_fair_slot(fair_tenant, dur)
+          end
+        end
+      end
+
+      # Release one Scheduler in-flight slot held by a fair-lane ready message.
+      # Best-effort: a Redis hiccup here must never break job processing (the
+      # slot self-heals — a stuck slot is only a soft concurrency undercount and
+      # can be reset via Scheduler#reset!).
+      def release_fair_slot(tenant_id, duration)
+        return unless tenant_id && !tenant_id.to_s.empty?
+        sched = KafkaBatch.scheduler
+        return unless sched
+        sched.complete(tenant_id, duration: duration)
+      rescue StandardError => e
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][JobConsumer] fair slot release failed for tenant=#{tenant_id}: #{e.message}"
+        )
       end
 
       # ── Failure handling ─────────────────────────────────────────────────
@@ -260,14 +302,21 @@ module KafkaBatch
           "attempt=#{next_attempt} tier=#{tier} at #{retry_after.iso8601}"
         )
 
+        # Strip "_fair_slot": the current pass releases its Scheduler in-flight
+        # slot in the outer ensure. The retried message re-enters the ready topic
+        # WITHOUT holding a slot, so it must not trigger a second (spurious)
+        # Scheduler#complete when it runs.
+        retry_payload = data.merge(
+          "attempt"       => next_attempt,
+          "retry_after"   => retry_after.iso8601,
+          "retry_to"      => message.topic,
+          "batch_counted" => batch_counted
+        )
+        retry_payload.delete("_fair_slot")
+
         KafkaBatch::Producer.produce_sync(
           topic:   KafkaBatch.config.retry_topic_for(tier),
-          payload: data.merge(
-            "attempt"       => next_attempt,
-            "retry_after"   => retry_after.iso8601,
-            "retry_to"      => message.topic,
-            "batch_counted" => batch_counted
-          ),
+          payload: retry_payload,
           key: job_id
         )
 

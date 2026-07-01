@@ -38,16 +38,6 @@ module KafkaBatch
         end
       end
 
-      def heartbeat_class
-        @heartbeat_class ||= begin
-          klass = Class.new(ActiveRecord::Base)
-          klass.table_name        = "kafka_batch_consumer_heartbeats"
-          klass.primary_key       = "consumer_id"
-          klass.inheritance_column = nil
-          klass
-        end
-      end
-
       def consumption_pause_class
         @consumption_pause_class ||= begin
           klass = Class.new(ActiveRecord::Base)
@@ -319,45 +309,6 @@ module KafkaBatch
         failures_scope(scope, limit, offset, include_batch_id: true)
       end
 
-      # ── Liveness (:store backend) ────────────────────────────────────────────
-
-      # #13 fix: replace SELECT + conditional INSERT/UPDATE (with unbounded retry)
-      # with a single-statement INSERT … ON DUPLICATE KEY UPDATE via Rails upsert.
-      # Eliminates the SELECT round-trip, the create/update race window, and the
-      # bare `retry` that had no cap and could spin indefinitely under contention.
-      def record_heartbeat(consumer_id, data)
-        attrs = data.slice(
-          :hostname, :pid, :topic, :current_job_id, :current_worker,
-          :current_batch_id, :current_topic, :current_partition, :jobs_done
-        ).merge(last_seen: Time.now, consumer_id: consumer_id)
-
-        # heartbeat_class.primary_key == "consumer_id", so upsert conflicts on it.
-        heartbeat_class.upsert(attrs)
-      rescue NotImplementedError
-        # Fallback for ActiveRecord versions that don't support upsert (< 6.0).
-        retries = 0
-        begin
-          attrs_no_pk = attrs.except(:consumer_id)
-          rec = heartbeat_class.find_by(consumer_id: consumer_id)
-          rec ? rec.update!(attrs_no_pk) : heartbeat_class.create!(attrs)
-        rescue ActiveRecord::RecordNotUnique
-          retries += 1
-          retry if retries < 3
-          KafkaBatch.logger.error(
-            "[KafkaBatch][MysqlStore] record_heartbeat upsert fallback failed after " \
-            "#{retries} retries for consumer_id=#{consumer_id}"
-          )
-        end
-      end
-
-      def list_heartbeats(since)
-        heartbeat_class.where("last_seen >= ?", since).order(last_seen: :desc).map { |r| heartbeat_to_hash(r) }
-      end
-
-      def sweep_stale_heartbeats(older_than)
-        heartbeat_class.where("last_seen < ?", older_than).delete_all
-      end
-
       # ── Consumption pause/resume (/lag dashboard) ─────────────────────────────
 
       TOPIC_PAUSE_PARTITION = -1
@@ -524,22 +475,6 @@ module KafkaBatch
 
       def counts_mutex
         @counts_mutex ||= Mutex.new
-      end
-
-      def heartbeat_to_hash(r)
-        {
-          consumer_id:       r.consumer_id,
-          hostname:          r.hostname,
-          pid:               r.pid,
-          topic:             r.topic,
-          current_job_id:    r.current_job_id,
-          current_worker:    r.current_worker,
-          current_batch_id:  r.current_batch_id,
-          current_topic:     r.current_topic,
-          current_partition: r.current_partition,
-          jobs_done:         r.jobs_done,
-          last_seen:         r.last_seen
-        }
       end
 
       def failures_scope(scope, limit, offset, include_batch_id: false)

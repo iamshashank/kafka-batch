@@ -111,26 +111,64 @@ module KafkaBatch
       # successful checkout — acceptable since the Lua call is already one
       # Redis round-trip).
       # ARGV[5] = fetch_n (bounded scan depth; avoids full ZRANGE on large rings)
+      # ARGV[6] = weighted (1 = weight-proportional per-tenant cap, 0 = equal share)
       CHECKOUT_LUA_COUNT = <<~LUA.freeze
-        local ring    = KEYS[1]
-        local vth     = KEYS[2]
-        local inf     = KEYS[3]
-        local inftot  = KEYS[4]
-        local wh      = KEYS[5]
-        local budget  = tonumber(ARGV[1])
-        local cap     = tonumber(ARGV[2])
-        local rprefix = ARGV[3]
-        local dw      = tonumber(ARGV[4])
-        local fetch_n = tonumber(ARGV[5]) - 1
+        local ring     = KEYS[1]
+        local vth      = KEYS[2]
+        local inf      = KEYS[3]
+        local inftot   = KEYS[4]
+        local wh       = KEYS[5]
+        local budget   = tonumber(ARGV[1])
+        local cap      = tonumber(ARGV[2])
+        local rprefix  = ARGV[3]
+        local dw       = tonumber(ARGV[4])
+        local fetch_n  = tonumber(ARGV[5]) - 1
+        local weighted = tonumber(ARGV[6])
 
         local total = tonumber(redis.call('GET', inftot) or '0')
         if budget > 0 and total >= budget then return {0, 'budget'} end
+
+        -- Per-tenant in-flight cap.
+        --   weighted == 0 : EQUAL dynamic fair share = ceil(budget / active).
+        --   weighted == 1 : WEIGHTED share = floor(budget * w_t / sum_active_w),
+        --                   min 1, so caps enforce the intended ratio even under
+        --                   full saturation. One active tenant → whole budget
+        --                   (work-conserving). The configured cap is an optional
+        --                   HARD ceiling layered on top (0 = none).
+        local active = redis.call('ZCARD', ring)
+        if active < 1 then active = 1 end
+
+        local sum_w = 0
+        if weighted == 1 and budget > 0 then
+          local all = redis.call('ZRANGE', ring, 0, -1)
+          for i = 1, #all do
+            local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
+            if wi == nil or wi <= 0 then wi = dw end
+            sum_w = sum_w + wi
+          end
+          if sum_w <= 0 then sum_w = dw end
+        end
 
         local members = redis.call('ZRANGE', ring, 0, fetch_n)
         for i = 1, #members do
           local t   = members[i]
           local tin = tonumber(redis.call('HGET', inf, t) or '0')
-          if cap == 0 or tin < cap then
+
+          local eff_cap = 0
+          if budget > 0 then
+            if weighted == 1 then
+              local w_t = tonumber(redis.call('HGET', wh, t) or dw)
+              if w_t == nil or w_t <= 0 then w_t = dw end
+              eff_cap = math.floor(budget * w_t / sum_w)
+              if eff_cap < 1 then eff_cap = 1 end
+            else
+              eff_cap = math.ceil(budget / active)
+              if eff_cap < 1 then eff_cap = 1 end
+            end
+          end
+          if cap > 0 and (eff_cap == 0 or cap < eff_cap) then eff_cap = cap end
+
+          if eff_cap == 0 or tin < eff_cap then
             local rk  = rprefix .. t
             local job = redis.call('LPOP', rk)
             if job then
@@ -158,24 +196,63 @@ module KafkaBatch
       # Vtime is NOT advanced at dispatch — that happens at completion
       # (COMPLETE_LUA_TIME) using the actual job duration. The ring ordering
       # reflects accumulated slot-time consumed, not dispatch count.
-      # Fewer KEYS/ARGV needed (no weight lookup at dispatch).
+      # WEIGHT hash (KEYS[4]) + dw (ARGV[5]) are used only for the weighted cap.
+      # ARGV[6] = weighted (1 = weight-proportional per-tenant cap, 0 = equal share)
       CHECKOUT_LUA_TIME = <<~LUA.freeze
-        local ring    = KEYS[1]
-        local inf     = KEYS[2]
-        local inftot  = KEYS[3]
-        local budget  = tonumber(ARGV[1])
-        local cap     = tonumber(ARGV[2])
-        local rprefix = ARGV[3]
-        local fetch_n = tonumber(ARGV[4]) - 1
+        local ring     = KEYS[1]
+        local inf      = KEYS[2]
+        local inftot   = KEYS[3]
+        local wh       = KEYS[4]
+        local budget   = tonumber(ARGV[1])
+        local cap      = tonumber(ARGV[2])
+        local rprefix  = ARGV[3]
+        local fetch_n  = tonumber(ARGV[4]) - 1
+        local dw       = tonumber(ARGV[5])
+        local weighted = tonumber(ARGV[6])
 
         local total = tonumber(redis.call('GET', inftot) or '0')
         if budget > 0 and total >= budget then return {0, 'budget'} end
+
+        -- Per-tenant in-flight cap. In time mode vtime only advances at
+        -- completion, so this cap is what interleaves tenants:
+        --   weighted == 0 : EQUAL fair share = ceil(budget / active).
+        --   weighted == 1 : WEIGHTED share = floor(budget * w_t / sum_active_w),
+        --                   min 1 — enforces the intended time distribution even
+        --                   under full saturation. Lone tenant → whole budget.
+        local active = redis.call('ZCARD', ring)
+        if active < 1 then active = 1 end
+
+        local sum_w = 0
+        if weighted == 1 and budget > 0 then
+          local all = redis.call('ZRANGE', ring, 0, -1)
+          for i = 1, #all do
+            local wi = tonumber(redis.call('HGET', wh, all[i]) or dw)
+            if wi == nil or wi <= 0 then wi = dw end
+            sum_w = sum_w + wi
+          end
+          if sum_w <= 0 then sum_w = dw end
+        end
 
         local members = redis.call('ZRANGE', ring, 0, fetch_n)
         for i = 1, #members do
           local t   = members[i]
           local tin = tonumber(redis.call('HGET', inf, t) or '0')
-          if cap == 0 or tin < cap then
+
+          local eff_cap = 0
+          if budget > 0 then
+            if weighted == 1 then
+              local w_t = tonumber(redis.call('HGET', wh, t) or dw)
+              if w_t == nil or w_t <= 0 then w_t = dw end
+              eff_cap = math.floor(budget * w_t / sum_w)
+              if eff_cap < 1 then eff_cap = 1 end
+            else
+              eff_cap = math.ceil(budget / active)
+              if eff_cap < 1 then eff_cap = 1 end
+            end
+          end
+          if cap > 0 and (eff_cap == 0 or cap < eff_cap) then eff_cap = cap end
+
+          if eff_cap == 0 or tin < eff_cap then
             local rk  = rprefix .. t
             local job = redis.call('LPOP', rk)
             if job then
@@ -252,6 +329,7 @@ module KafkaBatch
         @budget           = cfg.fairness_global_concurrency.to_i
         @cap              = cfg.fairness_max_inflight_per_tenant.to_i
         @default_weight   = cfg.fairness_default_weight.to_f
+        @weighted         = cfg.fairness_weighted_concurrency ? 1 : 0
         @fairness_mode    = cfg.fairness_mode.to_sym   # :time_fairness | :job_count_fairness
         @weight_cache_ttl = cfg.fairness_weight_cache_ttl.to_f
 
@@ -298,12 +376,12 @@ module KafkaBatch
         res = with do |r|
           if @fairness_mode == :time_fairness
             r.eval(CHECKOUT_LUA_TIME,
-              keys: [RING, INFLIGHT, INFLIGHT_TOTAL],
-              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @fetch_n.to_s])
+              keys: [RING, INFLIGHT, INFLIGHT_TOTAL, WEIGHT],
+              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @fetch_n.to_s, @default_weight.to_s, @weighted.to_s])
           else
             r.eval(CHECKOUT_LUA_COUNT,
               keys: [RING, VTIME, INFLIGHT, INFLIGHT_TOTAL, WEIGHT],
-              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @default_weight.to_s, @fetch_n.to_s])
+              argv: [@budget.to_s, @cap.to_s, READY_PREFIX, @default_weight.to_s, @fetch_n.to_s, @weighted.to_s])
           end
         end
         code, a, b = res
@@ -531,6 +609,10 @@ module KafkaBatch
             VALUES (#{qt}, #{qw}, #{qnow})
             ON DUPLICATE KEY UPDATE weight = VALUES(weight), updated_at = VALUES(updated_at)
           SQL
+          # Mirror to the Redis WEIGHT hash so the WFQ Lua (checkout) can read the
+          # weight directly. Without this, weighting (selection order AND weighted
+          # concurrency) would silently no-op on the MySQL backend. Best-effort.
+          mirror_weight_to_redis(tenant_id, weight)
         else
           with { |r| r.hset(WEIGHT, tenant_id, weight) }
         end
@@ -543,12 +625,28 @@ module KafkaBatch
       def remove_weight_from_backend(tenant_id)
         if mysql_weight_backend?
           weight_record_class.where(tenant_id: tenant_id).delete_all
+          mirror_weight_delete_to_redis(tenant_id)
         else
           with { |r| r.hdel(WEIGHT, tenant_id) }
         end
       rescue => e
         KafkaBatch.logger.error("[KafkaBatch][Scheduler] remove_weight failed for #{tenant_id}: #{e.message}")
         raise
+      end
+
+      # Mirror a custom weight into the Redis WEIGHT hash (MySQL backend only, so
+      # the Lua can read it). Failures are logged, not fatal — the durable value
+      # is already in MySQL.
+      def mirror_weight_to_redis(tenant_id, weight)
+        with { |r| r.hset(WEIGHT, tenant_id, weight) }
+      rescue => e
+        KafkaBatch.logger.warn("[KafkaBatch][Scheduler] weight Redis mirror failed for #{tenant_id}: #{e.message}")
+      end
+
+      def mirror_weight_delete_to_redis(tenant_id)
+        with { |r| r.hdel(WEIGHT, tenant_id) }
+      rescue => e
+        KafkaBatch.logger.warn("[KafkaBatch][Scheduler] weight Redis unmirror failed for #{tenant_id}: #{e.message}")
       end
 
       # Anonymous ActiveRecord model for kafka_batch_tenant_weights.

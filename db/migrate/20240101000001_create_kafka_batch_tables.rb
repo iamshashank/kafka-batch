@@ -6,7 +6,6 @@ class CreateKafkaBatchTables < ActiveRecord::Migration[6.0]
   #   kafka_batch_records              – one row per batch (the core ledger)
   #   kafka_batch_consumer_offsets     – offset deduplication (offset_inbox mode)
   #   kafka_batch_failures             – per-job failure tracking for the dashboard
-  #   kafka_batch_consumer_heartbeats  – live consumer view (liveness_backend: :store)
   #   kafka_batch_consumption_pauses   – pause/resume state (store: :mysql fallback)
   #   kafka_batch_tenant_weights       – per-tenant WFQ weight overrides (store: :mysql)
   def change
@@ -123,31 +122,6 @@ class CreateKafkaBatchTables < ActiveRecord::Migration[6.0]
     # list_all_failures: ORDER BY failed_at DESC (cross-batch recency view)
     add_index :kafka_batch_failures, :failed_at,
               name: "idx_kb_failures_failed_at"
-
-
-    # ── kafka_batch_consumer_heartbeats ──────────────────────────────────────
-    # One row per live consumer pod/thread (upserted on a throttled heartbeat).
-    # Holds a sampled "current job" so the dashboard shows what each consumer
-    # is working on without a per-job insert/delete. Staleness handled by
-    # last_seen + periodic sweep. Only used when liveness_backend: :store.
-    create_table :kafka_batch_consumer_heartbeats, id: false do |t|
-      t.string   :consumer_id,        limit: 128, null: false
-      t.string   :hostname,           limit: 255
-      t.integer  :pid
-      t.string   :topic,              limit: 255
-      t.string   :current_job_id,     limit: 36
-      t.string   :current_worker,     limit: 255
-      t.string   :current_batch_id,   limit: 36
-      t.string   :current_topic,      limit: 255
-      t.integer  :current_partition
-      t.integer  :jobs_done,          null: false, default: 0
-      t.datetime :last_seen,          null: false
-    end
-
-    add_index :kafka_batch_consumer_heartbeats, :consumer_id,
-              unique: true, name: "uq_kb_consumer_heartbeats"
-    add_index :kafka_batch_consumer_heartbeats, :last_seen,
-              name: "idx_kb_consumer_heartbeats_last_seen"
 
 
     # ── kafka_batch_consumption_pauses ───────────────────────────────────────

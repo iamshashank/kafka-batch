@@ -61,6 +61,7 @@ module KafkaBatch
       method       = env["REQUEST_METHOD"]
       path         = env["PATH_INFO"].to_s
       path         = "/" if path.empty?
+      @path        = path   # remembered so layout can tailor per-page live/reload behaviour
       params       = parse_query(env["QUERY_STRING"])
 
       # ── CSRF: resolve token from cookie (or generate a fresh one) ──────────
@@ -393,7 +394,7 @@ module KafkaBatch
         </div>
         <div class="card">
           <h3>Running jobs</h3>
-          <p class="muted">Backend: <code>#{h(KafkaBatch::Liveness.backend)}</code>. Approximate snapshot#{KafkaBatch::Liveness.backend == :store ? ' (sampled per consumer at heartbeat)' : ''} — short-lived jobs may not always appear. Auto-refreshing every 5s.</p>
+          <p class="muted">Backend: <code>#{h(KafkaBatch::Liveness.backend)}</code>. Approximate snapshot — short-lived jobs may not always appear. Auto-refreshing every 5s.</p>
           <table>
             <thead><tr><th>Job</th><th>Batch</th><th>Worker</th><th>Consumer</th><th>Topic/Part</th><th>Started</th></tr></thead>
             <tbody>#{job_rows}</tbody>
@@ -581,7 +582,10 @@ module KafkaBatch
       ingest_total = ingest.sum { |p| p[:lag] }
       ready_total  = ready.sum { |p| p[:lag] }
       lanes        = ingest.count { |p| p[:lag].positive? }
-      throttled    = ready_total >= cfg.fairness_ready_lag_high.to_i
+      # The Forwarder stops forwarding once the in-flight window is full, so the
+      # ready buffer sitting at ~fairness_global_concurrency means it's throttling.
+      window       = cfg.fairness_global_concurrency.to_i
+      throttled    = window.positive? && ready_total >= window
       status_html  = throttled ? "<span class='badge' style='background:#ef4444'>Throttled</span>"
                                : "<span class='badge' style='background:#10b981'>Flowing</span>"
 
@@ -606,7 +610,7 @@ module KafkaBatch
           <div class="metric"><div class="metric-value">#{status_html}</div><div class="metric-label">Dispatcher</div></div>
         </div>
         <div class="card">
-          <p class="muted">Jobs land on the ingest topic (keyed one-tenant-per-partition), the dispatcher forwards them fairly onto the ready topic, and the JobConsumer swarm drains it. The dispatcher throttles to keep the ready buffer between <code>#{cfg.fairness_ready_lag_low}</code> and <code>#{cfg.fairness_ready_lag_high}</code>. Auto-refreshing every 5s.</p>
+          <p class="muted">Jobs land on the ingest topic (keyed one-tenant-per-partition), the Dispatcher stages them into the Redis WFQ scheduler, and the Forwarder checks out the fairest jobs onto the ready topic (bounded by the in-flight window <code>fairness_global_concurrency=#{window}</code>), which the JobConsumer swarm drains. Auto-refreshing every 5s.</p>
         </div>
         <div class="card">
           <h3>Ingest backlog by lane (un-dispatched, ≈ per tenant)</h3>
@@ -915,33 +919,45 @@ module KafkaBatch
         return "<p class='muted'>Could not read partition count for <code>#{h(topic)}</code>.</p>"
       end
 
-      partition = KafkaBatch::Partition.for_key(tenant_id, count)
-      lag_row   = lag_rows&.find do |r|
+      # Resolve partition: explicit map wins, murmur2_random hash is the fallback.
+      configured = (KafkaBatch.config.fairness_tenant_partitions || {})[tenant_id.to_s]
+      if configured && configured.to_i < count
+        partition    = configured.to_i
+        source_badge = "<span class='badge' style='background:#6366f1'>configured</span> "
+      else
+        partition    = KafkaBatch::Partition.for_key(tenant_id, count)
+        source_badge =
+          if configured
+            # Configured value exists but is out of range — warn visually.
+            "<span class='badge' style='background:#ef4444'>configured partition #{configured} out of range</span> "
+          else
+            ""
+          end
+      end
+
+      lag_row = lag_rows&.find do |r|
         r[:topic] == topic && r[:partition].to_i == partition &&
           r[:group] == KafkaBatch.dispatch_consumer_group
       end
-      lag_note  =
+
+      lag_note =
         if lag_row
           if lag_row[:never_consumed]
-            # Dispatcher has never committed to this partition — messages may be
-            # accumulating here but the consumer group has no committed offset yet.
-            " <span class='badge' style='background:#f59e0b'>Dispatch group has never consumed this partition</span>" \
-            " — Dispatcher may not be running or hasn't reached it yet."
+            " <span class='badge' style='background:#f59e0b'>Never consumed</span>" \
+            " — Dispatcher has not yet committed to this partition." \
+            " Jobs may be queued here waiting for the Dispatcher."
           elsif lag_row[:lag].to_i.zero?
-            # lag=0 means the Dispatcher has consumed everything here. Jobs are now
-            # on the ready topic awaiting execution — check ready-topic lag below.
-            " Ingest drained (lag: 0). Jobs forwarded to ready topic — check ready-topic lag."
+            " Ingest drained (lag: 0). Jobs forwarded to ready topic — check ready-topic lag below."
           else
             " Pending on this partition (dispatch group): #{lag_badge(lag_row[:lag])}."
           end
         elsif lag_rows
-          # Partition not in lag data at all — dispatch group unknown to Kafka (never ran).
-          " <span class='badge' style='background:#f59e0b'>Dispatch group not found</span>" \
-          " — Dispatcher has never consumed this topic. Jobs may be accumulating on partition #{partition}."
+          " <span class='badge' style='background:#f59e0b'>No dispatch-group data</span>" \
+          " — Dispatcher has never consumed this topic."
         end
 
       <<~HTML
-        <p><strong>Tenant</strong> <code>#{h(tenant_id)}</code> → <strong>partition #{partition}</strong> of #{count} on <code>#{h(topic)}</code>.#{lag_note}</p>
+        <p>#{source_badge}<strong>Tenant</strong> <code>#{h(tenant_id)}</code> → <strong>partition #{partition}</strong> of #{count} on <code>#{h(topic)}</code>.#{lag_note}</p>
       HTML
     end
 
@@ -1342,7 +1358,20 @@ module KafkaBatch
       h(value.to_s)
     end
 
+    # Auto-refreshing monitoring pages that show live Kafka/Redis state. These
+    # reload on a fixed 5s timer; the batch list uses the interactive toggle.
+    AUTO_RELOAD_PATHS = %w[/live /lag /fairness].freeze
+
     def layout(title, body)
+      is_index = @path.nil? || @path == "/"
+
+      # The interactive "Live" countdown toggle is only meaningful on the batch
+      # list (index). Monitoring pages (/live, /lag, /fairness) auto-reload on a
+      # fixed 5s timer; other pages (failures, weights, batch detail) are static.
+      live_toggle_button = %(<button id="kb-live-toggle" type="button" class="btn">○ Live</button>)
+
+      foot_script = live_toggle_script
+
       <<~HTML
         <!DOCTYPE html>
         <html lang="en">
@@ -1356,16 +1385,17 @@ module KafkaBatch
           <header>
             <a href="#{index_path}" class="logo">KafkaBatch</a>
             <nav class="header-nav">
-              <button id="kb-live-toggle" type="button" class="btn">○ Live</button>
+              <a class="btn" href="#{index_path}">Batches</a>
               <a class="btn" href="#{failures_path}">⚠ Failures</a>
-              <a class="btn" href="#{live_path}">▶ Live</a>
-              <a class="btn" href="#{lag_path}">▦ Lag</a>
+              <a class="btn" href="#{live_path}">▶ Consumer Process</a>
+              <a class="btn" href="#{lag_path}">▦ Kafka Lag</a>
               <a class="btn" href="#{fairness_path}">⚖ Fairness</a>
               <a class="btn" href="#{weights_path}">⚖ Weights</a>
+              #{live_toggle_button}
             </nav>
           </header>
           <main>#{body}</main>
-          #{live_toggle_script}
+          #{foot_script}
         </body>
         </html>
       HTML

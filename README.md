@@ -112,7 +112,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
    └──────────────────────────┘
 ```
 
-> **Multi-tenant fairness** (per-worker opt-in via `fairness true`) inserts a stage before `JobConsumer` for *that worker*: `Batch.push` writes to a per-tenant **ingest** topic, a `Fairness::Dispatcher` fairly forwards onto a throttled **ready** topic, and a dedicated **`…-jobs-fair`** consumer group drains the ready topic. Plain workers keep going straight to their own topic in the **`…-jobs`** group. Everything downstream (events/callbacks/retry/DLT) is identical. See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
+> **Multi-tenant fairness** (per-worker opt-in via `fairness true`) inserts a stage before `JobConsumer` for *that worker*: `Batch.push` writes to a per-tenant **ingest** topic, a `Fairness::Dispatcher` loads it into a **Redis WFQ scheduler**, a `Fairness::Forwarder` checks out the fairest job (weighted, concurrency-gated) onto a **ready** topic, and a dedicated **`…-jobs-fair`** consumer group drains it. Plain workers keep going straight to their own topic in the **`…-jobs`** group. Everything downstream (events/callbacks/retry/DLT) is identical. **Redis is required.** See [Multi-tenant fairness](#multi-tenant-fairness-wfq).
 
 ---
 
@@ -164,7 +164,6 @@ The two stores generate different defaults in the initializer. Key differences:
 
 | Setting | `--store mysql` | `--store redis` |
 |---|---|---|
-| `liveness_backend` | `:store` (consumer heartbeats in MySQL) | `:redis` (per-job tracking) |
 | `failures_ttl` | 7 days (reconciler purge) | 1 day (Redis auto-expire) |
 | Redis block | commented-out (optional) | enabled (`redis_url`, `batch_ttl`, `all_index_max_size`) |
 | Reconciler lock note | `GET_LOCK` advisory lock | distributed `SET NX EX` |
@@ -232,19 +231,12 @@ KafkaBatch.configure do |config|
   # ── Kafka brokers ───────────────────────────────────────────────────
   config.brokers = ENV.fetch("KAFKA_BROKERS", "localhost:9092").split(",")
 
-  # ── Topic names ─────────────────────────────────────────────────────
-  config.jobs_topic        = "kafka_batch.jobs"
-  config.events_topic      = "kafka_batch.events"
-  config.callbacks_topic   = "kafka_batch.callbacks"
-  config.retry_topic       = "kafka_batch.jobs.retry"   # prefix; tier topics are
-                                                        # <prefix>.short/.medium/.large
-  config.dead_letter_topic = "kafka_batch.dead_letter"
-  # Multi-tenant fairness topics (only used when a worker declares `fairness true`):
-  config.fairness_ingest_topic = "kafka_batch.ingest"   # per-tenant intake (durable backlog)
-  config.fairness_ready_topic  = "kafka_batch.ready"    # throttled execution queue
-
-  # ── Consumer group ──────────────────────────────────────────────────
-  config.consumer_group = "kafka-batch"
+  # ── Topic namespace ─────────────────────────────────────────────────
+  # One prefix namespaces ALL topic names and the consumer group, e.g.
+  # "myapp" → "myapp.kafka_batch.jobs", consumer group "myapp.kafka-batch".
+  # Leave "" for the bare defaults. Any individual name can still be set
+  # explicitly (config.jobs_topic = "…") to override the derived value.
+  config.topic_prefix = ENV["KAFKA_PREFIX"].to_s.strip
 
   # ── Cancellation ────────────────────────────────────────────────────
   # When true, JobConsumer skips jobs whose batch was cancelled. The set of
@@ -287,39 +279,35 @@ KafkaBatch.configure do |config|
   config.failures_ttl           = 24 * 3600  # seconds
   config.max_failures_per_batch = 1000        # 0 = unlimited
 
-  # ── Live-activity backend (/live page; independent of config.store) ──
-  #   :redis – per-job tracking in Redis (most detail; writes scale with jobs)
-  #   :store – consumer heartbeats in config.store (sampled; writes scale with
-  #            #consumers — needs the consumer-heartbeats table on :mysql)
+  # ── Live-activity backend (/live page; Redis-backed) ──
+  #   :redis – (default) per-job + per-consumer tracking in Redis
   #   :off   – disable the /live page
-  config.liveness_backend            = :redis
-  config.liveness_ttl                = 30  # seconds a heartbeat/entry is "live"
-  config.liveness_heartbeat_interval = 5   # :store throttle: 1 write/consumer/N s
-  config.track_running_jobs          = true # gate :redis per-job running-state writes
+  config.liveness_backend   = :redis
+  config.liveness_ttl       = 30   # seconds a heartbeat/entry is "live"
+  config.track_running_jobs = true # gate :redis per-job running-state writes
 
-  # ── Multi-tenant fairness ────────────────────────────────────────────────
-  # The default fairness path (ingest → dispatcher → ready) is Kafka-only; no
-  # Redis is required for `fairness true` workers to process jobs.
-  config.fairness_ready_lag_high = 5000 # dispatcher pauses forwarding above this depth
-  config.fairness_ready_lag_low  = 1000 # ...resumes below this depth
+  # ── Multi-tenant fairness (Redis-backed WFQ; Redis REQUIRED) ─────────────
+  config.fairness_mode                    = :time_fairness  # or :job_count_fairness
+  config.fairness_global_concurrency      = 50   # in-flight window (bounds ready depth + concurrency)
+  config.fairness_max_inflight_per_tenant = 0    # optional hard per-tenant ceiling (0 = dynamic share only)
+  config.fairness_ready_window            = 500  # bounded per-tenant staging window in Redis
+  config.fairness_default_weight          = 1.0
+  config.fairness_dispatcher_batch_size   = 50   # max ingest msgs drained into Redis per consume call
+  config.fairness_dispatcher_concurrency  = 5    # expected Karafka concurrency on dispatch process; boot-warning only
 
-  # ── Optional Redis-backed WFQ Scheduler (strict weighted shares) ─────────
-  # Active only when config.redis_url is set. Auto-disabled (KafkaBatch.scheduler
-  # returns nil) when redis_url is blank; the Weights UI shows "inactive".
-  # config.fairness_mode                    = :time_fairness  # or :job_count_fairness
-  # config.fairness_weight_cache_ttl        = 120  # seconds; weight changes propagate within this window
-  # config.fairness_global_concurrency      = 50
-  # config.fairness_max_inflight_per_tenant = 3    # per-tenant in-flight cap (0 = disabled)
-  # config.fairness_ready_window            = 500
-  # config.fairness_default_weight          = 1.0
+  # Explicit tenant → ingest partition map (optional; bypasses the hash partitioner entirely).
+  # Useful when you need deterministic assignment — e.g. a "hot" tenant on its own partition.
+  # Tenants NOT listed here still use murmur2_random hashing.
+  # config.fairness_tenant_partitions = { "acme" => 0, "globex" => 1 }
 
   # ── Priority queues (non-fair; 4-topic 2-group design) ───────────────────
-  # Workers opt in by setting kafka_topic to one of these four names.
-  # fairness true always takes precedence over kafka_topic.
-  config.fast_p0_topic = "kafka_batch.jobs.fast_p0"  # fast, critical priority
-  config.fast_p1_topic = "kafka_batch.jobs.fast_p1"  # fast, normal priority
-  config.slow_p0_topic = "kafka_batch.jobs.slow_p0"  # slow, critical priority
-  config.slow_p1_topic = "kafka_batch.jobs.slow_p1"  # slow, normal priority
+  # These four topic names are derived from topic_prefix by default. Workers opt
+  # in by setting kafka_topic to one of them (fairness true takes precedence).
+  # Override only if you want different names:
+  # config.fast_p0_topic = "kafka_batch.jobs.fast_p0"  # fast, critical priority
+  # config.fast_p1_topic = "kafka_batch.jobs.fast_p1"  # fast, normal priority
+  # config.slow_p0_topic = "kafka_batch.jobs.slow_p0"  # slow, critical priority
+  # config.slow_p1_topic = "kafka_batch.jobs.slow_p1"  # slow, normal priority
   # How often (seconds) p1 consumers re-check p0 lag. Default 2.
   config.priority_lag_check_interval = 2
 
@@ -346,13 +334,14 @@ Every option on `KafkaBatch.config`:
 |---|---|---|---|
 | `store` | Symbol | `:mysql` | State store for counters/cursors/failures: `:mysql` or `:redis` |
 | `brokers` | Array&lt;String&gt; | `["localhost:9092"]` | Kafka bootstrap brokers |
-| `consumer_group` | String | `"kafka-batch"` | Base consumer-group name (suffixed `-control`, `-dispatch`, `-jobs-fair`, `-jobs`) |
+| `topic_prefix` | String | `""` | Namespaces **all** topic names and the consumer group (e.g. `"myapp"` → `myapp.kafka_batch.jobs`, `myapp.kafka-batch`). Any name below can still be set explicitly to override the derived value |
+| `consumer_group` | String | `"kafka-batch"` | Base consumer-group name (derived from `topic_prefix`; suffixed `-control`, `-dispatch`, `-jobs-fair`, `-jobs`) |
 | `logger` | Logger | `Rails.logger` | Logger instance |
-| `jobs_topic` | String | `"kafka_batch.jobs"` | Shared default job topic for workers that don't declare their own `kafka_topic` (non-fairness) |
-| `events_topic` | String | `"kafka_batch.events"` | Completion-event topic |
-| `callbacks_topic` | String | `"kafka_batch.callbacks"` | Batch-callback topic |
-| `retry_topic` | String | `"kafka_batch.jobs.retry"` | Retry-topic **prefix** (tier topics are `<prefix>.short/.medium/.large`) |
-| `dead_letter_topic` | String | `"kafka_batch.dead_letter"` | Dead-letter topic |
+| `jobs_topic` | String | `"kafka_batch.jobs"` | Shared default job topic for workers that don't declare their own `kafka_topic` (non-fairness); derived from `topic_prefix` |
+| `events_topic` | String | `"kafka_batch.events"` | Completion-event topic (derived from `topic_prefix`) |
+| `callbacks_topic` | String | `"kafka_batch.callbacks"` | Batch-callback topic (derived from `topic_prefix`) |
+| `retry_topic` | String | `"kafka_batch.jobs.retry"` | Retry-topic **prefix** (tier topics are `<prefix>.short/.medium/.large`); derived from `topic_prefix` |
+| `dead_letter_topic` | String | `"kafka_batch.dead_letter"` | Dead-letter topic (derived from `topic_prefix`) |
 | `max_retries` | Integer | `3` | Retry attempts before dead-letter (per-Worker override) |
 | `retry_jitter` | Float | `0.1` | ± randomization on retry delays |
 | `retry_tiers` | Hash | `{short: 30, medium: 420, large: 1200}` | Tier → delay (seconds) |
@@ -368,21 +357,22 @@ Every option on `KafkaBatch.config`:
 | `batch_ttl` | Integer (s) | `604800` (7d) | TTL for Redis batch keys |
 | `failures_ttl` | Integer (s) | `86400` (1d) | TTL for the Redis failure log |
 | `max_failures_per_batch` | Integer | `1000` | Cap on tracked failing jobs per batch (Redis; `0` = unlimited) |
-| `liveness_backend` | Symbol | `:redis` | `/live` source: `:redis`, `:store`, or `:off` |
+| `liveness_backend` | Symbol | `:redis` | `/live` source: `:redis` or `:off` (Redis-backed) |
 | `liveness_ttl` | Integer (s) | `30` | How long a heartbeat/entry is considered live |
-| `liveness_heartbeat_interval` | Integer (s) | `5` | `:store` heartbeat write throttle |
 | `track_running_jobs` | Boolean | `true` | Gate per-job running-state writes (`:redis` liveness) |
-| `fairness_ingest_topic` | String | `"kafka_batch.ingest"` | Per-tenant intake topic (fairness) |
-| `fairness_ready_topic` | String | `"kafka_batch.ready"` | Throttled execution topic (fairness) |
-| `fairness_ready_lag_high` | Integer | `5000` | Dispatcher pauses forwarding above this ready-topic depth |
-| `fairness_ready_lag_low` | Integer | `1000` | Dispatcher resumes forwarding below this depth |
+| `fairness_ingest_topic` | String | `"kafka_batch.ingest"` | Durable per-tenant intake topic (fairness) |
+| `fairness_ready_topic` | String | `"kafka_batch.ready"` | Fairly-ordered execution topic (fairness) |
+| `fairness_mode` | Symbol | `:time_fairness` | Active fairness mode: `:time_fairness` (vtime advances by `duration / weight` at completion — fair weighted wall-clock time) or `:job_count_fairness` (vtime advances by `1/weight` at checkout — fair weighted job count) |
+| `fairness_global_concurrency` | Integer | `50` | In-flight window (forwarded-but-not-completed jobs). Bounds ready-topic depth and total fair-lane concurrency; per-tenant share is `ceil(this / active_tenants)` |
+| `fairness_max_inflight_per_tenant` | Integer | `0` | Optional **hard** per-tenant in-flight ceiling on top of the dynamic fair share; `0` = dynamic share only |
+| `fairness_ready_window` | Integer | `500` | Bounded per-tenant staging window in Redis; when full the Dispatcher pauses the ingest partition (backpressure) |
+| `fairness_default_weight` | Float | `1.0` | Default per-tenant weight when no override is set |
+| `fairness_weight_cache_ttl` | Integer (s) | `60` | How long each process caches the tenant-weight map; weight changes propagate within this window |
+| `fairness_forwarder_idle_sleep` | Float (s) | `0.05` | How long the Forwarder sleeps when a checkout yields nothing (idle / window full) before polling again |
 | `fairness_min_ingest_partitions` | Integer | `2` | Warns (raises when `validate_topics_on_boot`) if the ingest topic has fewer partitions; set near max concurrent tenants |
-| `fairness_mode` | Symbol | `:time_fairness` | **Optional `Scheduler` only** — `:time_fairness` (vtime advances by `actual_duration / weight` at completion — fair wall-clock slot-time per hour) or `:job_count_fairness` (vtime advances by `1/weight` at dispatch — fair over dispatch count). Has no effect when the Scheduler is disabled (no Redis). |
-| `fairness_weight_cache_ttl` | Integer (s) | `120` | **Optional `Scheduler` only** — how long each dispatcher process caches the tenant-weight map; weight changes propagate within this window |
-| `fairness_global_concurrency` | Integer | `50` | **Optional `Scheduler` only** — total in-flight slots |
-| `fairness_max_inflight_per_tenant` | Integer | `3` | **Optional `Scheduler` only** — per-tenant in-flight cap; prevents one slow-job tenant holding all budget slots; `0` disables |
-| `fairness_ready_window` | Integer | `500` | **Optional `Scheduler` only** — bounded ready jobs/tenant in Redis |
-| `fairness_default_weight` | Float | `1.0` | **Optional `Scheduler` only** — default tenant weight when no override is set |
+| `fairness_dispatcher_batch_size` | Integer | `50` | Max ingest messages the Dispatcher drains into the Redis window per consume call (`max_messages` in the route) |
+| `fairness_dispatcher_concurrency` | Integer | `5` | Expected Karafka concurrency on the dispatch process. **Boot warning only** — logged if `Karafka::App.config.concurrency` is lower |
+| `fairness_tenant_partitions` | Hash | `{}` | Explicit `tenant_id → partition_number` overrides. Bypasses the hash partitioner entirely — the producer sends directly to that partition via WaterDrop's `partition:` parameter. Tenants not listed fall back to murmur2\_random. Out-of-range values are logged and ignored. |
 | `max_reconcile_per_run` | Integer | `100` | Max batches the reconciler processes per sweep (both stuck-running and lost-callback independently); caps callback bursts during incidents |
 | `max_message_bytes` | Integer | `1_048_576` | Raise `ProducerError` if an encoded payload exceeds this size (1 MiB default, matches Kafka's `message.max.bytes`); `0` disables the guard |
 | `fast_p0_topic` | String | `"kafka_batch.jobs.fast_p0"` | Fast-group critical topic; set `kafka_topic` to this value on a worker to enroll it |
@@ -415,19 +405,18 @@ Holds batch counters, the per-partition completion cursors (exactly-once dedup),
 | Hot-batch counter writes | One row lock per batch (kept cheap by per-poll **batched counting**) | Atomic Lua, microsecond-fast — no row contention |
 | Best for | Auditability, durability, an existing RDBMS | Lowest latency, no schema, very high single-batch throughput |
 
-#### 2. Live-activity backend — `config.liveness_backend` (`:redis` | `:store` | `:off`)
+#### 2. Live-activity backend — `config.liveness_backend` (`:redis` | `:off`)
 
-Powers **only** the `/live` dashboard page, and is **independent** of `config.store` (e.g. you can run `store = :mysql` with `liveness_backend = :redis`).
+Powers **only** the `/live` dashboard page. It is Redis-backed (Redis is a required dependency) and independent of `config.store`.
 
-| | `:redis` | `:store` | `:off` |
-|---|---|---|---|
-| Source | Per-job keys in Redis (`redis_url`) | Consumer heartbeats in `config.store` | — |
-| Detail | Every running job (most detailed) | Sampled "current job" per consumer | none |
-| Write volume | Scales with **job throughput** | Scales with **#consumers** (throttled to 1 write / `liveness_heartbeat_interval`) | none |
-| Requires | Redis reachable | the heartbeats table (on `:mysql`) | — |
-| Resilience | Best-effort behind a circuit breaker | Best-effort; stale rows filtered by `liveness_ttl` | — |
+| | `:redis` | `:off` |
+|---|---|---|
+| Source | Per-job + per-consumer keys in Redis (`redis_url`) | — |
+| Detail | Every running job + live consumers | none |
+| Write volume | Scales with **job throughput** (gated by `track_running_jobs`) | none |
+| Resilience | Best-effort behind a circuit breaker; stale entries expire via `liveness_ttl` TTL | — |
 
-> On `:store`, "running jobs" is **sampled** — very short jobs may not appear between heartbeats, but active consumers always show. Use `:redis` when you want every in-flight job listed.
+> Keys are short-TTL'd (`liveness_ttl`) and expire on their own — no sweep needed. Set `track_running_jobs = false` to keep consumer heartbeats but skip per-job running-state writes.
 
 ### MySQL store
 
@@ -442,7 +431,6 @@ Requires these migrations:
 | `add_description_to_kafka_batch_records` | optional `description` column shown in the Web UI |
 | `add_callback_dispatched_by_to_kafka_batch_records` | records which consumer pod/process ran the batch's callbacks |
 | `create_kafka_batch_failures` | Always-on per-batch failure log (upserted per failing job from the first failed attempt; bounded by failures, not total jobs) |
-| `create_kafka_batch_consumer_heartbeats` | Consumer heartbeats for the `:store` live-activity backend (one row per consumer; only needed if `liveness_backend = :store`) |
 
 ```bash
 bundle exec rails db:migrate
@@ -1025,9 +1013,16 @@ bundle exec rake kafka_batch:create_topics
 
 ## Multi-tenant fairness (WFQ)
 
-When many tenants (businesses) push jobs into the same system, a naive Kafka topic processes them roughly FIFO — so one tenant dumping 10M jobs starves everyone behind it. KafkaBatch shares capacity dynamically across tenants using **only Kafka — no Redis required**.
+When many tenants (businesses) push jobs into the same system, a naive Kafka topic processes them roughly FIFO — so one tenant dumping 10M jobs starves everyone behind it. KafkaBatch shares capacity dynamically across tenants using a **Redis-backed Weighted-Fair-Queuing (WFQ) scheduler**. Redis is a **required** dependency of the gem.
 
 Fairness is a **per-worker opt-in** (`fairness true` on the Worker class) — there's no global switch. Fair workers share one ingest → ready lane (consumer groups `-dispatch` and `-jobs-fair`); plain workers use their own topics in the `-jobs` group. Both lanes can run in the same Karafka process or in **separate processes** for independent scaling — see [Scaling consumer groups independently](#scaling-consumer-groups-independently).
+
+Two accounting modes, both real and active (set `config.fairness_mode`):
+
+- **`:time_fairness`** (default) — each tenant gets a fair, weighted share of **wall-clock execution time**. Virtual time advances at job *completion* by `duration / weight`. Correct for uneven job runtimes (e.g. 20–60 s jobs).
+- **`:job_count_fairness`** — each tenant gets a fair, weighted share of **dispatched job count**. Virtual time advances at *checkout* by `1 / weight`. Best when all tenants' jobs have similar runtimes.
+
+Concurrency is shared work-conservingly: the global in-flight window (`fairness_global_concurrency`) is split as `ceil(window / active_tenants)` — **1 active tenant uses the whole window; N active split it evenly** — with an optional hard per-tenant ceiling (`fairness_max_inflight_per_tenant`).
 
 ```ruby
 class CampaignSendWorker
@@ -1043,17 +1038,16 @@ end
 
 The fair lane gives you:
 
-- **1 active tenant → 100%** of capacity; **2 → ~50:50**; **N → ~1/N each** — and it's **work-conserving** (an idle tenant's share is instantly redistributed).
-- The durable backlog stays in **Kafka** (the ingest topic), so memory is bounded regardless of backlog size. Nothing is stored in Redis on the fairness path.
-- Fairness is **approximate** ("good enough"): it relies on Kafka's balanced per-partition fetch plus a shallow, throttled ready topic.
+- **1 active tenant → 100%** of the in-flight window; **2 → ~50:50**; **N → ~1/N each** — **work-conserving** (an idle tenant's share is instantly redistributed via the dynamic `ceil(window / active_tenants)` cap).
+- **Weighted, exact fairness** via a virtual-time ring — not fetch-batch approximation. Weights are per-tenant and editable live on the **⚖ Weights** page.
+- The durable, unbounded backlog stays in **Kafka** (the ingest topic); only a small bounded per-tenant staging window (`fairness_ready_window`) lives in Redis, with backpressure to Kafka when it fills.
+- Choice of **time-based** or **job-count** fairness via `config.fairness_mode`.
 
-> **Does `fairness true` need Redis? No.** The default fairness path (ingest → dispatcher → ready → swarm) is 100% Kafka-native. **Jobs process normally and approximate fairness still works even if Redis is absent.** No code breaks — there is no error, no fallback warning, no degraded behaviour on the job-processing side.
->
-> Redis is involved **only** if you opt into the standalone `KafkaBatch::Fairness::Scheduler` (the optional virtual-time WFQ engine for *strict weighted* shares). The Scheduler requires Redis and is **automatically disabled** (`KafkaBatch.scheduler` returns `nil`) when `config.redis_url` is blank. When disabled:
-> - The **⚖ Weights** UI page shows "Scheduler inactive".
-> - `config.fairness_mode` (`:time_fairness` / `:job_count_fairness`) has **no effect** — it only governs how the Scheduler advances virtual time.
-> - `config.fairness_weight_cache_ttl` and `config.fairness_default_weight` are similarly ignored.
-> - Everything else — job dispatch, retries, callbacks, the batch dashboard — is unaffected.
+> **Does `fairness true` need Redis? Yes.** Redis is a **hard dependency** of KafkaBatch. The scheduler's virtual-time ring, in-flight counters, and per-tenant ready windows all live in Redis, and it drives the default fairness path (`config.redis_url` must be set — `Configuration#validate!` raises otherwise). The pieces:
+> - **`Fairness::Dispatcher`** (consumer group `-dispatch`) drains the ingest topic into the bounded Redis WFQ window, pausing an ingest partition when a tenant's window is full (backpressure).
+> - **`Fairness::Forwarder`** (one background thread per dispatch process) checks out the fairest next job — concurrency-gated — and forwards it to the ready topic.
+> - **`JobConsumer`** (consumer group `-jobs-fair`) runs `perform` and calls `Scheduler#complete(tenant, duration:)`, which releases the in-flight slot and (in `:time_fairness`) advances the tenant's virtual time by `duration / weight`.
+> The **⚖ Weights** page's "In-flight now" and "Queued" columns are now live, because the default path drives the scheduler's `checkout`/`complete`.
 
 ### Enqueuing fair jobs
 
@@ -1131,69 +1125,103 @@ end
 
 Monitor ingest/ready depth on the Web UI **Fairness** page (`/kafka_batch/fairness`).
 
-Configure the shared lane (no Redis needed) — these apply to every fair worker:
+Configure the shared lane — these apply to every fair worker:
 
 ```ruby
-config.fairness_ingest_topic   = "kafka_batch.ingest"  # per-tenant intake (durable backlog)
-config.fairness_ready_topic    = "kafka_batch.ready"   # throttled execution queue
-config.fairness_ready_lag_high = 5000   # dispatcher pauses forwarding above this depth
-config.fairness_ready_lag_low  = 1000   # ...resumes below this depth
+config.fairness_ingest_topic            = "kafka_batch.ingest"  # durable per-tenant intake
+config.fairness_ready_topic             = "kafka_batch.ready"   # fairly-ordered execution queue
+config.fairness_mode                    = :time_fairness        # or :job_count_fairness
+config.fairness_global_concurrency      = 50    # in-flight window (bounds ready depth + concurrency)
+config.fairness_max_inflight_per_tenant = 0     # optional hard per-tenant ceiling (0 = dynamic share only)
+config.fairness_ready_window            = 500   # bounded per-tenant staging window in Redis
+config.fairness_default_weight          = 1.0
 ```
 
-> The `fairness_global_concurrency`, `fairness_ready_window`, `fairness_max_inflight_per_tenant`, and `fairness_default_weight` settings apply **only** to the optional Redis-backed `Scheduler` — not the default dispatcher.
+### Dispatcher / forwarder fairness tuning
 
-### How it's wired (reuses normal Kafka consumers, no Redis on the path)
+The default configuration gives good, exact fairness out of the box with **a single dispatch process**. You don't need to change anything to start — understand these knobs to tune further.
 
-Execution stays on ordinary `JobConsumer`s — fairness is achieved by controlling the *order* jobs reach them, using only Kafka. Each stage has its **own consumer group** so fair and plain throughput scale independently:
+#### How 1 dispatch process achieves fairness across all tenants
+
+Fairness is decided by the **Redis WFQ scheduler**, not by Kafka fetch balance, so a single dispatch process is sufficient regardless of ingest-partition layout:
+
+**`fairness_global_concurrency` (default: 50)** is the in-flight window — the number of jobs forwarded to the ready topic but not yet completed. It bounds the ready-topic depth (so a newly active tenant only ever waits behind ~this many jobs — keeping fairness *dynamic*) and caps total fair-lane concurrency.
+
+**Dynamic fair share.** Each tenant may hold at most `ceil(fairness_global_concurrency / active_tenants)` in-flight slots: **1 active tenant → the whole window; N active → window/N each** (work-conserving). `fairness_max_inflight_per_tenant` is an optional hard ceiling layered on top (0 = rely purely on the dynamic share). This dynamic cap is what enforces interleaving in `:time_fairness`, where virtual time only advances at completion.
+
+**`fairness_mode`** selects what is shared fairly: weighted wall-clock time (`:time_fairness`) or weighted job count (`:job_count_fairness`).
+
+**Karafka concurrency (set in `karafka.rb`)** governs how many ingest partitions the Dispatcher drains into Redis in parallel and how many ready-topic messages the JobConsumer swarm executes concurrently. It does **not** affect fairness ordering (the scheduler owns that) — it affects raw throughput. `fairness_dispatcher_concurrency` only drives a boot warning if the Karafka setting looks too low.
+
+```ruby
+# karafka.rb
+Karafka::App.setup do |config|
+  config.concurrency = 5
+end
+```
+
+The **`Fairness::Forwarder`** runs as one background thread per dispatch process; multiple processes may run it safely (each `checkout` is a single atomic Redis Lua call), so the fair lane is HA without double-dispatching.
+
+#### Explicit tenant-to-partition mapping
+
+By default the producer uses the `murmur2_random` partitioner to spread tenants evenly across ingest partitions (matching the Web UI partition lookup widget). To pin a specific tenant to a specific partition — for isolation, predictable routing, or debugging — use the explicit map:
+
+```ruby
+config.fairness_tenant_partitions = {
+  "acme"   => 0,   # always lands on ingest partition 0
+  "globex" => 1,   # always lands on ingest partition 1
+  # all other tenants → murmur2_random hash
+}
+```
+
+When a tenant is in the map, the producer passes `partition:` directly to WaterDrop (bypassing the partitioner entirely). The Web UI partition lookup widget shows a **configured** badge for these tenants. Out-of-range partition numbers (≥ ingest partition count) are logged as a warning and fall back to hash-based routing.
+
+> If you pin a tenant that was previously hash-routed to a different partition, existing messages in the old partition are still consumed normally — no data migration needed.
+
+### How it's wired
+
+Execution stays on ordinary `JobConsumer`s; fairness is achieved by controlling the *order* jobs reach them, using a Redis virtual-time ring. Each stage has its **own consumer group** so fair and plain throughput scale independently:
 
 ```
-push → ingest topic (keyed one-tenant-per-partition)
+push → ingest topic (durable backlog, keyed by tenant)
         │
    {consumer_group}-dispatch
-   Fairness::Dispatcher: forwards each job ingest → ready,
-        │   THROTTLED so the ready topic's un-consumed depth stays between
-        │   fairness_ready_lag_low/high (pauses above high, resumes below low)
-        │   (reads ready lag from {consumer_group}-jobs-fair, not -jobs)
+   Fairness::Dispatcher: enqueue → bounded Redis WFQ window
+        │   (pauses the ingest partition when a tenant's window is full)
+        ▼
+   Redis WFQ ring (virtual-time ordered, per-tenant ready windows)
+        │
+   Fairness::Forwarder (background thread, per dispatch process)
+        │   checkout the fairest job — global + dynamic per-tenant
+        │   concurrency gated — and forward it to the ready topic
         ▼
    ready topic
         │
    {consumer_group}-jobs-fair
-   JobConsumer swarm → perform → events
+   JobConsumer swarm → perform → events → Scheduler#complete
 
 plain worker push → worker topic → {consumer_group}-jobs → JobConsumer → events
 ```
 
-Two things make this fair, with no Redis and no extra process:
+What makes this fair:
 
-1. **Kafka's balanced fetch.** A consumer fetches roughly evenly across its assigned partitions, so with ingest keyed one-tenant-per-partition the dispatcher naturally forwards a balanced mix. One active tenant fills the ready topic alone (**100%**); N active split **~1/N**; idle tenants contribute nothing (**work-conserving**).
-2. **A shallow ready topic.** The throttle keeps the ready topic's depth bounded, so a newly active tenant only ever waits behind ~the watermark of queued work — not the whole backlog. That's what keeps fairness *dynamic*.
+1. **Virtual-time WFQ.** `#checkout` always picks the ready tenant with the smallest virtual time. In `:job_count_fairness` vtime advances by `1/weight` at checkout; in `:time_fairness` it advances by `duration/weight` when the JobConsumer calls `#complete` after `perform`. Returning idle tenants are re-admitted at the current minimum vtime so they cannot hoard capacity accrued while idle (**work-conserving**).
+2. **Bounded in-flight window.** `fairness_global_concurrency` caps forwarded-but-not-completed jobs, keeping the ready topic shallow so a newly active tenant only ever waits behind ~a window's worth of work. The dynamic `ceil(window / active_tenants)` per-tenant share prevents any one tenant from filling the window.
 
-`draw_routes` wires this automatically when **any** registered worker declares `fairness true`. The durable backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees. **Retries for fair workers** go back to the **ready** topic (not ingest), so they skip the dispatcher on retry.
+`draw_routes` wires this automatically when **any** registered worker declares `fairness true`. The durable, unbounded backlog stays in the **ingest topic (Kafka)**; the ready topic + existing retry/DLT path keep the usual at-least-once guarantees. **Retries for fair workers** re-enter the **ready** topic directly (skipping the scheduler) and do not re-hold an in-flight slot.
 
-Fairness here is **approximate** ("good enough"): granularity is the fetch batch, and it assumes ~even partition assignment per tenant and similar job sizes. For **strict weighted shares**, `KafkaBatch::Fairness::Scheduler` is available as a standalone Redis-backed virtual-time WFQ engine — see [Optional: Redis-backed WFQ Scheduler](#optional-redis-backed-wfq-scheduler-strict-weighted-shares) below.
+> **Redis is required.** The virtual-time ring, in-flight counters, and per-tenant ready windows all live in Redis (`config.redis_url`). `Configuration#validate!` raises if it is unset.
 
-### Optional: Redis-backed WFQ Scheduler (strict weighted shares)
+### The WFQ Scheduler (engine behind the default path)
 
-`KafkaBatch::Fairness::Scheduler` is a standalone engine for **strict, weighted** fairness. It is completely independent of the Kafka-native Dispatcher above — you can use either one, or both. The Scheduler has no Karafka dependency: it is pure Redis Lua.
+`KafkaBatch::Fairness::Scheduler` is the Redis virtual-time WFQ engine that the default fairness path is built on (`Fairness::Dispatcher` enqueues into it; `Fairness::Forwarder` checks out of it; `JobConsumer` completes into it). It has no Karafka dependency — it is pure Redis Lua — so you can also drive it directly if you want to build a custom dispatcher/worker loop.
 
-**Important for the `/weights` dashboard:** the "In-flight now" and "Queued" metric cards (and the per-tenant In-flight / Status columns) are **always 0 when using the Kafka-native Dispatcher**. Those counters live in the `kafka_batch:fair:inflight` Redis hash and the `kafka_batch:fair:ring` ZSET, and they are only written by the Scheduler's `checkout` and `complete` Lua scripts. The Kafka-native Dispatcher never calls those — it forwards jobs directly through Kafka without touching the Scheduler's WFQ ring. The `vtime` column and the tenant list still populate correctly (via `touch_tenants`), and weights can still be set and will propagate to any process running the Scheduler. But inflight/queued will read 0 until you build and deploy a custom Scheduler-based dispatcher.
-
-#### When to use the Scheduler instead of (or alongside) the Kafka-native path
-
-| | Kafka-native Dispatcher | Scheduler (WFQ) |
-|---|---|---|
-| Redis required | No | Yes |
-| Fairness | Approximate (fetch-batch granularity) | Exact (per-job virtual time) |
-| Weighted shares | No | Yes — per-tenant weight via `set_weight` |
-| In-flight cap | No | Yes — `fairness_max_inflight_per_tenant` |
-| Global concurrency cap | No | Yes — `fairness_global_concurrency` |
-| Backlog storage | Kafka (durable, unbounded) | Redis LIST per tenant (bounded by `fairness_ready_window`) |
-| Suitable for | Any scale; no extra infrastructure | When you need provably weighted shares or per-tenant concurrency caps |
+**`/weights` dashboard:** because the default path now drives `checkout`/`complete`, the "In-flight now" and "Queued" cards and the per-tenant In-flight / vtime columns are **live**. Per-tenant weights set on this page take effect within `fairness_weight_cache_ttl` seconds across all processes.
 
 The Scheduler's API:
 
 ```ruby
-sched = KafkaBatch.scheduler   # configured via KafkaBatch.configure; nil when redis_url is blank
+sched = KafkaBatch.scheduler   # process-wide singleton (Redis is required and always configured)
 
 sched.enqueue(tenant_id, payload)     # push a job into the tenant's ready queue; returns :ok or :full
 sched.checkout                         # pull the next job fairly; returns { tenant_id:, payload: } or nil
@@ -1344,7 +1372,7 @@ This is a different constraint. Kafka assigns **at most one partition per consum
 >
 > **Ready partitions = pod count × Karafka concurrency** — for full thread utilization during bursts
 
-With 100 pods and `concurrency = 5`: 500 ready partitions means each pod gets 5 partitions and all 5 threads stay busy under load. There is a natural ceiling though — the dispatcher's throttle (the `fairness_ready_lag_high` watermark) caps how deep the ready topic ever gets, so going much beyond `pods × concurrency` adds broker metadata overhead for no throughput gain.
+With 100 pods and `concurrency = 5`: 500 ready partitions means each pod gets 5 partitions and all 5 threads stay busy under load. There is a natural ceiling though — the forwarder's in-flight window (`fairness_global_concurrency`) caps how deep the ready topic ever gets, so going much beyond `pods × concurrency` adds broker metadata overhead for no throughput gain.
 
 ```bash
 # Example: 400 total tenants, 100 job-consumer pods, concurrency = 5
@@ -1395,8 +1423,7 @@ What it shows:
 - **Batch detail** — all fields, callbacks, meta, progress, and a **Job failures** list. Failures are recorded on the **first failed attempt** (status `retrying` while retries remain, `failed` once exhausted) so problems surface immediately rather than after hours of retries. Each row shows the worker, attempt #, error class/message, and time. Upserted per job and bounded by the number of failing jobs, so it's cheap even for huge batches.
 - **All failures** (`/failures`) — a cross-batch view of every failure in one place (linked from the dashboard), filterable by `retrying` / `failed`, each row linking back to its batch.
 - **Live activity** (`/live`) — currently-running jobs (job, batch, worker, which consumer process, topic/partition, start time) and the live consumer processes (host, PID, last-seen), auto-refreshing every 5s. It's **approximate** (very short-lived jobs may not appear between snapshots). Choose a backend with `config.liveness_backend`:
-  - **`:redis`** (default) — full per-job tracking in Redis (`config.redis_url`) with a short TTL (`config.liveness_ttl`, default 30s), best-effort behind a circuit breaker so it never slows jobs; crashed entries expire on their own. If Redis isn't reachable, the page says the feature is unavailable. (`config.track_running_jobs = false` disables the per-job writes.)
-  - **`:store`** — consumer **heartbeat + sampled current job** in the configured store (e.g. MySQL). Writes scale with the **number of consumers, not job throughput** (throttled to once per `config.liveness_heartbeat_interval`, default 5s), so it's reliable and low-impact — no per-job row churn. Staleness is handled by `last_seen` + a sweep in the reconciler. You see consumer count + what each is working on (sampled), rather than every individual in-flight job. Requires the `create_kafka_batch_consumer_heartbeats` migration on MySQL.
+  - **`:redis`** (default) — full per-job + per-consumer tracking in Redis (`config.redis_url`) with a short TTL (`config.liveness_ttl`, default 30s), best-effort behind a circuit breaker so it never slows jobs; crashed entries expire on their own (no sweep needed). If Redis isn't reachable, the page says the feature is unavailable. (`config.track_running_jobs = false` disables the per-job writes.)
   - **`:off`** — disabled.
 - **Actions** —
   - **Cancel** (running batches): sets status to `cancelled`; with `skip_cancelled_jobs` the remaining jobs stop processing (eventually-consistent — within `cancellation_cache_ttl`).
@@ -1740,9 +1767,8 @@ All keys use the `kafka_batch:` namespace. The gem never writes outside it.
 
 | Key pattern | Type | TTL | Contents |
 |---|---|---|---|
-| `kafka_batch:live:job:<job_id>` | STRING | `liveness_ttl` (default 30s) | JSON: `job_id`, `batch_id`, `worker_class`, `consumer_id`, `topic`, `partition`, `started_at`. Written when a job starts; expires automatically if the consumer crashes |
-| `kafka_batch:live:consumer:<consumer_id>` | STRING | `liveness_ttl` | JSON: `consumer_id`, `hostname`, `pid`, `topic`, `started_at`. One key per active consumer thread |
-| `kafka_batch:heartbeats` | HASH | none | field = `consumer_id`, value = JSON heartbeat. Used by liveness_backend `:redis` **and** `:store` for consumer-level tracking. Stale entries swept by the reconciler |
+| `kafka_batch:live:job:<consumer_id>:<job_id>` | STRING | `liveness_ttl` (default 30s) | JSON: `job_id`, `batch_id`, `worker_class`, `consumer_id`, `topic`, `partition`, `started_at`. Written when a job starts; expires automatically if the consumer crashes |
+| `kafka_batch:live:consumer:<consumer_id>` | STRING | `liveness_ttl` | JSON: `consumer_id`, `hostname`, `pid`, `topic`, `last_seen`. One key per active consumer thread |
 
 ---
 
@@ -1846,28 +1872,6 @@ One row per failing job (upserted on each failure event). Surfaced in the dashbo
 | `failed_at` | DATETIME | Time of this failure event |
 
 **Indexes:** unique on `(batch_id, job_id)`, `(batch_id, failed_at)` (per-batch listing), `failed_at` (cross-batch `/failures` view).
-
----
-
-#### `kafka_batch_consumer_heartbeats` — live consumer view
-
-One row per active consumer pod/thread (upserted on a throttled heartbeat). Used only when `liveness_backend: :store`. No auto-increment PK — consumer_id is the natural key.
-
-| Column | Type | Description |
-|---|---|---|
-| `consumer_id` | VARCHAR(128) | Unique consumer identifier (`hostname:pid:topic:partition`) |
-| `hostname` | VARCHAR(255) | Machine hostname |
-| `pid` | INT | Process ID |
-| `topic` | VARCHAR(255) | Topic this consumer is assigned to |
-| `current_job_id` | VARCHAR(36) | Job currently being processed (sampled) |
-| `current_worker` | VARCHAR(255) | Worker class of the current job |
-| `current_batch_id` | VARCHAR(36) | Batch of the current job |
-| `current_topic` | VARCHAR(255) | Source topic of the current job |
-| `current_partition` | INT | Source partition of the current job |
-| `jobs_done` | INT | Jobs processed by this consumer since startup |
-| `last_seen` | DATETIME | Last heartbeat time; rows with `last_seen < now - liveness_ttl` are considered stale |
-
-**Indexes:** unique on `consumer_id`, `last_seen` (stale sweep).
 
 ---
 

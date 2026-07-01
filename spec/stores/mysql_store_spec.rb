@@ -290,34 +290,6 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     end
   end
 
-  describe "liveness heartbeats (:store backend)" do
-    it "upserts, lists active, and sweeps stale heartbeats" do
-      store.record_heartbeat("c1", hostname: "h1", pid: 11, topic: "t",
-                             current_job_id: "j1", current_worker: "W", jobs_done: 2)
-
-      active = store.list_heartbeats(Time.now - 60)
-      expect(active.map { |h| h[:consumer_id] }).to eq(["c1"])
-      expect(active.first[:current_job_id]).to eq("j1")
-      expect(active.first[:jobs_done]).to eq(2)
-
-      # upsert same consumer (no duplicate row)
-      store.record_heartbeat("c1", hostname: "h1", pid: 11, topic: "t2", current_job_id: nil, jobs_done: 3)
-      reread = store.list_heartbeats(Time.now - 60)
-      expect(reread.size).to eq(1)
-      expect(reread.first[:current_job_id]).to be_nil
-      expect(reread.first[:jobs_done]).to eq(3)
-
-      # sweep everything
-      store.sweep_stale_heartbeats(Time.now + 60)
-      expect(store.list_heartbeats(Time.now - 60)).to be_empty
-    end
-
-    it "excludes heartbeats older than the since cutoff" do
-      store.record_heartbeat("c1", hostname: "h", pid: 1, jobs_done: 0)
-      expect(store.list_heartbeats(Time.now + 60)).to be_empty  # nothing newer than the future
-    end
-  end
-
   describe "admin UI queries" do
     it "#batch_status returns the status (or nil when unknown)" do
       id = new_batch

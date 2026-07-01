@@ -51,6 +51,9 @@ module KafkaBatch
         end
 
         Karafka::App.monitor.subscribe("app.stopped") do
+          # Stop the fairness forwarder thread (if this process ran one) before
+          # closing the producer, so no in-flight forward is cut off mid-produce.
+          KafkaBatch::Fairness::Forwarder.stop! if defined?(KafkaBatch::Fairness::Forwarder)
           KafkaBatch::Producer.reset!
         end
       else

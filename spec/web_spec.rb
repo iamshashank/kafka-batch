@@ -187,7 +187,6 @@ RSpec.describe KafkaBatch::Web do
 
     it "renders lanes, buffer depth and dispatcher status when a worker is fair" do
       allow(KafkaBatch).to receive(:fairness?).and_return(true)
-      KafkaBatch.config.fairness_ready_lag_high = 5000
       allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
       ingest_group = KafkaBatch.dispatch_consumer_group
       fair_group   = KafkaBatch.jobs_fair_consumer_group

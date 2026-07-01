@@ -56,15 +56,6 @@ module KafkaBatch
         end
         lost = lost_all.first(max)
         KafkaBatch.logger.info("[KafkaBatch][Reconciler] Found #{lost_all.size} lost-callback batch(es), processing #{lost.size}")
-
-        # ── 3. Sweep stale consumer heartbeats (:store liveness backend) ─────
-        if KafkaBatch.config.liveness_backend == :store
-          begin
-            KafkaBatch.store.sweep_stale_heartbeats(Time.now - KafkaBatch.config.liveness_ttl)
-          rescue => e
-            KafkaBatch.logger.warn("[KafkaBatch][Reconciler] heartbeat sweep failed: #{e.message}")
-          end
-        end
       end
 
       # Lock was not acquired (another process holds it) – nothing to do.

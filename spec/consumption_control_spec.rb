@@ -33,8 +33,11 @@ RSpec.describe KafkaBatch::ConsumptionControl do
 
   describe "mysql backend" do
     before do
-      KafkaBatch.config.store     = :mysql
-      KafkaBatch.config.redis_url = ""
+      KafkaBatch.config.store = :mysql
+      # Redis is a mandatory dependency now, so redis_url must be set. Simulate
+      # Redis being configured-but-unreachable to exercise the MySQL fallback.
+      KafkaBatch.config.redis_url = KafkaBatchSpec::RedisHelper::TEST_URL
+      allow(described_class).to receive(:detect_backend).and_return(:mysql)
       described_class.reset!
     end
 

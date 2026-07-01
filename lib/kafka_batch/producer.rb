@@ -17,15 +17,22 @@ module KafkaBatch
       #
       # @param topic   [String]
       # @param payload [Hash, String]
-      # @param key     [String, nil]   optional partition key
-      # @param headers [Hash]          optional Kafka headers
-      def produce_sync(topic:, payload:, key: nil, headers: {})
-        instance.produce_sync(
+      # @param key       [String, nil]   partition key (murmur2_random hash)
+      # @param partition [Integer, nil]  explicit partition number; skips key-hash when set
+      # @param headers   [Hash]          optional Kafka headers
+      def produce_sync(topic:, payload:, key: nil, partition: nil, headers: {})
+        msg = {
           topic:   topic,
           payload: encode(payload),
-          key:     key&.to_s,
           headers: headers
-        )
+        }
+        # Explicit partition takes precedence; when set, no key is needed.
+        if partition
+          msg[:partition] = partition
+        else
+          msg[:key] = key&.to_s
+        end
+        instance.produce_sync(**msg)
       rescue WaterDrop::Errors::BaseError, Rdkafka::RdkafkaError => e
         raise KafkaBatch::ProducerError, "Kafka produce failed: #{e.message}"
       end
@@ -38,15 +45,22 @@ module KafkaBatch
       # Sidekiq's push_bulk, without the per-message round-trip overhead of
       # calling produce_sync in a loop.
       #
-      # @param messages [Array<Hash>] each with keys: :topic, :payload, :key (opt), :headers (opt)
+      # @param messages [Array<Hash>] each with keys: :topic, :payload,
+      #                              :key (opt), :partition (opt), :headers (opt)
+      #   When :partition is set, :key is ignored for that message.
       def produce_many_sync(messages)
         encoded = messages.map do |m|
-          {
+          msg = {
             topic:   m[:topic],
             payload: encode(m[:payload]),
-            key:     m[:key]&.to_s,
             headers: m[:headers] || {}
           }
+          if m.key?(:partition) && !m[:partition].nil?
+            msg[:partition] = m[:partition]
+          else
+            msg[:key] = m[:key]&.to_s
+          end
+          msg
         end
         instance.produce_many_sync(encoded)
       rescue WaterDrop::Errors::BaseError, Rdkafka::RdkafkaError => e
