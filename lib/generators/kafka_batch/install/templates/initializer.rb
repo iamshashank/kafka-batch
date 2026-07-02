@@ -11,9 +11,9 @@ require "kafka_batch/ui"
 
 KafkaBatch.configure do |config|
   # ── State store ─────────────────────────────────────────────────────────────
-  # :mysql – persistent/queryable; run `rails g kafka_batch:install --store mysql`
-  #          then `rails db:migrate`.
-  # :redis – no migrations; batch state lives in Redis.
+  # :redis – (default) all batch ledger state in Redis; no migrations.
+  # :mysql – batch ledger still in Redis; run `rails g kafka_batch:install --store mysql`
+  #          then `rails db:migrate` for failures / pause / weight tables.
   config.store = :<%= @store %>
 
   # ── Kafka brokers ─────────────────────────────────────────────────────────────

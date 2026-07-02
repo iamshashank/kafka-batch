@@ -15,40 +15,11 @@ module KafkaBatchSpec
       @established = true
     end
 
-    # SQLite-compatible equivalent of the gem's MySQL migrations. The shipped
-    # migrations use MySQL-only DDL (ALTER TABLE ... ADD PRIMARY KEY), so for
-    # the test database we declare the same logical schema portably.
+    # SQLite-compatible schema for the MySQL store's relational tables.
+    # Batch ledger state (counters, dedup, reconciler indexes) lives in Redis.
     def load_schema!
       ActiveRecord::Schema.verbose = false
       ActiveRecord::Schema.define do
-        create_table :kafka_batch_records, id: :string, force: true do |t|
-          t.integer  :total_jobs,             null: false
-          t.integer  :completed_count,        null: false, default: 0
-          t.integer  :failed_count,           null: false, default: 0
-          t.string   :status,                 null: false, default: "running"
-          t.string   :on_success
-          t.string   :on_complete
-          t.string   :description
-          t.string   :tenant_id
-          t.text     :meta
-          t.datetime :created_at,             null: false
-          t.datetime :finished_at
-          t.datetime :callback_dispatched_at
-          t.string   :callback_dispatched_by
-          t.datetime :locked_at
-        end
-        add_index :kafka_batch_records, :status
-        add_index :kafka_batch_records, %i[status created_at]
-        add_index :kafka_batch_records, %i[status callback_dispatched_at finished_at]
-
-        create_table :kafka_batch_consumer_offsets, force: true do |t|
-          t.string   :source_topic,     null: false
-          t.integer  :source_partition, null: false
-          t.bigint   :last_offset,      null: false, default: 0
-          t.datetime :updated_at
-        end
-        add_index :kafka_batch_consumer_offsets, %i[source_topic source_partition], unique: true
-
         create_table :kafka_batch_failures, force: true do |t|
           t.string   :batch_id,      null: false
           t.string   :job_id,        null: false
@@ -78,8 +49,6 @@ module KafkaBatchSpec
     def truncate!
       establish!
       conn = ActiveRecord::Base.connection
-      conn.execute("DELETE FROM kafka_batch_records")
-      conn.execute("DELETE FROM kafka_batch_consumer_offsets")
       conn.execute("DELETE FROM kafka_batch_failures")
       conn.execute("DELETE FROM kafka_batch_consumption_pauses")
     end

@@ -1,270 +1,105 @@
 require "active_record"
 require_relative "base"
+require_relative "redis_store"
 
 module KafkaBatch
   module Stores
+    # MySQL-backed store for optional relational data. All hot batch-ledger work
+    # (counters, completion dedup, reconciler indexes, callback claims) is
+    # delegated to Redis to avoid hot-row contention on kafka_batch_records.
+    #
+    # MySQL holds:
+    #   - kafka_batch_failures          (dashboard failure log)
+    #   - kafka_batch_consumption_pauses (/lag pause state when Redis is down)
+    #   - kafka_batch_tenant_weights    (fairness weight overrides)
     class MysqlStore < Base
-      # ── Lazy model accessors ──────────────────────────────────────────────
-      # Built on first use so ActiveRecord doesn't need to be booted at
-      # require-time (avoids issues in tests and non-Rails environments).
+      attr_reader :ledger
 
-      # Bug #19 fix: set inheritance_column = nil on all anonymous AR models so
-      # ActiveRecord's STI machinery never activates on a "type" column (if any),
-      # and avoids class-name lookup errors on anonymous classes.
-      def batch_record_class
-        @batch_record_class ||= begin
-          klass = Class.new(ActiveRecord::Base)
-          klass.table_name        = "kafka_batch_records"
-          klass.inheritance_column = nil
-          klass
-        end
+      def initialize
+        @ledger = RedisStore.new
       end
 
-      def consumer_offset_class
-        @consumer_offset_class ||= begin
-          klass = Class.new(ActiveRecord::Base)
-          klass.table_name        = "kafka_batch_consumer_offsets"
-          klass.inheritance_column = nil
-          klass
-        end
-      end
+      # ── Batch ledger (Redis) ───────────────────────────────────────────────
 
-      def failure_class
-        @failure_class ||= begin
-          klass = Class.new(ActiveRecord::Base)
-          klass.table_name        = "kafka_batch_failures"
-          klass.inheritance_column = nil
-          klass
-        end
-      end
-
-      def consumption_pause_class
-        @consumption_pause_class ||= begin
-          klass = Class.new(ActiveRecord::Base)
-          klass.table_name        = "kafka_batch_consumption_pauses"
-          klass.inheritance_column = nil
-          klass
-        end
-      end
-
-      # ── Public interface ──────────────────────────────────────────────────
-
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, tenant_id: nil, sealed: true)
-        attrs = {
-          id:               id,
-          total_jobs:       total_jobs,
-          completed_count:  0,
-          failed_count:     0,
-          status:           "running",
-          on_success:       on_success,
-          on_complete:      on_complete,
-          meta:             serialize(meta),
-          locked_at:        sealed ? Time.now : nil  # locked_at == "sealed_at"
-        }
-        # Tolerate apps that haven't run the optional column migrations yet.
-        attrs[:description] = description if batch_record_class.column_names.include?("description")
-        attrs[:tenant_id]   = tenant_id   if batch_record_class.column_names.include?("tenant_id")
-        batch_record_class.create!(attrs)
-      rescue ActiveRecord::RecordNotUnique
-        nil  # idempotent – already created
-      end
-
-      # Bug #4 fix: lock-free compare-and-update replaces the SELECT FOR UPDATE +
-      # transaction pattern.  MySQL serialises concurrent UPDATEs to the same row
-      # internally so the increment is atomic without an explicit lock.  This
-      # eliminates the hot-path row-lock contention at 500 pods × batch.push rate.
-      def add_jobs(id, count)
-        affected = batch_record_class
-          .where(id: id, status: "running")
-          .where(callback_dispatched_at: nil)
-          .update_all("total_jobs = total_jobs + #{count.to_i}")
-        return :ok if affected == 1
-
-        # Determine why the guard rejected the update (one extra SELECT, only on
-        # the slow path — i.e. when the batch is closed or missing).
-        record = batch_record_class
-          .select(:id, :status, :callback_dispatched_at)
-          .find_by(id: id)
-        return :not_found  if record.nil?
-        return :cancelled  if record.status == "cancelled"
-        :closed
-      end
-
-      def seal_batch(id)
-        result = nil
-        batch_record_class.transaction do
-          record = batch_record_class.lock.find_by(id: id)
-          if record.nil?
-            result = :not_found
-          else
-            was_running = record.status == "running"
-            record.update!(locked_at: Time.now) if record.locked_at.nil?
-
-            if was_running && record.completed_count + record.failed_count >= record.total_jobs
-              outcome = record.failed_count.positive? ? "complete" : "success"
-              record.update!(status: outcome, finished_at: Time.now)
-              result = { status: :done, outcome: outcome, batch: record_to_hash(record) }
-            else
-              result = { status: :sealed }
-            end
-          end
-        end
-        result.is_a?(Hash) ? result : { status: result }
+      def create_batch(**kwargs)
+        ledger.create_batch(**kwargs)
       end
 
       def find_batch(id)
-        record = batch_record_class.find_by(id: id)
-        return nil unless record
-        record_to_hash(record)
+        ledger.find_batch(id)
       end
 
-      # Dedup by a monotonic per-partition cursor over the job message's source
-      # coordinates. One row per (topic, partition), independent of batch size.
-      #
-      # Bug #4 fix: the cursor lookup is now a plain SELECT (no FOR UPDATE).
-      # Kafka's partition-assignment model guarantees that only ONE consumer
-      # processes each (topic, partition) at a time, so there is no concurrent
-      # writer on the offset row and the lock was purely defensive overhead.
-      # apply_completion still holds a FOR UPDATE on the batch row to ensure
-      # at-most-once finalization when multiple consumers share the same batch.
-      def record_completion_by_offset(batch_id:, source_topic:, source_partition:, source_offset:, status:)
-        offset = source_offset.to_i
-        result = nil
-
-        batch_record_class.transaction do
-          cursor = consumer_offset_class.find_by(
-            source_topic: source_topic, source_partition: source_partition
-          )
-
-          if cursor && offset <= cursor.last_offset
-            # Already applied (redelivered or re-produced) – skip.
-            result = { status: :duplicate }
-          else
-            if cursor
-              cursor.update!(last_offset: offset)
-            else
-              consumer_offset_class.create!(
-                source_topic: source_topic, source_partition: source_partition, last_offset: offset
-              )
-            end
-            result = apply_completion(batch_id, status)
-          end
-        end
-
-        result
+      def add_jobs(id, count)
+        ledger.add_jobs(id, count)
       end
 
-      # Batched counter application for a whole Kafka poll. One transaction:
-      #   1. dedup per source partition + advance each cursor once (to its max
-      #      new offset) — re-delivered offsets are skipped, none are missed;
-      #   2. aggregate +N per (batch, status);
-      #   3. apply one UPDATE per batch (rows locked in sorted id order to avoid
-      #      deadlocks) and finalize any batch that reached its total.
-      # @return [Array<Hash>] { batch:, outcome: } for batches that just finished
-      #
-      # Bug #4 fixes applied here:
-      #   Phase 1: plain SELECT (no FOR UPDATE) on cursor rows — Kafka partition
-      #            ownership ensures no concurrent writers on the same row.
-      #   Phase 3: compute new counts in-memory instead of calling record.reload
-      #            after update_all, eliminating one extra SELECT inside the lock.
+      def seal_batch(id)
+        ledger.seal_batch(id)
+      end
+
       def record_completions_batch(events)
-        return [] if events.empty?
-
-        finalized = []
-        batch_record_class.transaction do
-          # ── Phase 1: dedup + advance cursors (no FOR UPDATE on cursor rows) ──
-          applicable = []
-          events.group_by { |e| [e[:source_topic], e[:source_partition]] }
-                .sort_by { |(t, p), _| [t.to_s, p.to_i] }
-                .each do |(topic, partition), evs|
-            # Bug #4: plain find_by — no .lock — cursor rows are partition-owned.
-            cursor = consumer_offset_class.find_by(source_topic: topic, source_partition: partition)
-            last   = cursor ? cursor.last_offset : -1
-            maxoff = last
-            seen   = {}
-            evs.each do |e|
-              off    = e[:source_offset].to_i
-              maxoff = off if off > maxoff
-              next if off <= last || seen[off]  # duplicate / already applied
-              seen[off] = true
-              applicable << e
-            end
-            if maxoff > last
-              cursor ? cursor.update!(last_offset: maxoff)
-                     : consumer_offset_class.create!(source_topic: topic, source_partition: partition, last_offset: maxoff)
-            end
-          end
-
-          # ── Phase 2: aggregate increments per batch ─────────────────────────
-          incr = Hash.new { |h, k| h[k] = [0, 0] }  # batch_id => [completed, failed]
-          applicable.each do |e|
-            idx = e[:status] == "success" ? 0 : 1
-            incr[e[:batch_id]][idx] += 1
-          end
-
-          # ── Phase 3: apply per batch + finalize (sorted id => stable lock order) ──
-          incr.keys.sort.each do |batch_id|
-            done, n_failed = incr[batch_id]
-            record = batch_record_class.lock.find_by(id: batch_id)
-            next if record.nil?
-            next if %w[success complete cancelled].include?(record.status)
-
-            sets = []
-            sets << "completed_count = completed_count + #{done.to_i}"     if done.positive?
-            sets << "failed_count = failed_count + #{n_failed.to_i}"       if n_failed.positive?
-            batch_record_class.where(id: batch_id).update_all(sets.join(", ")) unless sets.empty?
-
-            # Bug #4: compute new values in-memory — avoids record.reload (an extra
-            # SELECT round-trip) while the FOR UPDATE lock is still held.
-            new_completed = record.completed_count + done
-            new_failed    = record.failed_count    + n_failed
-
-            if record.locked_at && new_completed + new_failed >= record.total_jobs
-              outcome = new_failed.positive? ? "complete" : "success"
-              record.update!(status: outcome, finished_at: Time.now)
-              finalized << { batch: record_to_hash(record), outcome: outcome }
-            end
-          end
-        end
-        finalized
+        ledger.record_completions_batch(events)
       end
 
-      # Atomically claim callback dispatch rights.
-      # Uses a conditional UPDATE (WHERE callback_dispatched_at IS NULL) as a
-      # compare-and-swap.  Only the process whose UPDATE affected 1 row wins;
-      # all others receive false and must skip callback invocation.
+      def record_completion_by_offset(**kwargs)
+        ledger.record_completion_by_offset(**kwargs)
+      end
+
       def claim_callback(id, dispatched_by = nil)
-        attrs = { callback_dispatched_at: Time.now }
-        if dispatched_by && batch_record_class.column_names.include?("callback_dispatched_by")
-          attrs[:callback_dispatched_by] = dispatched_by
-        end
-        rows = batch_record_class
-                 .where(id: id, callback_dispatched_at: nil)
-                 .update_all(attrs)
-        rows > 0
+        ledger.claim_callback(id, dispatched_by)
       end
 
       def callback_dispatched?(id)
-        batch_record_class
-          .where(id: id)
-          .where.not(callback_dispatched_at: nil)
-          .exists?
+        ledger.callback_dispatched?(id)
       end
 
       def update_batch_status(id, status)
-        batch_record_class.where(id: id).update_all(status: status)
+        ledger.update_batch_status(id, status)
       end
 
       def batch_status(id)
-        batch_record_class.where(id: id).limit(1).pluck(:status).first
+        ledger.batch_status(id)
       end
 
-      # Uses the existing index on :status.
       def cancelled_batch_ids
-        batch_record_class.where(status: "cancelled").pluck(:id)
+        ledger.cancelled_batch_ids
       end
 
-      # Bug #4 fix: add a retry cap so RecordNotUnique can't spin forever.
+      def list_batches(**kwargs)
+        ledger.list_batches(**kwargs)
+      end
+
+      def pending_jobs_total
+        ledger.pending_jobs_total
+      end
+
+      def batch_counts
+        ledger.batch_counts
+      end
+
+      def mark_finished(id, outcome)
+        ledger.mark_finished(id, outcome)
+      end
+
+      def stale_batches(**kwargs)
+        ledger.stale_batches(**kwargs)
+      end
+
+      def done_batches_without_callback(**kwargs)
+        ledger.done_batches_without_callback(**kwargs)
+      end
+
+      def delete_batch(id)
+        failure_class.where(batch_id: id).delete_all
+        ledger.delete_batch(id)
+      end
+
+      def with_reconciler_lock(**kwargs, &block)
+        ledger.with_reconciler_lock(**kwargs, &block)
+      end
+
+      # ── Failures (MySQL) ───────────────────────────────────────────────────
+
       def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)
         attrs = {
           worker_class:  worker_class.to_s,
@@ -277,7 +112,6 @@ module KafkaBatch
         }
         retries = 0
         begin
-          # Upsert per (batch_id, job_id): reflect the latest failed attempt.
           rec = failure_class.find_by(batch_id: batch_id, job_id: job_id)
           if rec
             rec.update!(attrs)
@@ -285,7 +119,6 @@ module KafkaBatch
             failure_class.create!(attrs.merge(batch_id: batch_id, job_id: job_id))
           end
         rescue ActiveRecord::RecordNotUnique
-          # Lost a create race – the row now exists; retry the find+update path.
           retries += 1
           retry if retries < 3
           KafkaBatch.logger.error(
@@ -374,107 +207,24 @@ module KafkaBatch
         { topics: topics, partitions: partitions }
       end
 
-      def list_batches(status: nil, limit: 50, offset: 0, search: nil)
-        scope = batch_record_class.order(created_at: :desc)
-        scope = scope.where(status: status) if status
-        if (q = presence(search))
-          like = "%#{sanitize_like(q)}%"
-          if batch_record_class.column_names.include?("description")
-            scope = scope.where("id LIKE :q OR description LIKE :q", q: like)
-          else
-            scope = scope.where("id LIKE :q", q: like)
-          end
-        end
-        scope.limit(limit).offset(offset).map { |r| record_to_hash(r) }
-      end
-
-      # Bug #9 fix: cache batch_counts for 5 seconds to avoid a full-table GROUP BY
-      # on every web request. The store instance is a singleton so the cache is
-      # process-wide and consistent with the instance's connection.
-      #
-      # Fix #19: guard @batch_counts_cache with a dedicated mutex. The store
-      # instance is shared across all threads (JRuby / TruffleRuby run truly
-      # parallel threads), so two threads doing a simultaneous read-then-write
-      # can race: both see a stale cache, both hit the DB, both write back —
-      # harmless on MRI (GIL) but a genuine data race on multi-threaded runtimes.
-      # A single Mutex adds negligible overhead (the DB query itself dominates).
-      def batch_counts
-        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        counts_mutex.synchronize do
-          if @batch_counts_cache && (now - @batch_counts_cache[:at]) < 5
-            return @batch_counts_cache[:counts]
-          end
-          counts = batch_record_class.group(:status).count
-          @batch_counts_cache = { counts: counts, at: now }
-          counts
-        end
-      end
-
-      def mark_finished(id, outcome)
-        batch_record_class
-          .where(id: id)
-          .update_all(status: outcome, finished_at: Time.now)
-      end
-
-      def pending_jobs_total
-        sum = batch_record_class.where(status: "running")
-                                .sum("total_jobs - completed_count - failed_count")
-        [sum.to_i, 0].max
-      end
-
-      def stale_batches(older_than:)
-        batch_record_class
-          .where(status: "running")
-          .where("created_at < ?", older_than)
-          .map { |r| record_to_hash(r) }
-      end
-
-      # Batches that finished but whose callback was never dispatched.
-      # Identified by: terminal status + null callback_dispatched_at + finished_at is old.
-      def done_batches_without_callback(older_than:)
-        batch_record_class
-          .where(status: %w[success complete])
-          .where(callback_dispatched_at: nil)
-          .where("finished_at < ?", older_than)
-          .map { |r| record_to_hash(r) }
-      end
-
-      def delete_batch(id)
-        batch_record_class.transaction do
-          failure_class.where(batch_id: id).delete_all
-          batch_record_class.where(id: id).delete_all
-        end
-      end
-
-      # Distributed lock using MySQL advisory locks (GET_LOCK / RELEASE_LOCK).
-      # GET_LOCK(name, 0) returns 1 if acquired, 0 if another session holds it.
-      # Using timeout=0 so we don't block; the reconciler simply skips if locked.
-      #
-      # Bug #15 fix: use with_connection to hold an explicit checkout for the
-      # entire lock lifetime. MySQL advisory locks are connection-scoped; if the
-      # pool recycles `connection` between GET_LOCK and RELEASE_LOCK the lock is
-      # silently orphaned on the recycled connection and we lose mutual exclusion.
-      def with_reconciler_lock(ttl: 300)
-        lock_name = "kafka_batch_reconciler"
-
-        batch_record_class.connection_pool.with_connection do |conn|
-          acquired = conn.select_value("SELECT GET_LOCK(#{conn.quote(lock_name)}, 0)").to_i
-          return unless acquired == 1
-
-          begin
-            yield
-          ensure
-            conn.execute("SELECT RELEASE_LOCK(#{conn.quote(lock_name)})")
-          end
-        end
-      rescue => e
-        KafkaBatch.logger.error("[KafkaBatch][MysqlStore] Reconciler lock error: #{e.message}")
-      end
-
       private
 
-      def counts_mutex
-        @counts_mutex ||= Mutex.new
+      def failure_class
+        @failure_class ||= begin
+          klass = Class.new(ActiveRecord::Base)
+          klass.table_name        = "kafka_batch_failures"
+          klass.inheritance_column = nil
+          klass
+        end
+      end
+
+      def consumption_pause_class
+        @consumption_pause_class ||= begin
+          klass = Class.new(ActiveRecord::Base)
+          klass.table_name        = "kafka_batch_consumption_pauses"
+          klass.inheritance_column = nil
+          klass
+        end
       end
 
       def failures_scope(scope, limit, offset, include_batch_id: false)
@@ -492,83 +242,6 @@ module KafkaBatch
           h[:batch_id] = r.batch_id if include_batch_id
           h
         end
-      end
-
-      # Increment the batch counter and detect completion. MUST be called from
-      # within a transaction. FOR UPDATE locks the batch row so two concurrent
-      # processes don't both observe completion and both fire the callback.
-      #
-      # Bug #4 fix: compute new counts in-memory instead of calling record.reload
-      # after update_all. update_all issues one SQL UPDATE; AR's in-memory
-      # representation is stale but we know exactly what changed (+1 on one
-      # counter), so we compute the new values without an extra SELECT round-trip
-      # inside the lock window.
-      def apply_completion(batch_id, status)
-        record = batch_record_class.lock.find_by(id: batch_id)
-        return { status: :not_found } if record.nil?
-        return { status: :duplicate } if %w[success complete cancelled].include?(record.status)
-
-        field = status == "success" ? "completed_count" : "failed_count"
-        batch_record_class.where(id: batch_id).update_all("#{field} = #{field} + 1")
-
-        # Bug #4: compute new values without reload.
-        new_completed = record.completed_count + (status == "success" ? 1 : 0)
-        new_failed    = record.failed_count    + (status != "success" ? 1 : 0)
-
-        # Only finalize (and fire callbacks) once the batch is sealed – a held
-        # (block-form, not-yet-sealed) batch may still receive more jobs even if
-        # currently at its total. locked_at doubles as the "sealed_at" marker.
-        if record.locked_at && new_completed + new_failed >= record.total_jobs
-          outcome = new_failed.positive? ? "complete" : "success"
-          # record.update! refreshes the model's attributes in-place (no extra SELECT).
-          record.update!(status: outcome, finished_at: Time.now)
-          { status: :done, outcome: outcome, batch: record_to_hash(record) }
-        else
-          { status: :continue }
-        end
-      end
-
-      def record_to_hash(r)
-        {
-          id:                     r.id,
-          total_jobs:             r.total_jobs,
-          completed_count:        r.completed_count,
-          failed_count:           r.failed_count,
-          status:                 r.status,
-          on_success:             r.on_success,
-          on_complete:            r.on_complete,
-          description:            (r.respond_to?(:description) ? r.description : nil),
-          tenant_id:              (r.respond_to?(:tenant_id)   ? r.tenant_id   : nil),
-          meta:                   deserialize(r.meta),
-          created_at:             r.created_at,
-          finished_at:            r.respond_to?(:finished_at)            ? r.finished_at            : nil,
-          callback_dispatched_at: r.respond_to?(:callback_dispatched_at) ? r.callback_dispatched_at : nil,
-          callback_dispatched_by: (r.respond_to?(:callback_dispatched_by) ? r.callback_dispatched_by : nil),
-          locked_at:              r.respond_to?(:locked_at)              ? r.locked_at              : nil
-        }
-      end
-
-      def presence(value)
-        return nil if value.nil?
-        s = value.to_s
-        s.empty? ? nil : s
-      end
-
-      # Escape LIKE wildcards so user input is matched literally.
-      def sanitize_like(str)
-        str.to_s.gsub(/[\\%_]/) { |c| "\\#{c}" }
-      end
-
-      def serialize(obj)
-        return nil if obj.nil? || (obj.respond_to?(:empty?) && obj.empty?)
-        Oj.dump(obj, mode: :compat)
-      end
-
-      def deserialize(str)
-        return {} if str.nil? || str.empty?
-        Oj.load(str)
-      rescue Oj::ParseError
-        {}
       end
     end
   end

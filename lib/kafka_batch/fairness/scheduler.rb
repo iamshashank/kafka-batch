@@ -159,43 +159,63 @@ module KafkaBatch
           end
         end
 
+        -- Two-pass, WORK-CONSERVING selection:
+        --   round 1 (fair)     : respect the per-tenant fair-share cap.
+        --   round 2 (fallback) : if the fair pass found nothing dispatchable but
+        --                        the global budget still has room, fill the slack
+        --                        ignoring the DYNAMIC fair-share cap (still honor
+        --                        the absolute hard cap `cap` and the global budget).
+        -- This guarantees full utilization when few tenants are active (a lone
+        -- tenant uses the whole budget) without starving newcomers: fairness only
+        -- binds under contention (when the fair pass can fill the budget), and any
+        -- freed slot goes to the lowest-vtime tenant first as jobs complete.
         local members = redis.call('ZRANGE', ring, 0, fetch_n)
-        for i = 1, #members do
-          local t   = members[i]
-          local tin = tonumber(redis.call('HGET', inf, t) or '0')
+        for round = 1, 2 do
+          local fallback = (round == 2)
+          for i = 1, #members do
+            local t   = members[i]
+            local tin = tonumber(redis.call('HGET', inf, t) or '0')
 
-          local eff_cap = 0
-          if budget > 0 then
-            if weighted == 1 then
-              local w_t = tonumber(redis.call('HGET', wh, t) or dw)
-              if w_t == nil or w_t <= 0 then w_t = dw end
-              eff_cap = math.floor(budget * w_t / sum_w)
-              if eff_cap < 1 then eff_cap = 1 end
+            local dispatchable
+            if fallback then
+              -- Slack fill: only the absolute hard cap (if any) still applies.
+              dispatchable = (cap == 0 or tin < cap)
             else
-              eff_cap = math.ceil(budget / active)
-              if eff_cap < 1 then eff_cap = 1 end
-            end
-          end
-          if cap > 0 and (eff_cap == 0 or cap < eff_cap) then eff_cap = cap end
-
-          if eff_cap == 0 or tin < eff_cap then
-            local rk  = rprefix .. t
-            local job = redis.call('LPOP', rk)
-            if job then
-              local w = tonumber(redis.call('HGET', wh, t) or dw)
-              if w == nil or w <= 0 then w = dw end
-              local vt = tonumber(redis.call('ZSCORE', ring, t)) + (1.0 / w)
-              redis.call('HSET', vth, t, vt)
-              if redis.call('LLEN', rk) == 0 then
-                redis.call('ZREM', ring, t)
-              else
-                redis.call('ZADD', ring, vt, t)
+              local eff_cap = 0
+              if budget > 0 then
+                if weighted == 1 then
+                  local w_t = tonumber(redis.call('HGET', wh, t) or dw)
+                  if w_t == nil or w_t <= 0 then w_t = dw end
+                  eff_cap = math.floor(budget * w_t / sum_w)
+                  if eff_cap < 1 then eff_cap = 1 end
+                else
+                  eff_cap = math.ceil(budget / active)
+                  if eff_cap < 1 then eff_cap = 1 end
+                end
               end
-              redis.call('HINCRBY', inf, t, 1)
-              redis.call('INCR', inftot)
-              return {1, t, job}
-            else
-              redis.call('ZREM', ring, t)  -- stale entry: self-heal
+              if cap > 0 and (eff_cap == 0 or cap < eff_cap) then eff_cap = cap end
+              dispatchable = (eff_cap == 0 or tin < eff_cap)
+            end
+
+            if dispatchable then
+              local rk  = rprefix .. t
+              local job = redis.call('LPOP', rk)
+              if job then
+                local w = tonumber(redis.call('HGET', wh, t) or dw)
+                if w == nil or w <= 0 then w = dw end
+                local vt = tonumber(redis.call('ZSCORE', ring, t)) + (1.0 / w)
+                redis.call('HSET', vth, t, vt)
+                if redis.call('LLEN', rk) == 0 then
+                  redis.call('ZREM', ring, t)
+                else
+                  redis.call('ZADD', ring, vt, t)
+                end
+                redis.call('HINCRBY', inf, t, 1)
+                redis.call('INCR', inftot)
+                return {1, t, job}
+              else
+                redis.call('ZREM', ring, t)  -- stale entry: self-heal
+              end
             end
           end
         end
@@ -253,39 +273,53 @@ module KafkaBatch
           end
         end
 
+        -- Two-pass, WORK-CONSERVING selection (see CHECKOUT_LUA_COUNT): a fair
+        -- pass respecting the per-tenant fair-share cap, then a fallback pass that
+        -- fills any remaining global budget ignoring the dynamic cap (honoring the
+        -- absolute hard cap). Guarantees full utilization when few tenants are
+        -- active without starving newcomers.
         local members = redis.call('ZRANGE', ring, 0, fetch_n)
-        for i = 1, #members do
-          local t   = members[i]
-          local tin = tonumber(redis.call('HGET', inf, t) or '0')
+        for round = 1, 2 do
+          local fallback = (round == 2)
+          for i = 1, #members do
+            local t   = members[i]
+            local tin = tonumber(redis.call('HGET', inf, t) or '0')
 
-          local eff_cap = 0
-          if budget > 0 then
-            if weighted == 1 then
-              local w_t = tonumber(redis.call('HGET', wh, t) or dw)
-              if w_t == nil or w_t <= 0 then w_t = dw end
-              eff_cap = math.floor(budget * w_t / sum_w)
-              if eff_cap < 1 then eff_cap = 1 end
+            local dispatchable
+            if fallback then
+              dispatchable = (cap == 0 or tin < cap)
             else
-              eff_cap = math.ceil(budget / active)
-              if eff_cap < 1 then eff_cap = 1 end
-            end
-          end
-          if cap > 0 and (eff_cap == 0 or cap < eff_cap) then eff_cap = cap end
-
-          if eff_cap == 0 or tin < eff_cap then
-            local rk  = rprefix .. t
-            local job = redis.call('LPOP', rk)
-            if job then
-              if redis.call('LLEN', rk) == 0 then
-                redis.call('ZREM', ring, t)
+              local eff_cap = 0
+              if budget > 0 then
+                if weighted == 1 then
+                  local w_t = tonumber(redis.call('HGET', wh, t) or dw)
+                  if w_t == nil or w_t <= 0 then w_t = dw end
+                  eff_cap = math.floor(budget * w_t / sum_w)
+                  if eff_cap < 1 then eff_cap = 1 end
+                else
+                  eff_cap = math.ceil(budget / active)
+                  if eff_cap < 1 then eff_cap = 1 end
+                end
               end
-              -- vtime intentionally NOT advanced here; done at completion with
-              -- the actual duration so accounting reflects wall-clock usage.
-              redis.call('HINCRBY', inf, t, 1)
-              redis.call('INCR', inftot)
-              return {1, t, job}
-            else
-              redis.call('ZREM', ring, t)  -- stale entry: self-heal
+              if cap > 0 and (eff_cap == 0 or cap < eff_cap) then eff_cap = cap end
+              dispatchable = (eff_cap == 0 or tin < eff_cap)
+            end
+
+            if dispatchable then
+              local rk  = rprefix .. t
+              local job = redis.call('LPOP', rk)
+              if job then
+                if redis.call('LLEN', rk) == 0 then
+                  redis.call('ZREM', ring, t)
+                end
+                -- vtime intentionally NOT advanced here; done at completion with
+                -- the actual duration so accounting reflects wall-clock usage.
+                redis.call('HINCRBY', inf, t, 1)
+                redis.call('INCR', inftot)
+                return {1, t, job}
+              else
+                redis.call('ZREM', ring, t)  -- stale entry: self-heal
+              end
             end
           end
         end

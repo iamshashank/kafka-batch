@@ -2,8 +2,8 @@ RSpec.describe KafkaBatch::Configuration do
   subject(:config) { described_class.new }
 
   describe "defaults" do
-    it "defaults to the mysql store" do
-      expect(config.store).to eq(:mysql)
+    it "defaults to the redis store" do
+      expect(config.store).to eq(:redis)
     end
 
     it "ships sane topic + retry defaults" do

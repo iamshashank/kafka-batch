@@ -1223,6 +1223,7 @@ module KafkaBatch
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def pending(b)
+      return 0 if %w[success complete cancelled].include?(b[:status])
       [b[:total_jobs].to_i - b[:completed_count].to_i - b[:failed_count].to_i, 0].max
     end
 

@@ -165,8 +165,9 @@ module KafkaBatch
         end
 
         batch_id = data["batch_id"]
+        job_id   = data["job_id"]
         status   = data["status"]
-        unless batch_id && status
+        unless batch_id && job_id && status
           KafkaBatch.logger.warn("[KafkaBatch][EventConsumer] Malformed event – skipping: #{data.inspect}")
           return nil
         end

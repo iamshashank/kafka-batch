@@ -102,6 +102,39 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
     end
   end
 
+  describe "work-conserving fallback (full utilization with few tenants)" do
+    it "fills the whole budget for one tenant even when the fair cap is tiny" do
+      KafkaBatch.config.fairness_global_concurrency      = 10
+      KafkaBatch.config.fairness_max_inflight_per_tenant = 0
+      # Simulate an active set that just shrank (stale-high smoothed count).
+      allow(scheduler).to receive(:active_view).and_return(count: 20, sum_weight: 0.0)
+      15.times { |i| scheduler.enqueue("only", "j#{i}") }
+
+      expect(drain(30).size).to eq(10)  # full budget used despite ceil(10/20)=1 fair cap
+    end
+
+    it "still honors an absolute hard cap in the fallback" do
+      KafkaBatch.config.fairness_global_concurrency      = 10
+      KafkaBatch.config.fairness_max_inflight_per_tenant = 3   # hard ceiling
+      allow(scheduler).to receive(:active_view).and_return(count: 20, sum_weight: 0.0)
+      15.times { |i| scheduler.enqueue("only", "j#{i}") }
+
+      expect(drain(30).size).to eq(3)   # fallback fills slack but never past the hard cap
+    end
+
+    it "does not fire the fallback under real contention (caps hold, split stays fair)" do
+      KafkaBatch.config.fairness_global_concurrency      = 8
+      KafkaBatch.config.fairness_max_inflight_per_tenant = 0
+      20.times { |i| scheduler.enqueue("A", "a#{i}") }
+      20.times { |i| scheduler.enqueue("B", "b#{i}") }
+
+      counts = drain(20).map { |j| j[:tenant_id] }.tally
+      expect(counts.values.sum).to eq(8)
+      expect(counts["A"]).to eq(4)   # equal fair share ceil(8/2), fair pass fills budget
+      expect(counts["B"]).to eq(4)
+    end
+  end
+
   describe "smoothed active-tenant view" do
     it "counts distinct tenants with queued OR in-flight work (not just the ring)" do
       scheduler.enqueue("A", "a0")   # 1 job each
@@ -113,14 +146,15 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       expect(view[:count]).to eq(2)
     end
 
-    it "uses the cached active count as a cap FLOOR so a lone tenant doesn't balloon" do
+    it "stays work-conserving: a lone active tenant uses the FULL budget even if the smoothed count is high" do
       KafkaBatch.config.fairness_global_concurrency = 8
       # Pretend 4 tenants are active even though only one has work right now.
       allow(scheduler).to receive(:active_view).and_return(count: 4, sum_weight: 0.0)
       10.times { |i| scheduler.enqueue("solo", "s#{i}") }
 
-      # equal cap = ceil(8 / max(ZCARD=1, hint=4)) = ceil(8/4) = 2
-      expect(drain(20).size).to eq(2)
+      # Fair pass caps solo at ceil(8/4)=2, but the work-conserving fallback fills
+      # the remaining budget (no other tenant wants it) → full utilization.
+      expect(drain(20).size).to eq(8)
     end
 
     it "caches the view within fairness_active_count_ttl (one compute per window)" do

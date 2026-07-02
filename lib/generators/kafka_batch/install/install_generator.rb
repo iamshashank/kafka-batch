@@ -9,8 +9,8 @@ module KafkaBatch
       desc "Creates a KafkaBatch initializer, copies the topic-creation shell " \
            "script, and (when --store mysql) copies migrations."
 
-      class_option :store, type: :string, default: "mysql",
-                           desc: "State store to use: mysql or redis"
+      class_option :store, type: :string, default: "redis",
+                           desc: "State store: redis (default) or mysql (failures/pauses in MySQL)"
 
       def validate_store_option
         unless %w[mysql redis].include?(options[:store])
@@ -83,9 +83,9 @@ module KafkaBatch
         say "   - max_message_bytes  (1 MiB default; match your broker limit)\n"
         say "   - reconciliation_interval / max_reconcile_per_run\n"
         say "   - liveness_backend  (:redis / :off)\n"
-        if @store == "redis"
-          say "   - redis_url / redis_pool_size / batch_ttl\n"
-          say "   - all_index_max_size  (batch list page history cap)\n"
+        say "   - redis_url / redis_pool_size / batch_ttl / all_index_max_size  (required)\n"
+        if @store == "mysql"
+          say "   - run rails db:migrate (failures, pauses, tenant weights)\n"
         end
         say "\n"
       end

@@ -36,6 +36,10 @@ RSpec.configure do |config|
       # Liveness writes to Redis; keep it off for the bulk of specs and enable
       # explicitly in the liveness/web specs that exercise it.
       c.track_running_jobs = false
+      if KafkaBatchSpec::RedisHelper.available?
+        c.redis_url = KafkaBatchSpec::RedisHelper::TEST_URL
+        KafkaBatchSpec::RedisHelper.flush!
+      end
     end
 
     # Every spec gets a clean SQLite schema + a recording producer by default.

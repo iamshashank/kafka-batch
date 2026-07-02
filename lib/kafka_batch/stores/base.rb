@@ -35,13 +35,12 @@ module KafkaBatch
       # whole Kafka poll's worth of counter updates costs far fewer row locks /
       # round-trips than one transaction per event.
       #
-      # MUST be exactly-once per event: each event is deduplicated by the same
-      # monotonic per-(source_topic, source_partition) cursor used by
-      # #record_completion_by_offset, so re-delivered or re-produced events are
-      # never double-counted and none are missed.
+      # MUST be exactly-once per event: each event is deduplicated by job_id so
+      # re-delivered events are never double-counted and out-of-order completions
+      # on the same source partition are all counted.
       #
-      # @param events [Array<Hash>] each: { batch_id:, source_topic:,
-      #   source_partition:, source_offset:, status: } in delivery (offset) order
+      # @param events [Array<Hash>] each: { batch_id:, job_id:, source_topic:,
+      #   source_partition:, source_offset:, status: }
       # @return [Array<Hash>] batches that JUST finalized: { batch:, outcome: }
       def record_completions_batch(events)
         raise NotImplementedError, "#{self.class}#record_completions_batch"
@@ -53,18 +52,16 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#find_batch"
       end
 
-      # Atomically record that a single job finished, deduplicating by the job
-      # message's immutable source coordinates. A completion is applied only if
-      # +source_offset+ is strictly greater than the stored monotonic cursor for
-      # (source_topic, source_partition); this absorbs both redelivered and
-      # re-produced events with O(num_partitions) state regardless of batch size.
+      # Atomically record that a single job finished, deduplicating by job_id.
+      # Each job counts at most once regardless of completion order on the
+      # source partition. source_* coords are retained for provenance.
       #
       # @return [Hash]
       #   { status: :done,      outcome: "success"|"complete", batch: <hash> }
       #   { status: :continue                                                 }
       #   { status: :duplicate                                                }
       #   { status: :not_found                                                }
-      def record_completion_by_offset(batch_id:, source_topic:, source_partition:, source_offset:, status:)
+      def record_completion_by_offset(batch_id:, job_id:, source_topic:, source_partition:, source_offset:, status:)
         raise NotImplementedError, "#{self.class}#record_completion_by_offset"
       end
 

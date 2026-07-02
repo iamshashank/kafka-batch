@@ -24,7 +24,7 @@ RSpec.describe KafkaBatch::Batch do
         # All jobs finish while we're still populating: must NOT finalize yet.
         observed = KafkaBatch.store.record_completion_by_offset(
           batch_id: b.id, source_topic: "test.success", source_partition: 0,
-          source_offset: 1, status: "success"
+          job_id: "j1", source_offset: 1, status: "success"
         )
       end
 
@@ -81,7 +81,7 @@ RSpec.describe KafkaBatch::Batch do
 
       result = KafkaBatch.store.record_completion_by_offset(
         batch_id: batch.id, source_topic: "test.success", source_partition: 0,
-        source_offset: 1, status: "success"
+        job_id: "j1", source_offset: 1, status: "success"
       )
       expect(result[:status]).to eq(:done)
       expect(KafkaBatch.store.find_batch(batch.id)[:status]).to eq("success")
@@ -226,7 +226,7 @@ RSpec.describe KafkaBatch::Batch do
         b.push(SuccessfulWorker, {})
         KafkaBatch.store.record_completion_by_offset(
           batch_id: b.id, source_topic: "test.success",
-          source_partition: 0, source_offset: 1, status: "success"
+          source_partition: 0, job_id: "j1", source_offset: 1, status: "success"
         )
       end
       # seal! fires now that the batch is drained; callback produced above.

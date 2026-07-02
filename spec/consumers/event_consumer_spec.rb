@@ -2,7 +2,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
   let(:consumer) { build_consumer(described_class) }
 
   # Completion events carry the job message's source coordinates and are
-  # deduplicated by a monotonic per-partition cursor.
+  # deduplicated by job_id.
   def event(id:, status:, src_offset:, src_partition: 0, src_topic: "wt")
     FakeMessage.new(
       topic:   KafkaBatch.config.events_topic,
@@ -39,7 +39,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     msgs = [
       event(id: id, status: "success", src_offset: 10),
       event(id: id, status: "success", src_offset: 11),
-      event(id: id, status: "success", src_offset: 10),  # duplicate offset – must not double-count
+      event(id: id, status: "success", src_offset: 10),  # duplicate job_id – must not double-count
       event(id: id, status: "failed",  src_offset: 12)
     ]
     allow(consumer).to receive(:messages).and_return(msgs)
@@ -47,7 +47,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     consumer.consume
 
     b = KafkaBatch.store.find_batch(id)
-    expect(b[:completed_count]).to eq(2)  # offset 10 counted once
+    expect(b[:completed_count]).to eq(2)  # job j10 counted once
     expect(b[:failed_count]).to eq(1)
 
     cb = FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)
@@ -155,6 +155,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
       # apply takes raw event hashes — same format as record_completions_batch input.
       events = [{
         batch_id:         id,
+        job_id:           "j1",
         source_topic:     "wt",
         source_partition: 0,
         source_offset:    1,

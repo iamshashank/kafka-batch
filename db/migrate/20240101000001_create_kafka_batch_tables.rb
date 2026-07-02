@@ -3,95 +3,15 @@ class CreateKafkaBatchTables < ActiveRecord::Migration[6.0]
   # Run this instead of individual incremental migrations.
   #
   # Tables:
-  #   kafka_batch_records              – one row per batch (the core ledger)
-  #   kafka_batch_consumer_offsets     – offset deduplication (offset_inbox mode)
   #   kafka_batch_failures             – per-job failure tracking for the dashboard
   #   kafka_batch_consumption_pauses   – pause/resume state (store: :mysql fallback)
   #   kafka_batch_tenant_weights       – per-tenant WFQ weight overrides (store: :mysql)
+  #
+  # Batch ledger (counters, dedup, reconciler indexes) is always in Redis.
   def change
 
-    # ── kafka_batch_records ──────────────────────────────────────────────────
-    # Core batch ledger. UUID primary key matches the ID generated in Ruby.
-    # All job-count columns are incremented atomically by SQL expressions;
-    # never replaced wholesale to avoid lost-update races.
-    create_table :kafka_batch_records, id: false, force: :cascade do |t|
-      t.string  :id,                    limit: 36,   null: false, primary_key: true
-
-      # Job accounting
-      t.integer :total_jobs,            null: false
-      t.integer :completed_count,       null: false, default: 0
-      t.integer :failed_count,          null: false, default: 0
-
-      # Lifecycle status:
-      #   pending   – created but jobs not yet produced (transient)
-      #   running   – jobs are being processed
-      #   success   – all jobs succeeded          → on_success callback fired
-      #   complete  – all finished, ≥1 failed     → on_complete callback fired
-      #   cancelled – manually cancelled
-      t.string  :status,                limit: 20,   null: false, default: "running"
-
-      # Callback worker class names (nil = no callback)
-      t.string  :on_success,            limit: 255
-      t.string  :on_complete,           limit: 255
-
-      # Arbitrary caller-supplied JSON metadata
-      t.text    :meta
-
-      # Human-readable label for the dashboard (Batch.create(description: "…"))
-      t.string  :description,           limit: 1000
-
-      # Multi-tenant identifier (Batch.create(tenant_id: "acme"))
-      t.string  :tenant_id,             limit: 255
-
-      # Timestamps
-      t.datetime :created_at,           null: false
-      t.datetime :finished_at
-
-      # Streaming / open batch support: jobs can be pushed incrementally until
-      # locked_at is set. Completion callbacks only fire after locking.
-      t.datetime :locked_at
-
-      # At-most-once callback claim guard (CallbackConsumer UPDATE WHERE IS NULL).
-      # Also used by the reconciler to detect lost callbacks.
-      t.datetime :callback_dispatched_at
-      t.string   :callback_dispatched_by, limit: 255
-    end
-
-    # MySQL requires an explicit ALTER for a custom string primary key
-    execute "ALTER TABLE kafka_batch_records ADD PRIMARY KEY (id);"
-
-    # Reconciler: stale_batches → WHERE status = 'running' AND created_at < ?
-    add_index :kafka_batch_records, :status,     name: "idx_kb_records_status"
-    add_index :kafka_batch_records, :created_at, name: "idx_kb_records_created_at"
-    add_index :kafka_batch_records, %i[status created_at],
-              name: "idx_kb_records_status_created_at"
-
-    # Reconciler: done_batches_without_callback →
-    #   WHERE status IN ('success','complete')
-    #     AND callback_dispatched_at IS NULL
-    #     AND finished_at < ?
-    # Leading status prunes to terminal batches; finished_at drives the range;
-    # callback_dispatched_at is a covering column for the IS NULL predicate.
-    add_index :kafka_batch_records, %i[status callback_dispatched_at finished_at],
-              name: "idx_kb_records_done_no_callback"
-
-    # Dashboard tenant filter
-    add_index :kafka_batch_records, :tenant_id, name: "idx_kb_records_tenant_id"
-
-
-    # ── kafka_batch_consumer_offsets ─────────────────────────────────────────
-    # One row per (source_topic, source_partition). The EventConsumer advances
-    # last_offset monotonically to deduplicate redelivered completion events
-    # without a per-job row. Only used in counting_mode: :offset_inbox.
-    create_table :kafka_batch_consumer_offsets do |t|
-      t.string  :source_topic,     limit: 255, null: false
-      t.integer :source_partition,             null: false
-      t.bigint  :last_offset,                  null: false, default: 0
-      t.datetime :updated_at
-    end
-
-    add_index :kafka_batch_consumer_offsets, %i[source_topic source_partition],
-              unique: true, name: "uq_kb_consumer_offsets"
+    # Batch ledger (counters, completion dedup, reconciler indexes) lives in Redis
+    # for all store modes. MySQL tables below are optional relational data only.
 
 
     # ── kafka_batch_failures ─────────────────────────────────────────────────

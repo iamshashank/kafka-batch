@@ -1,8 +1,8 @@
 module KafkaBatch
   class Configuration
     # ── Store ────────────────────────────────────────────────────────────────
-    # :mysql  – uses ActiveRecord (requires kafka_batch migrations)
-    # :redis  – uses Redis (no migrations needed)
+    # :redis  – (default) all batch ledger state in Redis
+    # :mysql  – batch ledger in Redis + failures/pauses/weights in MySQL
     attr_accessor :store
 
     # ── Kafka connection ─────────────────────────────────────────────────────
@@ -252,7 +252,7 @@ module KafkaBatch
     attr_accessor :logger
 
     def initialize
-      @store                    = :mysql
+      @store                    = :redis
       @topic_prefix             = ""
       @brokers                  = ["localhost:9092"]
       @skip_cancelled_jobs      = true

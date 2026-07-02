@@ -39,26 +39,24 @@ module KafkaBatch
       # can return in O(1) instead of O(N pipelined HGETs).
       COUNTS_KEY    = "kafka_batch:counts"
 
-      # Atomically apply a completion, deduplicating by a monotonic per-partition
-      # cursor over the job message's source offset, then check for completion.
+      # Atomically apply a completion, deduplicating by job_id (each job counts at
+      # most once regardless of completion order on the source partition), then
+      # check for batch completion.
       #   KEYS[1] = batch hash
-      #   KEYS[2] = per-topic offsets hash (Bug #3: sharded by source_topic)
+      #   KEYS[2] = per-batch dedup set (kafka_batch:dedup:{batch_id})
       #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset
       #   KEYS[5] = COUNTS_KEY hash (Bug #2: O(1) status counters)
-      #   ARGV[1] = "topic/partition" field, ARGV[2] = source_offset,
-      #   ARGV[3] = counter field, ARGV[4] = ttl, ARGV[5] = now (iso8601),
-      #   ARGV[6] = finished_at score (unix float as string, for DONE_INDEX zadd)
+      #   ARGV[1] = job_id, ARGV[2] = counter field ("completed_count"|"failed_count"),
+      #   ARGV[3] = ttl, ARGV[4] = now (iso8601),
+      #   ARGV[5] = finished_at score (unix float as string, for DONE_INDEX zadd)
       # Returns [code, payload]:
-      #   [0, "duplicate"]  – source_offset already applied (dedup)
+      #   [0, "duplicate"]  – job_id already applied (dedup)
       #   [0, "not_found"]  – batch hash does not exist
       #   [1, outcome]      – batch just completed; outcome = "success"|"complete"
       #   [2, "continue"]   – still jobs outstanding
-      BATCH_DONE_OFFSET_LUA = <<~LUA.freeze
-        local last = redis.call('HGET', KEYS[2], ARGV[1])
-        if last and tonumber(ARGV[2]) <= tonumber(last) then return {0, 'duplicate'} end
-
-        -- Advance the monotonic cursor first; the event is now "applied".
-        redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+      BATCH_DONE_JOB_LUA = <<~LUA.freeze
+        if redis.call('SADD', KEYS[2], ARGV[1]) == 0 then return {0, 'duplicate'} end
+        redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
 
         if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
 
@@ -67,8 +65,8 @@ module KafkaBatch
           return {0, 'duplicate'}
         end
 
-        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
-        redis.call('HINCRBY', KEYS[1], ARGV[3], 1)
+        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+        redis.call('HINCRBY', KEYS[1], ARGV[2], 1)
 
         local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
         local completed = tonumber(redis.call('HGET', KEYS[1], 'completed_count')) or 0
@@ -80,14 +78,14 @@ module KafkaBatch
         if (completed + failed) >= total and sealed and sealed ~= '' then
           local outcome = (failed > 0) and 'complete' or 'success'
           redis.call('HSET', KEYS[1], 'status',      outcome)
-          redis.call('HSET', KEYS[1], 'finished_at', ARGV[5])
-          redis.call('EXPIRE', KEYS[1], tonumber(ARGV[4]))
+          redis.call('HSET', KEYS[1], 'finished_at', ARGV[4])
+          redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
           -- Atomically move from RUNNING_INDEX to DONE_INDEX so no intermediate
           -- state is visible if the process crashes after Lua returns.
           local batch_id = redis.call('HGET', KEYS[1], 'id')
           if batch_id then
             redis.call('ZREM', KEYS[3], batch_id)
-            redis.call('ZADD', KEYS[4], tonumber(ARGV[6]), batch_id)
+            redis.call('ZADD', KEYS[4], tonumber(ARGV[5]), batch_id)
           end
           -- Bug #2: keep COUNTS_KEY in sync atomically with finalization so
           -- batch_counts() can be answered in O(1) without scanning ALL_INDEX.
@@ -285,20 +283,16 @@ module KafkaBatch
         end
       end
 
-      def record_completion_by_offset(batch_id:, source_topic:, source_partition:, source_offset:, status:)
-        field        = status == "success" ? "completed_count" : "failed_count"
-        # Bug #3: field is "topic/partition" inside the per-topic offsets key.
-        # Having the topic in both the key name and field is redundant but harmless
-        # — changing the field format would invalidate existing cursor data.
-        offset_field = "#{source_topic}/#{source_partition}"
-        bkey         = batch_key(batch_id)
-        okey         = offsets_key(source_topic)  # Bug #3: per-topic sharded key
-        now          = Time.now.iso8601
+      def record_completion_by_offset(batch_id:, job_id:, source_topic:, source_partition:, source_offset:, status:)
+        field = status == "success" ? "completed_count" : "failed_count"
+        bkey  = batch_key(batch_id)
+        dkey  = dedup_key(batch_id)
+        now   = Time.now.iso8601
 
         result = with_redis do |r|
-          r.eval(BATCH_DONE_OFFSET_LUA,
-            keys: [bkey, okey, RUNNING_INDEX, DONE_INDEX, COUNTS_KEY],
-            argv: [offset_field, source_offset.to_s, field, @ttl.to_s, now, Time.now.to_f.to_s]
+          r.eval(BATCH_DONE_JOB_LUA,
+            keys: [bkey, dkey, RUNNING_INDEX, DONE_INDEX, COUNTS_KEY],
+            argv: [job_id.to_s, field, @ttl.to_s, now, Time.now.to_f.to_s]
           )
         end
 
@@ -324,17 +318,11 @@ module KafkaBatch
         results = with_redis do |r|
           r.pipelined do |pipe|
             events.each do |e|
-              field        = e[:status] == "success" ? "completed_count" : "failed_count"
-              offset_field = "#{e[:source_topic]}/#{e[:source_partition]}"
-              # Bug #3: use per-topic sharded offsets key to spread write
-              # contention across N Redis keys instead of serializing all 500
-              # pods on a single OFFSETS_KEY hash.
-              # Bug #2: pass COUNTS_KEY as KEYS[5] so finalization updates
-              # status counts atomically inside Lua.
-              pipe.eval(BATCH_DONE_OFFSET_LUA,
-                keys: [batch_key(e[:batch_id]), offsets_key(e[:source_topic]),
+              field = e[:status] == "success" ? "completed_count" : "failed_count"
+              pipe.eval(BATCH_DONE_JOB_LUA,
+                keys: [batch_key(e[:batch_id]), dedup_key(e[:batch_id]),
                        RUNNING_INDEX, DONE_INDEX, COUNTS_KEY],
-                argv: [offset_field, e[:source_offset].to_s, field, @ttl.to_s, now, now_float])
+                argv: [e[:job_id].to_s, field, @ttl.to_s, now, now_float])
             end
           end
         end
@@ -605,11 +593,16 @@ module KafkaBatch
       def mark_finished(id, outcome)
         now = Time.now
         with_redis do |r|
+          old_status = r.hget(batch_key(id), "status")
           r.hset(batch_key(id), "status", outcome)
           r.hset(batch_key(id), "finished_at", now.iso8601)
           # Move from running → done so a (re-)lost callback stays recoverable.
           r.zrem(RUNNING_INDEX, id)
           r.zadd(DONE_INDEX, now.to_f, id)
+          if old_status == "running"
+            r.hincrby(COUNTS_KEY, "running", -1)
+            r.hincrby(COUNTS_KEY, outcome, 1)
+          end
         end
       end
 
@@ -691,7 +684,7 @@ module KafkaBatch
         with_redis do |r|
           # Bug #2: decrement COUNTS_KEY before erasing the batch hash.
           st = r.hget(batch_key(id), "status")
-          r.del(batch_key(id), failures_key(id))
+          r.del(batch_key(id), failures_key(id), dedup_key(id))
           r.zrem(RUNNING_INDEX, id)
           r.zrem(DONE_INDEX, id)
           r.zrem(ALL_INDEX, id)
@@ -741,9 +734,12 @@ module KafkaBatch
         "#{batch_key(id)}:failures"
       end
 
-      # Bug #3: per-topic sharded offsets key.  Spreading the write load across N
-      # keys prevents all 500 pods serializing on a single Redis hash during the
-      # Lua HSET/HGET for offset dedup.
+      def dedup_key(batch_id)
+        "#{KEY_PREFIX}:dedup:#{batch_id}"
+      end
+
+      # Legacy per-topic offset keys (pre job_id dedup). Retained for reference;
+      # completion dedup now uses per-batch job_id sets via #dedup_key.
       def offsets_key(source_topic)
         "kafka_batch:offsets:#{source_topic}"
       end

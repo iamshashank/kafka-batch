@@ -136,7 +136,7 @@ module KafkaBatch
           puts ""
         end
 
-        desc "Generate KafkaBatch migrations (MySQL store only)"
+        desc "Generate KafkaBatch migrations (store :mysql — failures, pauses, weights)"
         task :install_migrations do
           source = File.expand_path("../../db/migrate", __dir__)
           dest   = Rails.root.join("db", "migrate")
