@@ -390,15 +390,14 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       conn.execute("DELETE FROM kafka_batch_tenant_weights")
 
       # write_weight_to_backend uses ON DUPLICATE KEY UPDATE (MySQL-only).
-      # Stub it to use SQLite-compatible INSERT OR REPLACE so the test DB works.
-      allow(scheduler).to receive(:write_weight_to_backend).and_wrap_original do |_, tid, w|
+      # Replace with SQLite-compatible INSERT OR REPLACE for the test DB.
+      allow(scheduler).to receive(:write_weight_to_backend) do |tid, w|
         c   = ActiveRecord::Base.connection
         sql = "INSERT OR REPLACE INTO kafka_batch_tenant_weights " \
               "(tenant_id, weight, updated_at) VALUES " \
               "(#{c.quote(tid.to_s)}, #{c.quote(w.to_f)}, " \
               "#{c.quote(Time.now.utc.strftime('%Y-%m-%d %H:%M:%S'))})"
         c.execute(sql)
-        scheduler.send(:bust_weight_cache!)
       end
     end
 
@@ -464,9 +463,8 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       # Prime cache
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
 
-      # Write directly to Redis bypassing the scheduler (simulates another process)
-      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
-      redis.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 9.0)
+      # Write via the scheduler's Redis pool (simulates another process)
+      scheduler.send(:with) { |r| r.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 9.0) }
 
       # Still within TTL — should see old value from cache
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
@@ -479,8 +477,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       scheduler.set_weight("t1", 1.0)
       scheduler.send(:weight_for, "t1")  # prime cache at t=0
 
-      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
-      redis.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 7.0)
+      scheduler.send(:with) { |r| r.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 7.0) }
 
       t = 61.0  # advance past TTL
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(7.0)
@@ -490,8 +487,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       scheduler.set_weight("t1", 1.0)
       scheduler.send(:weight_for, "t1")  # prime cache
 
-      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
-      redis.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 5.0)
+      scheduler.send(:with) { |r| r.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 5.0) }
 
       # Still cached without bust
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(1.0)
@@ -500,6 +496,19 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
 
       # Now reflects the backend value
       expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(5.0)
+    end
+
+    it "bust_weight_cache! invalidates cache even when monotonic clock is below the TTL" do
+      t = 5.0
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { t }
+
+      scheduler.set_weight("t1", 1.0)
+      scheduler.send(:weight_for, "t1")
+
+      scheduler.send(:with) { |r| r.hset(KafkaBatch::Fairness::Scheduler::WEIGHT, "t1", 8.0) }
+      scheduler.send(:bust_weight_cache!)
+
+      expect(scheduler.send(:weight_for, "t1")).to be_within(0.001).of(8.0)
     end
 
     it "returns default_weight for an unknown tenant even after cache is primed" do

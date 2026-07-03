@@ -648,7 +648,13 @@ module KafkaBatch
       end
 
       def bust_weight_cache!
-        @weights_mutex.synchronize { @weights_cache_at = 0.0 }
+        # Nil the cache — do not rely on (now - cache_at) >= ttl. On fresh
+        # containers monotonic time can be < ttl, so zeroing cache_at alone
+        # would leave stale weights visible after set_weight / bust.
+        @weights_mutex.synchronize do
+          @weights_cache    = nil
+          @weights_cache_at = 0.0
+        end
       end
 
       # ── Active-tenant view ─────────────────────────────────────────────────
