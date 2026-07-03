@@ -48,12 +48,22 @@ module KafkaBatch
           rescue => e
             KafkaBatch.logger.warn("[KafkaBatch] fairness partition check skipped: #{e.message}")
           end
+
+          # Start the delayed-job poller on consumer processes (gated on
+          # app.running so producer-only web/puma processes never poll — they only
+          # enqueue). Safe to run in every consumer process; claims are atomic.
+          begin
+            KafkaBatch::SchedulePoller.ensure_running! if defined?(KafkaBatch::SchedulePoller)
+          rescue => e
+            KafkaBatch.logger.warn("[KafkaBatch] schedule poller start skipped: #{e.message}")
+          end
         end
 
         Karafka::App.monitor.subscribe("app.stopped") do
-          # Stop the fairness forwarder thread (if this process ran one) before
-          # closing the producer, so no in-flight forward is cut off mid-produce.
+          # Stop the background threads (if this process ran them) before closing
+          # the producer, so no in-flight work is cut off mid-produce.
           KafkaBatch::Fairness::Forwarder.stop! if defined?(KafkaBatch::Fairness::Forwarder)
+          KafkaBatch::SchedulePoller.stop!       if defined?(KafkaBatch::SchedulePoller)
           KafkaBatch::Producer.reset!
         end
       else
@@ -156,6 +166,32 @@ module KafkaBatch
         task workers: :environment do
           KafkaBatch.workers.each do |w|
             puts "  #{w.name} → topic: #{w.kafka_topic}  retries: #{w.max_retries}"
+          end
+        end
+
+        desc "List pending delayed jobs (perform_in / perform_at). LIMIT=N (default 50)"
+        task scheduled: :environment do
+          store = KafkaBatch.schedule_store or abort "[KafkaBatch] schedule_store unavailable"
+          limit = (ENV["LIMIT"] || 50).to_i
+          rows  = store.list(limit: limit)
+          puts ""
+          puts "[KafkaBatch] #{store.size} scheduled job(s) pending (showing #{rows.size}):"
+          rows.each do |r|
+            puts "  %-36s  run_at=%-25s  loc=%s/%s:%s  batch=%s" %
+                 [r[:job_id], r[:run_at], KafkaBatch.config.scheduled_topic, r[:partition], r[:offset], r[:batch_id]]
+          end
+          puts ""
+        end
+
+        desc "Cancel a pending delayed job by JOB_ID (native only when schedule_store=:mysql)"
+        task cancel_scheduled: :environment do
+          job_id = ENV["JOB_ID"] or abort "[KafkaBatch] set JOB_ID=<uuid>"
+          store  = KafkaBatch.schedule_store or abort "[KafkaBatch] schedule_store unavailable"
+          if store.cancel(job_id)
+            puts "[KafkaBatch] cancelled scheduled job #{job_id}"
+          else
+            puts "[KafkaBatch] #{job_id} was not pending (already dispatched, unknown, or " \
+                 "schedule_store=:redis — cancel the batch instead)."
           end
         end
       end

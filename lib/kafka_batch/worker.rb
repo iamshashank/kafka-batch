@@ -78,6 +78,40 @@ module KafkaBatch
         fairness
       end
 
+      # ── Sidekiq-compatible enqueue API ────────────────────────────────────
+      # Convenience wrappers so a worker reads like a Sidekiq job:
+      #
+      #   MyWorker.perform_async("id" => 1)          # run now
+      #   MyWorker.perform_in(5.minutes, "id" => 1)  # run in 5 minutes
+      #   MyWorker.perform_at(time, "id" => 1)       # run at an absolute time
+      #
+      # perform_in/perform_at persist the job to the delayed-job index and are
+      # dispatched by the SchedulePoller when due. @return [String] job_id
+
+      def perform_async(payload = {})
+        KafkaBatch::Batch.enqueue(self, payload)
+      end
+
+      def perform_in(interval, payload = {})
+        KafkaBatch::Batch.enqueue_in(interval, self, payload)
+      end
+
+      def perform_at(time, payload = {})
+        KafkaBatch::Batch.enqueue_at(time, self, payload)
+      end
+
+      # Bulk-schedule many jobs (same worker) to run at one time (Sidekiq
+      # perform_bulk, delayed). One broker round-trip + one index write.
+      #   MyWorker.perform_bulk_in(300, [{"id"=>1}, {"id"=>2}, …])
+      # @return [Array<String>] job ids
+      def perform_bulk_in(interval, payloads)
+        KafkaBatch::Batch.enqueue_many_in(interval, self, payloads)
+      end
+
+      def perform_bulk_at(time, payloads)
+        KafkaBatch::Batch.enqueue_many_at(time, self, payloads)
+      end
+
       # Pin every retry of this worker to a single delay tier (e.g. :short,
       # :medium, :large) instead of walking the default progression. Pass nil
       # (default) to use config.retry_tier_progression.

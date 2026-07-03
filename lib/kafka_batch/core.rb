@@ -34,6 +34,29 @@ module KafkaBatch
       end
     end
 
+    # ── Schedule store (perform_in / perform_at index) ─────────────────────
+
+    # Returns the configured delayed-job index singleton. Detached from #store:
+    # selected by config.schedule_store (:redis | :mysql). Thread-safe via
+    # double-checked locking (same pattern as #store). Returns nil when the
+    # Schedule classes aren't loaded (e.g. a process that never required them).
+    # @return [Schedule::RedisStore, Schedule::MysqlStore, nil]
+    def schedule_store
+      return @schedule_store_instance if @schedule_store_instance
+      return nil unless defined?(Schedule::RedisStore)
+
+      schedule_store_mutex.synchronize do
+        @schedule_store_instance ||= begin
+          config.validate!
+          case config.schedule_store
+          when :mysql then Schedule::MysqlStore.new
+          when :redis then Schedule::RedisStore.new
+          else raise ConfigurationError, "Unknown schedule_store: #{config.schedule_store}"
+          end
+        end
+      end
+    end
+
     # ── Consumer group name helpers ────────────────────────────────────────
     # Derived entirely from config — no worker registration required.
     # Safe to call in both the web (UI-only) and worker (full) processes.
@@ -263,6 +286,8 @@ module KafkaBatch
       @store_mutex      = nil
       @scheduler        = nil
       @scheduler_mutex  = nil
+      @schedule_store_instance = nil
+      @schedule_store_mutex    = nil
       @node_id          = nil
       CancellationCache.reset! if defined?(CancellationCache)
       Liveness.reset!          if defined?(Liveness)
@@ -277,6 +302,10 @@ module KafkaBatch
 
     def scheduler_mutex
       @scheduler_mutex ||= Mutex.new
+    end
+
+    def schedule_store_mutex
+      @schedule_store_mutex ||= Mutex.new
     end
   end
 end

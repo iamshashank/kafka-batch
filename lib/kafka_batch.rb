@@ -19,6 +19,7 @@ require_relative "kafka_batch/fairness/forwarder"
 require_relative "kafka_batch/fairness/dispatcher"
 require_relative "kafka_batch/worker"
 require_relative "kafka_batch/batch"
+require_relative "kafka_batch/schedule_poller"
 require_relative "kafka_batch/reconciler"
 require_relative "kafka_batch/consumers/job_consumer"
 require_relative "kafka_batch/consumers/priority_gate"
@@ -235,6 +236,8 @@ module KafkaBatch
       @configuration   = nil
       @store           = nil
       @scheduler       = nil   # shared with core.rb via fairness_scheduler alias
+      @schedule_store_instance = nil
+      @schedule_store_mutex    = nil
       @workers         = []
       @store_mutex     = nil
       @workers_mutex   = nil
@@ -245,6 +248,7 @@ module KafkaBatch
       Liveness.reset!
       ConsumptionControl.reset!
       Fairness::Forwarder.stop! if defined?(Fairness::Forwarder)
+      SchedulePoller.stop! if defined?(SchedulePoller)
     end
 
     private

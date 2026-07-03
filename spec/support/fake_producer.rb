@@ -1,7 +1,7 @@
 # Captures messages that would have been produced to Kafka so specs can assert
 # on them without a live broker.
 module FakeProducer
-  Produced = Struct.new(:topic, :payload, :key, :headers, keyword_init: true)
+  Produced = Struct.new(:topic, :payload, :key, :partition, :headers, keyword_init: true)
 
   class << self
     def reset!
@@ -9,10 +9,10 @@ module FakeProducer
       @raise_on = nil
     end
 
-    def record(topic:, payload:, key: nil, headers: {})
+    def record(topic:, payload:, key: nil, partition: nil, headers: {})
       raise KafkaBatch::ProducerError, "boom (#{topic})" if @raise_on && @raise_on.call(topic)
 
-      messages << Produced.new(topic: topic, payload: payload, key: key, headers: headers)
+      messages << Produced.new(topic: topic, payload: payload, key: key, partition: partition, headers: headers)
       true
     end
 

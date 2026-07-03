@@ -45,8 +45,8 @@ RSpec.configure do |config|
     # Every spec gets a clean SQLite schema + a recording producer by default.
     KafkaBatchSpec::ActiveRecordSupport.truncate!
     FakeProducer.reset!
-    allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, payload:, key: nil, headers: {}|
-      FakeProducer.record(topic: topic, payload: payload, key: key, headers: headers)
+    allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, payload:, key: nil, partition: nil, headers: {}|
+      FakeProducer.record(topic: topic, payload: payload, key: key, partition: partition, headers: headers)
     end
     allow(KafkaBatch::Producer).to receive(:produce_many_sync) do |messages|
       messages.each { |m| FakeProducer.record(topic: m[:topic], payload: m[:payload], key: m[:key], headers: m[:headers] || {}) }

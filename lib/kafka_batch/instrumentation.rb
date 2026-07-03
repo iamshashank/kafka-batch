@@ -92,6 +92,38 @@ module KafkaBatch
         })
       end
 
+      # ── Scheduled (perform_in / perform_at) events ─────────────────────
+
+      # Fired when a delayed job is persisted to the schedule index.
+      def scheduled_enqueued(job_id:, batch_id:, worker_class:, run_at:)
+        instrument("scheduled.enqueued", {
+          job_id:       job_id,
+          batch_id:     batch_id,
+          worker_class: worker_class.to_s,
+          run_at:       (run_at.respond_to?(:iso8601) ? run_at.iso8601 : run_at)
+        })
+      end
+
+      # Fired when many delayed jobs are scheduled in one bulk call.
+      def scheduled_enqueued_bulk(count:, batch_id:, worker_class:, run_at:)
+        instrument("scheduled.enqueued_bulk", {
+          count:        count,
+          batch_id:     batch_id,
+          worker_class: worker_class.to_s,
+          run_at:       (run_at.respond_to?(:iso8601) ? run_at.iso8601 : run_at)
+        })
+      end
+
+      # Fired when the SchedulePoller re-produces a due job onto its real topic.
+      def scheduled_dispatched(job_id:, batch_id:, worker_class:, topic:)
+        instrument("scheduled.dispatched", {
+          job_id:       job_id,
+          batch_id:     batch_id,
+          worker_class: worker_class.to_s,
+          topic:        topic
+        })
+      end
+
       # ── Batch events ───────────────────────────────────────────────────
 
       # Fired immediately after a new batch is persisted in the store. Useful

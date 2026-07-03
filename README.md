@@ -855,6 +855,54 @@ config.retry_tier_progression = %i[short medium large]
 
 Override attempts per worker with `max_retries`, and the tier with `retry_tier`.
 
+## Delayed jobs (`perform_in` / `perform_at`)
+
+The Sidekiq equivalent for scheduling a job to run later:
+
+```ruby
+MyWorker.perform_async("id" => 1)             # run now
+MyWorker.perform_in(5 * 60, "id" => 1)        # run in 5 minutes
+MyWorker.perform_at(Time.now + 3600, "id" => 1) # run at an absolute time
+
+# Or explicitly, and inside a batch (the batch waits for the delayed job):
+KafkaBatch::Batch.enqueue_in(300, MyWorker, "id" => 1)
+KafkaBatch::Batch.create(on_complete: "MyCallback") do |b|
+  b.push_in(3600, MyWorker, "id" => 1)   # grows total_jobs now; on_complete fires only after it runs
+end
+```
+
+**Bulk delayed enqueue** — schedule many jobs sharing one run-at time in a single broker round-trip + one index write (the delayed `push_bulk`):
+
+```ruby
+MyWorker.perform_bulk_in(300, users.map { |u| { "user_id" => u.id } })   # all run in 5 min
+KafkaBatch::Batch.enqueue_many_at(t, MyWorker, payloads)
+
+KafkaBatch::Batch.create(on_complete: "MyCallback") do |b|
+  b.push_many_in(3600, MyWorker, payloads)   # one reserve!(N); batch waits for all N
+end
+```
+
+All payloads are produced to the scheduled topic with one `produce_many_sync`, and their pointers are written with one `ZADD` (Redis) / one `INSERT` (MySQL). The batch form grows `total_jobs` by the payload count in a single atomic reservation and rolls it all back if scheduling fails.
+
+**Why not the retry-topic `pause` approach?** That works for retries because their delays are short and monotonic, but pausing a Kafka partition blocks *every* later message behind the longest delay — wrong for arbitrary user scheduling. Instead, delayed jobs use the same design Sidekiq itself uses: a time-ordered index drained by a poller.
+
+**How it works.** The job payload is produced to a durable `scheduled_topic`; the schedule index stores only a **compact pointer** `job_id:partition:offset` scored by run-at time (so index size is independent of payload size). A per-process **`SchedulePoller`** claims due pointers, reads their payloads back from Kafka (grouped by partition, sorted by offset, so scattered reads become near-sequential), and re-produces each job onto its real topic — where the normal `JobConsumer` / fairness lane runs it unchanged.
+
+**Pluggable index backend**, detached from `config.store`:
+
+```ruby
+config.schedule_store = :redis   # default — ZSET, RAM-resident, lowest latency
+config.schedule_store = :mysql   # table, disk-resident, cheap at scale, native per-job cancel
+```
+
+**At-least-once / crash recovery.** `claim_due` moves due pointers to a *leased* state; the poller re-produces them and only then `ack`s. If a poller (or the whole process) crashes between claim and ack, the lease expires and `reclaim` — run by *any* poller in *any* process — returns the pointer to pending, so nothing is lost. Claims are atomic per backend (Redis Lua / MySQL `SELECT … FOR UPDATE SKIP LOCKED`), so every consumer process can run a poller with no double-dispatch and no leader election. Duplicates are rare and safe (completions dedup by `job_id`; the producer is idempotent).
+
+**Cancellation.** With `:mysql`, `rake kafka_batch:cancel_scheduled JOB_ID=…` deletes the pending row and decrements its batch. With `:redis`, cancel the batch — the poller drops cancelled jobs at dispatch via the `CancellationCache`.
+
+**Retention constraint.** The pointer references a Kafka offset, so **set the `scheduled_topic`'s `retention.ms` ≥ `config.max_schedule_horizon`** (default 7 days); schedules beyond the horizon are clamped. If a payload is ever gone (retention), the poller drops the pointer and logs rather than looping.
+
+Config knobs: `schedule_poller_enabled`, `schedule_poll_interval` (5s), `schedule_poll_jitter`, `schedule_batch_size` (100), `schedule_lease_seconds` (60), `schedule_reclaim_interval` (30s), `max_schedule_horizon`. Operational: `rake kafka_batch:scheduled` lists pending jobs. When `schedule_store = :mysql`, run the `CreateKafkaBatchScheduledJobs` migration.
+
 ### Early batch completion (`complete_after_retries`)
 
 A persistently-failing job can otherwise hold up its batch's **`on_complete`** for the whole retry budget (`max_retries × largest tier delay`), even when every other job is done. To cap that latency, a job counts toward its batch (as *failed*) after **`complete_after_retries`** retries (default **3**) — while it **keeps retrying in the background** up to `max_retries`:

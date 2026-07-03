@@ -29,6 +29,7 @@ module KafkaBatch
       callbacks_topic:       "kafka_batch.callbacks",   # batch callbacks
       dead_letter_topic:     "kafka_batch.dead_letter", # exhausted / poison jobs
       retry_topic:           "kafka_batch.jobs.retry",  # base; per-tier is <this>.short/.medium/.large
+      scheduled_topic:       "kafka_batch.scheduled",   # durable payload store for perform_in/perform_at
       consumer_group:        "kafka-batch",             # base consumer group (suffixed -control/-dispatch/…)
       fairness_ingest_topic: "kafka_batch.ingest",      # durable per-tenant intake (fairness)
       fairness_ready_topic:  "kafka_batch.ready",       # fairly-ordered execution queue (fairness)
@@ -95,6 +96,31 @@ module KafkaBatch
     # max_retries, so default behaviour is unchanged). on_success is unaffected:
     # it still fires only when every job truly succeeds.
     attr_accessor :complete_after_retries  # Integer – default 3 (worker can override)
+
+    # ── Delayed jobs (perform_in / perform_at) ───────────────────────────────
+    # The Sidekiq perform_in/perform_at equivalent. The job payload is produced
+    # to the durable `scheduled_topic`; a compact pointer (job_id:partition:offset)
+    # scored by run-at time is kept in the SCHEDULE store (below), and a per-process
+    # SchedulePoller re-produces each job onto its real topic when it comes due.
+    #
+    # Backend for the schedule index — DETACHED from `store` so the main ledger can
+    # be Redis while the (potentially huge) schedule index lives in MySQL:
+    #   :redis – (default) ZSET scored by run-at; RAM-resident, lowest latency.
+    #   :mysql – kafka_batch_scheduled_jobs table; disk-resident, cheap at scale,
+    #            native per-job cancel/lookup by primary key.
+    attr_accessor :schedule_store            # Symbol – :redis (default) | :mysql
+    attr_accessor :schedule_poller_enabled   # Boolean – default true (consumer procs poll)
+    attr_accessor :schedule_poll_interval    # Float   – seconds between idle polls; default 5.0
+    attr_accessor :schedule_poll_jitter      # Float   – +/- fraction on the idle sleep; default 0.1
+    attr_accessor :schedule_batch_size       # Integer – max due jobs claimed per tick; default 100
+    # In-flight LEASE: a claimed-but-not-dispatched job is reclaimed after this many
+    # seconds so a poller/process crash mid-dispatch cannot strand it (at-least-once).
+    attr_accessor :schedule_lease_seconds    # Integer – default 60
+    attr_accessor :schedule_reclaim_interval # Integer – seconds between reclaim sweeps; default 30
+    # Longest allowed delay. MUST be <= the scheduled_topic's retention.ms, else a
+    # job could point at an offset already removed by log cleanup. Schedules beyond
+    # this are clamped down to it. Default 7 days.
+    attr_accessor :max_schedule_horizon      # Integer – seconds; default 7 days
 
     # ── Completion-event emission retries ────────────────────────────────────
     # After a job succeeds, the consumer produces a completion event. If that
@@ -311,6 +337,14 @@ module KafkaBatch
       @retry_tier_progression   = %i[short medium large]
       @retry_max_pause_seconds  = 30
       @complete_after_retries   = 3    # == max_retries default → no early completion by default
+      @schedule_store           = :redis
+      @schedule_poller_enabled  = true
+      @schedule_poll_interval   = 5.0
+      @schedule_poll_jitter     = 0.1
+      @schedule_batch_size      = 100
+      @schedule_lease_seconds   = 60
+      @schedule_reclaim_interval = 30
+      @max_schedule_horizon     = 7 * 24 * 3600  # 7 days (match scheduled_topic retention)
       @event_emit_retries       = 3
       @event_emit_backoff       = 1
       @redis_url                = "redis://localhost:6379/0"
@@ -380,6 +414,9 @@ module KafkaBatch
 
     def validate!
       raise ConfigurationError, "store must be :mysql or :redis" unless %i[mysql redis].include?(@store)
+      unless %i[mysql redis].include?(@schedule_store)
+        raise ConfigurationError, "schedule_store must be :mysql or :redis"
+      end
       raise ConfigurationError, "brokers must not be empty"       if Array(@brokers).empty?
 
       unless %i[redis off].include?(@liveness_backend)

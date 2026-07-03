@@ -43,6 +43,19 @@ module KafkaBatchSpec
         add_index :kafka_batch_consumption_pauses,
                   %i[consumer_group topic_name partition_id],
                   unique: true
+
+        create_table :kafka_batch_scheduled_jobs, id: false, force: true do |t|
+          t.string   :job_id,       null: false
+          t.datetime :run_at,       null: false
+          t.integer  :partition_id, null: false
+          t.bigint   :kafka_offset, null: false
+          t.string   :batch_id
+          t.datetime :lease_until
+          t.datetime :created_at,   null: false
+        end
+        add_index :kafka_batch_scheduled_jobs, :job_id, unique: true
+        add_index :kafka_batch_scheduled_jobs, %i[run_at lease_until]
+        add_index :kafka_batch_scheduled_jobs, :batch_id
       end
     end
 
@@ -51,6 +64,7 @@ module KafkaBatchSpec
       conn = ActiveRecord::Base.connection
       conn.execute("DELETE FROM kafka_batch_failures")
       conn.execute("DELETE FROM kafka_batch_consumption_pauses")
+      conn.execute("DELETE FROM kafka_batch_scheduled_jobs")
     end
   end
 end

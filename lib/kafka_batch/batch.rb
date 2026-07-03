@@ -197,6 +197,67 @@ module KafkaBatch
       job_ids
     end
 
+    # Push a DELAYED job into this (open) batch, to run at an absolute time. Like
+    # #push, it grows total_jobs immediately (reserve!) so the batch's completion
+    # gate stays shut until the delayed job actually runs and completes — matching
+    # Sidekiq-Pro `batch.jobs { W.perform_at(...) }` semantics. @return [String] job_id
+    def push_at(time, worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
+      validate_worker!(worker_class)
+      reserve!(1)
+
+      begin
+        tid     = tenant_id || @tenant_id
+        message = self.class.build_message(
+          worker_class: worker_class, payload: payload,
+          job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid
+        )
+        self.class.schedule_message(
+          message, run_at: self.class.clamp_run_at(self.class.to_time(time)), batch_id: @id
+        )
+      rescue StandardError
+        KafkaBatch.store.add_jobs(@id, -1) rescue nil  # roll back the reserved count
+        raise
+      end
+
+      job_id
+    end
+
+    # Push a delayed job to run after +interval+ seconds. @return [String] job_id
+    def push_in(interval, worker_class, payload = {}, **opts)
+      push_at(Time.now + interval, worker_class, payload, **opts)
+    end
+
+    # Push MANY delayed jobs (same worker) into this open batch, all due at one
+    # absolute time. Grows total_jobs by payloads.size with a single atomic store
+    # write, produces all payloads to the scheduled topic in one round-trip, and
+    # bulk-writes their pointers — the delayed equivalent of #push_many. The batch
+    # won't complete until every scheduled job has run. @return [Array<String>] job ids
+    def push_many_at(time, worker_class, payloads, tenant_id: nil)
+      validate_worker!(worker_class)
+      payloads = payloads.to_a
+      return [] if payloads.empty?
+
+      reserve!(payloads.size)
+
+      begin
+        tid      = tenant_id || @tenant_id
+        run_at   = self.class.clamp_run_at(self.class.to_time(time))
+        messages = payloads.map do |payload|
+          self.class.build_message(worker_class: worker_class, payload: payload,
+                                   job_id: SecureRandom.uuid, batch_id: @id, attempt: 0, tenant_id: tid)
+        end
+        self.class.schedule_messages(messages, run_at: run_at, batch_id: @id)
+      rescue StandardError
+        KafkaBatch.store.add_jobs(@id, -payloads.size) rescue nil  # roll back the reservation
+        raise
+      end
+    end
+
+    # Push many delayed jobs to run after +interval+ seconds. @return [Array<String>]
+    def push_many_in(interval, worker_class, payloads, **opts)
+      push_many_at(Time.now + interval, worker_class, payloads, **opts)
+    end
+
     # Look up an existing batch by id. @return [Hash, nil]
     def self.find(id)
       KafkaBatch.store.find_batch(id)
@@ -209,35 +270,79 @@ module KafkaBatch
 
     # Enqueue a single job outside of any batch context. @return [String] job_id
     def self.enqueue(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
-      unless worker_class.is_a?(Class) && worker_class.include?(KafkaBatch::Worker)
-        raise ArgumentError, "#{worker_class} must include KafkaBatch::Worker"
-      end
+      ensure_worker!(worker_class)
 
       message = build_message(
         worker_class: worker_class, payload: payload,
         job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id
       )
+      route = route_for(worker_class, job_id: job_id, tenant_id: tenant_id)
+      KafkaBatch::Producer.produce_sync(
+        topic: route[:topic], payload: message, key: route[:key], partition: route[:partition]
+      )
+      job_id
+    end
+
+    # Enqueue a single job to run at an absolute time (Sidekiq perform_at).
+    # The payload is produced to the durable scheduled_topic and a compact pointer
+    # is stored in the delayed-job index; the SchedulePoller re-produces it onto
+    # the worker's real topic when due. @return [String] job_id
+    def self.enqueue_at(time, worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
+      ensure_worker!(worker_class)
+      message = build_message(
+        worker_class: worker_class, payload: payload,
+        job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id
+      )
+      schedule_message(message, run_at: clamp_run_at(to_time(time)), batch_id: nil)
+      job_id
+    end
+
+    # Enqueue a single job to run after +interval+ seconds (Sidekiq perform_in).
+    def self.enqueue_in(interval, worker_class, payload = {}, **opts)
+      enqueue_at(Time.now + interval, worker_class, payload, **opts)
+    end
+
+    # Bulk-enqueue many standalone jobs (same worker) to run at one absolute time.
+    # Delayed push_bulk: one produce_many_sync + one bulk index write.
+    # @param payloads [Array<Hash>] one payload per job
+    # @return [Array<String>] the job ids, in order
+    def self.enqueue_many_at(time, worker_class, payloads, tenant_id: nil)
+      ensure_worker!(worker_class)
+      payloads = payloads.to_a
+      return [] if payloads.empty?
+
+      run_at   = clamp_run_at(to_time(time))
+      messages = payloads.map do |payload|
+        build_message(worker_class: worker_class, payload: payload,
+                      job_id: SecureRandom.uuid, batch_id: nil, attempt: 0, tenant_id: tenant_id)
+      end
+      schedule_messages(messages, run_at: run_at, batch_id: nil)
+    end
+
+    # Bulk-enqueue many standalone jobs to run after +interval+ seconds.
+    def self.enqueue_many_in(interval, worker_class, payloads, **opts)
+      enqueue_many_at(Time.now + interval, worker_class, payloads, **opts)
+    end
+
+    # Resolve the destination topic / partition key for a job. Single source of
+    # truth shared by immediate enqueue (#enqueue, #produce_job) and the delayed
+    # SchedulePoller so scheduled jobs route identically to immediate ones.
+    #   fair worker  → fairness ingest topic (explicit tenant partition, else
+    #                  key-hash by tenant_id → batch_id → job_id)
+    #   plain worker → worker.kafka_topic, keyed by job_id
+    # @return [Hash] { topic:, key:, partition: }
+    def self.route_for(worker_class, job_id:, tenant_id: nil, batch_id: nil)
       if worker_class.fairness?
-        explicit_partition = KafkaBatch.tenant_ingest_partition(tenant_id)
-        if explicit_partition
-          KafkaBatch::Producer.produce_sync(
-            topic:     KafkaBatch.config.fairness_ingest_topic,
-            payload:   message,
-            partition: explicit_partition
-          )
+        explicit = KafkaBatch.tenant_ingest_partition(tenant_id)
+        if explicit
+          { topic: KafkaBatch.config.fairness_ingest_topic, key: nil, partition: explicit }
         else
-          KafkaBatch::Producer.produce_sync(
-            topic:   KafkaBatch.config.fairness_ingest_topic,
-            payload: message,
-            key:     (tenant_id || job_id).to_s
-          )
+          { topic: KafkaBatch.config.fairness_ingest_topic,
+            key: (tenant_id || batch_id || job_id).to_s, partition: nil }
         end
       else
-        KafkaBatch::Producer.produce_sync(
-          topic: worker_class.kafka_topic, payload: message, key: job_id
-        )
+        { topic: worker_class.kafka_topic, key: job_id, partition: nil }
       end
-      job_id
     end
 
     # Re-enqueue a job (called internally by JobConsumer on retry).
@@ -255,6 +360,102 @@ module KafkaBatch
     # more reliable monotonic reference within a partition. `enqueued_at` is useful
     # for human display and approximate age, but should not be used for strict
     # sequencing across concurrent producers.
+    # Produce a job payload to the durable scheduled_topic and record a compact
+    # pointer (job_id:partition:offset) in the delayed-job index, scored by run_at.
+    # The payload lives in Kafka; the index stays small (see Schedule::Base).
+    def self.schedule_message(message, run_at:, batch_id:)
+      store = KafkaBatch.schedule_store
+      raise ConfigurationError, "schedule_store is not available" unless store
+
+      report = KafkaBatch::Producer.produce_sync(
+        topic:   KafkaBatch.config.scheduled_topic,
+        payload: message,
+        key:     message["job_id"]
+      )
+      partition, offset = delivery_coords(report)
+
+      store.schedule(
+        job_id:    message["job_id"],
+        run_at:    run_at,
+        partition: partition,
+        offset:    offset,
+        batch_id:  batch_id
+      )
+
+      KafkaBatch::Instrumentation.scheduled_enqueued(
+        job_id:       message["job_id"],
+        batch_id:     batch_id,
+        worker_class: message["worker_class"],
+        run_at:       run_at
+      )
+      message["job_id"]
+    end
+
+    # Bulk variant of #schedule_message: produce ALL payloads to the scheduled
+    # topic in ONE produce_many_sync call (one broker round-trip, like push_bulk),
+    # then bulk-write all pointers in one store call. All jobs share +run_at+.
+    # @param messages [Array<Hash>] built job messages (each has "job_id")
+    # @return [Array<String>] job ids, in order
+    def self.schedule_messages(messages, run_at:, batch_id:)
+      store = KafkaBatch.schedule_store
+      raise ConfigurationError, "schedule_store is not available" unless store
+      return [] if messages.empty?
+
+      produce_msgs = messages.map do |m|
+        { topic: KafkaBatch.config.scheduled_topic, payload: m, key: m["job_id"] }
+      end
+      reports = KafkaBatch::Producer.produce_many_sync(produce_msgs)
+
+      unless reports.is_a?(Array) && reports.size == messages.size
+        raise KafkaBatch::ProducerError,
+          "scheduled bulk produce returned #{reports.inspect} (expected #{messages.size} delivery reports)"
+      end
+
+      entries = messages.each_with_index.map do |m, i|
+        partition, offset = delivery_coords(reports[i])
+        { job_id: m["job_id"], run_at: run_at, partition: partition, offset: offset, batch_id: batch_id }
+      end
+      store.schedule_many(entries)
+
+      KafkaBatch::Instrumentation.scheduled_enqueued_bulk(
+        count: messages.size, batch_id: batch_id,
+        worker_class: messages.first["worker_class"], run_at: run_at
+      )
+      messages.map { |m| m["job_id"] }
+    end
+
+    # Extract (partition, offset) from a WaterDrop/rdkafka delivery report.
+    def self.delivery_coords(report)
+      if report.respond_to?(:partition) && report.respond_to?(:offset)
+        [report.partition, report.offset]
+      else
+        raise KafkaBatch::ProducerError,
+          "scheduled produce did not return delivery coordinates (got #{report.class})"
+      end
+    end
+
+    # Clamp a run-at time to [now, now + max_schedule_horizon]. A horizon beyond
+    # the scheduled_topic's retention would let a job point at a log-cleaned offset.
+    def self.clamp_run_at(time)
+      now = Time.now
+      max = now + KafkaBatch.config.max_schedule_horizon.to_i
+      return max if time > max
+      return now if time < now
+
+      time
+    end
+
+    def self.to_time(time)
+      return time if time.is_a?(Time)
+      return Time.at(time) if time.is_a?(Numeric)
+      Time.parse(time.to_s)
+    end
+
+    def self.ensure_worker!(worker_class)
+      return if worker_class.is_a?(Class) && worker_class.include?(KafkaBatch::Worker)
+      raise ArgumentError, "#{worker_class} must include KafkaBatch::Worker"
+    end
+
     def self.build_message(worker_class:, payload:, job_id:, batch_id:, attempt:, tenant_id: nil)
       msg = {
         "job_id"                 => job_id,
@@ -274,8 +475,7 @@ module KafkaBatch
     private
 
     def validate_worker!(worker_class)
-      return if worker_class.is_a?(Class) && worker_class.include?(KafkaBatch::Worker)
-      raise ArgumentError, "#{worker_class} must include KafkaBatch::Worker"
+      self.class.ensure_worker!(worker_class)
     end
 
     # Atomically grow total_jobs by +count+, raising if the batch can't accept jobs.
@@ -314,27 +514,10 @@ module KafkaBatch
         worker_class: worker_class, payload: payload,
         job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tenant_id
       )
-
-      if worker_class.fairness?
-        explicit_partition = KafkaBatch.tenant_ingest_partition(tenant_id)
-        if explicit_partition
-          KafkaBatch::Producer.produce_sync(
-            topic:     KafkaBatch.config.fairness_ingest_topic,
-            payload:   message,
-            partition: explicit_partition
-          )
-        else
-          KafkaBatch::Producer.produce_sync(
-            topic:   KafkaBatch.config.fairness_ingest_topic,
-            payload: message,
-            key:     (tenant_id || @id).to_s
-          )
-        end
-      else
-        KafkaBatch::Producer.produce_sync(
-          topic: worker_class.kafka_topic, payload: message, key: job_id
-        )
-      end
+      route = self.class.route_for(worker_class, job_id: job_id, tenant_id: tenant_id, batch_id: @id)
+      KafkaBatch::Producer.produce_sync(
+        topic: route[:topic], payload: message, key: route[:key], partition: route[:partition]
+      )
     end
 
     # Produce the callback message when locking finalizes the batch (mirrors

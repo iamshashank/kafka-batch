@@ -522,4 +522,45 @@ RSpec.describe KafkaBatch::Web do
     expect(html).to include("Next retry")
     expect(html).to match(/in \d+h/)
   end
+
+  describe "GET /scheduled" do
+    let(:sched) do
+      instance_double(KafkaBatch::Schedule::RedisStore,
+                      size: 2,
+                      list: [
+                        { job_id: "aaaa1111", partition: 3, offset: 42, run_at: Time.now + 300, batch_id: nil },
+                        { job_id: "bbbb2222", partition: 1, offset: 7,  run_at: Time.now + 600, batch_id: "bx" }
+                      ])
+    end
+
+    before { allow(KafkaBatch).to receive(:schedule_store).and_return(sched) }
+
+    it "shows the pending counter and the next job_id:partition:offset pointers" do
+      status, _headers, body = get("/scheduled")
+      html = body.join
+
+      expect(status).to eq(200)
+      expect(html).to include("Pending scheduled")
+      expect(html).to include("2")                    # counter
+      expect(html).to include("aaaa1111:3:42")        # pointer member
+      expect(html).to include("bbbb2222:1:7")
+    end
+
+    it "searches by job_id" do
+      allow(sched).to receive(:find).with("aaaa1111").and_return(
+        { job_id: "aaaa1111", partition: 3, offset: 42, run_at: Time.now + 300, batch_id: nil, state: :pending }
+      )
+      html = get("/scheduled", query: "q=aaaa1111").last.join
+
+      expect(sched).to have_received(:find).with("aaaa1111")
+      expect(html).to include("aaaa1111:3:42")
+      expect(html).to include("Search result")
+    end
+
+    it "reports no match cleanly" do
+      allow(sched).to receive(:find).and_return(nil)
+      html = get("/scheduled", query: "q=missing").last.join
+      expect(html).to include("No scheduled job matches")
+    end
+  end
 end

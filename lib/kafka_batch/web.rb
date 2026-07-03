@@ -104,6 +104,8 @@ module KafkaBatch
           lag_consumption_control(:resume, params)
         elsif method == "GET" && path == "/fairness"
           html(render_fairness(params), title: "Fairness")
+        elsif method == "GET" && path == "/scheduled"
+          html(render_scheduled(params), title: "Scheduled")
         elsif method == "GET" && path == "/system"
           html(render_system, title: "System")
         elsif method == "GET" && path == "/weights"
@@ -266,6 +268,77 @@ module KafkaBatch
     end
 
     # ── Pages ──────────────────────────────────────────────────────────────
+
+    # Delayed jobs (perform_in / perform_at) waiting in the schedule index.
+    # Top box shows the pending counter; a search finds a job by id; the table
+    # lists the next few "job_id:partition:offset" pointers to be processed.
+    def render_scheduled(params)
+      store = KafkaBatch.schedule_store
+      unless store
+        return <<~HTML
+          <div class="card"><h2>Scheduled jobs</h2>
+          <p class="muted">The schedule store is not available in this process.</p></div>
+        HTML
+      end
+
+      query = non_empty(params["q"])
+      total = (store.size rescue 0)
+
+      # Top box: pending counter.
+      metrics = <<~HTML
+        <div class="metrics">
+          <div class="metric"><div class="metric-value">#{total}</div><div class="metric-label">Pending scheduled</div></div>
+          <div class="metric"><div class="metric-value">#{h(KafkaBatch.config.schedule_store)}</div><div class="metric-label">Backend</div></div>
+        </div>
+      HTML
+
+      # Search by job_id.
+      clear    = query ? "<a class='btn' href='#{scheduled_path}'>Clear</a>" : ""
+      search   = <<~HTML
+        <form class="search" method="get" action="#{scheduled_path}">
+          <input type="text" name="q" value="#{h(query)}" placeholder="Search by job ID…" autocomplete="off">
+          <button type="submit" class="btn">Search</button>#{clear}
+        </form>
+      HTML
+
+      if query
+        hit  = (store.find(query) rescue nil)
+        rows = hit ? scheduled_row(hit) : "<tr><td colspan='4' class='empty'>No scheduled job matches #{h(query)}.</td></tr>"
+        title = "Search result"
+      else
+        entries = (store.list(limit: PER_PAGE) rescue [])
+        rows = entries.map { |e| scheduled_row(e.merge(state: :pending)) }.join
+        rows = "<tr><td colspan='4' class='empty'>No scheduled jobs pending.</td></tr>" if entries.empty?
+        title = "Next #{PER_PAGE} to be processed"
+      end
+
+      <<~HTML
+        #{metrics}
+        <div class="filterbar">#{search}</div>
+        <div class="card">
+          <h2>#{title}</h2>
+          <table>
+            <thead><tr><th>Pointer (job_id:partition:offset)</th><th>Location</th><th>Runs</th><th>State</th></tr></thead>
+            <tbody>#{rows}</tbody>
+          </table>
+          <p class="muted">Payloads live in <code>#{h(KafkaBatch.config.scheduled_topic)}</code>; the poller re-produces each job onto its real topic when due.</p>
+        </div>
+      HTML
+    end
+
+    def scheduled_row(e)
+      member = "#{e[:job_id]}:#{e[:partition]}:#{e[:offset]}"
+      state  = e[:state] == :leased ? "<span class='badge' style='background:#f59e0b'>in-flight</span>" \
+                                    : "<span class='badge' style='background:#3b82f6'>pending</span>"
+      <<~ROW.gsub(/\n\s*/, "")
+        <tr>
+          <td class="mono">#{h(member)}</td>
+          <td class="mono">#{h(KafkaBatch.config.scheduled_topic)}/#{h(e[:partition])}:#{h(e[:offset])}</td>
+          <td>#{fmt_eta(e[:run_at])}</td>
+          <td>#{state}</td>
+        </tr>
+      ROW
+    end
 
     def render_system
       cards = KafkaBatch::SystemInfo.sections.map { |section| system_card(section) }.join
@@ -1613,6 +1686,10 @@ module KafkaBatch
       "#{@script_name}/system"
     end
 
+    def scheduled_path
+      "#{@script_name}/scheduled"
+    end
+
     def weights_reset_path
       "#{@script_name}/weights/reset"
     end
@@ -1756,6 +1833,7 @@ module KafkaBatch
               #{nav_btn("/failures", "⚠ Failures")}
               #{nav_btn("/live", "▶ Consumer Process")}
               #{nav_btn("/lag", "▦ Kafka Lag")}
+              #{nav_btn("/scheduled", "⏰ Scheduled")}
               #{nav_btn("/fairness", "⚖ Fairness")}
               #{nav_btn("/weights", "⚖ Weights")}
               #{nav_btn("/system", "⚙ System")}

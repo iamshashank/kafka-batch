@@ -22,6 +22,7 @@ module KafkaBatch
       events:      3,
       callbacks:   1,
       retry:       3,   # per tier
+      scheduled:   6,   # durable payload store for perform_in/perform_at
       dead_letter: 1,
       ingest:      12,  # fairness: ≈ max concurrent tenants
       ready:       6    # fairness: swarm parallelism
@@ -82,6 +83,10 @@ module KafkaBatch
       add.call(cfg.events_topic, :events)
       add.call(cfg.callbacks_topic, :callbacks)
       cfg.retry_topics.each { |t| add.call(t, :retry) }
+      # Durable payload store for delayed jobs (perform_in / perform_at).
+      # NOTE: set this topic's retention.ms >= config.max_schedule_horizon so a
+      # scheduled pointer can never reference a log-cleaned offset.
+      add.call(cfg.scheduled_topic, :scheduled)
       add.call(cfg.dead_letter_topic, :dead_letter)
 
       specs.uniq { |s| s[:name] }
