@@ -79,6 +79,10 @@ KafkaBatch.configure do |config|
   # (work-conserving). The knobs below apply to EACH lane independently.
   config.fairness_global_concurrency = 50   # in-flight window per lane (ready depth + concurrency)
   # config.fairness_max_inflight_per_tenant = 0   # optional hard per-tenant ceiling (0 = dynamic share)
+  # In-flight slots are leases: if a consumer is hard-killed mid-job the slot is
+  # reclaimed when this TTL expires, so a lane never stays wedged. MUST exceed your
+  # longest job runtime (a longer job's slot is reclaimed early — soft overshoot).
+  # config.fairness_lease_ttl = 1800   # seconds (default 30 min)
 
   # ⚠ Make per-tenant weights actually control THROUGHPUT (edit them live on
   # /kafka_batch/weights). The library default is FALSE, which means weights only

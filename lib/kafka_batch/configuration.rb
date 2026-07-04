@@ -320,6 +320,16 @@ module KafkaBatch
     # only (Karafka OSS concurrency is global; set it in karafka.rb).
     attr_accessor :fairness_dispatcher_concurrency  # Integer – default 5
 
+    # TTL (seconds) on a fair-lane in-flight slot. Each checkout writes a lease
+    # scored by (now + this); it is removed on completion. If a consumer dies
+    # mid-job (SIGKILL / OOM / node loss) the ensure-block release never runs, so
+    # the lease instead EXPIRES and the slot is reclaimed automatically on the
+    # next checkout that examines the tenant (and by the periodic sweep). MUST
+    # exceed your longest expected job runtime + forwarding latency — a job that
+    # runs longer than this has its slot reclaimed early (harmless soft
+    # concurrency overshoot; completion just finds no lease to remove).
+    attr_accessor :fairness_lease_ttl               # Integer – seconds; default 1800
+
     # Tenants spread across the ingest topic's partitions by key hash. With too
     # few partitions tenants collide and fairness degrades. The boot check warns
     # (or raises under validate_topics_on_boot) if the ingest topic has fewer.
@@ -406,6 +416,7 @@ module KafkaBatch
       @fairness_dispatcher_batch_size   = 50
       @fairness_dispatcher_concurrency  = 5
       @fairness_min_ingest_partitions   = 2
+      @fairness_lease_ttl               = 1800  # 30 min; must exceed max job runtime
       @priority_lag_check_interval = 2
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600

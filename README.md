@@ -377,6 +377,7 @@ Every option on `KafkaBatch.config`:
 | `fairness_min_ingest_partitions` | Integer | `2` | Warns (raises when `validate_topics_on_boot`) if the ingest topic has fewer partitions; set near max concurrent tenants |
 | `fairness_dispatcher_batch_size` | Integer | `50` | Max ingest messages the Dispatcher drains into the Redis window per consume call (`max_messages` in the route) |
 | `fairness_dispatcher_concurrency` | Integer | `5` | Expected Karafka concurrency on the dispatch process. **Boot warning only** — logged if `Karafka::App.config.concurrency` is lower |
+| `fairness_lease_ttl` | Integer (s) | `1800` | TTL on a fair-lane in-flight slot. Each checkout writes a lease scored by `now + this`; it's removed on completion. If a consumer dies mid-job (SIGKILL / OOM / node loss) the slot is reclaimed automatically when the lease expires — no wedged lane. **Must exceed your longest expected job runtime** (+ forwarding latency); a job running longer has its slot reclaimed early (harmless soft concurrency overshoot) |
 | `fairness_tenant_partitions` | Hash | `{}` | Explicit `tenant_id → partition_number` overrides. Bypasses the hash partitioner entirely — the producer sends directly to that partition via WaterDrop's `partition:` parameter. Tenants not listed fall back to murmur2\_random. Out-of-range values are logged and ignored. |
 | `max_reconcile_per_run` | Integer | `100` | Max batches the reconciler processes per sweep (both stuck-running and lost-callback independently); caps callback bursts during incidents |
 | `max_message_bytes` | Integer | `1_048_576` | Raise `ProducerError` if an encoded payload exceeds this size (1 MiB default, matches Kafka's `message.max.bytes`); `0` disables the guard |
@@ -1789,6 +1790,8 @@ bundle exec rake kafka_batch:workers
 **Worker class renames after deploy.** In-flight messages carry the original class name. After removing or renaming a worker, the consumer forwards those jobs straight to the DLT (and emits a `failed` event so the batch still completes) rather than blocking the partition. Perform a rolling deploy or drain the topic before removing the class.
 
 **No automatic metrics sink.** Instrumentation events are emitted via `ActiveSupport::Notifications` (see [Instrumentation](#instrumentation)) but nothing is sent to Prometheus/StatsD by default. Subscribe to the events to forward them to your metrics backend.
+
+**Fair-lane in-flight slots after a hard crash.** A fair-lane slot is normally released when the `JobConsumer` finishes a job. If a consumer is hard-killed mid-job (SIGKILL / OOM / node loss), that release never runs — so each slot is instead a **lease** that expires after `fairness_lease_ttl` (default 30 min) and is reclaimed automatically on the next checkout (and by a periodic sweep). A lane therefore self-heals rather than staying wedged, **provided `fairness_lease_ttl` exceeds your longest job runtime** — set it too low and long-running jobs get their slots reclaimed early (soft concurrency overshoot, not data loss).
 
 ---
 

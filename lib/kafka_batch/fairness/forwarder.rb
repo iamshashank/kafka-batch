@@ -100,6 +100,7 @@ module KafkaBatch
           begin
             forwarded = 0
             forwarded += 1 while forwarded < burst && running? && forward_once
+            maybe_reclaim_leases
             sleep(idle) if forwarded.zero?
           rescue StandardError => e
             KafkaBatch.logger.error(
@@ -112,6 +113,11 @@ module KafkaBatch
         KafkaBatch.logger.info("[KafkaBatch][Fairness::Forwarder] stopped (lane=#{@type})")
       end
 
+      # Interval (seconds) between full lease-reclaim sweeps. The checkout pre-pass
+      # already heals any tenant with ready work; this sweep only mops up leases
+      # leaked by a tenant that then went idle, so it can run infrequently.
+      RECLAIM_INTERVAL = 30.0
+
       # Check out one fairly-selected job and forward it to this lane's ready topic.
       # @return [Boolean] true if a job was forwarded; false when nothing is
       #   ready or the global in-flight window is full.
@@ -122,7 +128,7 @@ module KafkaBatch
         job = sched.checkout
         return false unless job
 
-        payload = mark_slot(job[:payload], job[:tenant_id])
+        payload = mark_slot(job[:payload], job[:tenant_id], job[:slot_id])
         KafkaBatch::Producer.produce_sync(
           topic:   KafkaBatch.config.fairness_ready_topic(@type),
           payload: payload,
@@ -133,18 +139,33 @@ module KafkaBatch
 
       private
 
+      # Run a full lease-reclaim sweep at most once per RECLAIM_INTERVAL, so leases
+      # leaked by a now-idle tenant don't linger in the global in-flight total.
+      def maybe_reclaim_leases
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        @last_reclaim_at ||= 0.0
+        return unless (now - @last_reclaim_at) >= RECLAIM_INTERVAL
+
+        @last_reclaim_at = now
+        sched = KafkaBatch.scheduler(@type)
+        n = sched&.reclaim_expired_leases!.to_i
+        KafkaBatch.logger.info("[KafkaBatch][Fairness::Forwarder] lane=#{@type} reclaimed #{n} expired lease(s)") if n.positive?
+      end
+
       def idle_sleep
         v = KafkaBatch.config.fairness_forwarder_idle_sleep.to_f
         v.positive? ? v : DEFAULT_IDLE_SLEEP
       end
 
-      # Stamp the fair-slot marker, tenant_id, and lane type into the raw job JSON
-      # so the JobConsumer knows this ready message holds one Scheduler in-flight
-      # slot on the CORRECT lane, and releases it (Scheduler(type)#complete) once.
-      def mark_slot(raw, tenant_id)
+      # Stamp the fair-slot marker, tenant_id, lane type, and in-flight LEASE id
+      # into the raw job JSON so the JobConsumer knows this ready message holds one
+      # Scheduler in-flight slot on the CORRECT lane, and releases exactly that
+      # lease (Scheduler(type)#complete(slot_id:)) once.
+      def mark_slot(raw, tenant_id, slot_id = nil)
         data = Oj.load(raw)
-        data["_fair_slot"] = true
-        data["_fair_type"] = @type.to_s
+        data["_fair_slot"]    = true
+        data["_fair_type"]    = @type.to_s
+        data["_fair_slot_id"] = slot_id if slot_id
         data["tenant_id"] ||= tenant_id
         Oj.dump(data, mode: :compat)
       rescue StandardError

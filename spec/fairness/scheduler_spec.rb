@@ -247,6 +247,56 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
     end
   end
 
+  describe "in-flight lease crash recovery" do
+    let(:redis) { Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL) }
+
+    it "records a lease on checkout and releases exactly it on complete(slot_id:)" do
+      scheduler.enqueue("A", "a0")
+      job = scheduler.checkout
+      expect(job[:slot_id]).to be_a(String)
+      expect(scheduler.stats[:inflight_total]).to eq(1)
+      expect(redis.zcard("#{scheduler.lease_prefix}A")).to eq(1)
+
+      scheduler.complete("A", slot_id: job[:slot_id])
+      expect(scheduler.stats[:inflight_total]).to eq(0)
+      expect(redis.zcard("#{scheduler.lease_prefix}A")).to eq(0)
+    end
+
+    it "is idempotent — a redelivered completion never double-releases the slot" do
+      scheduler.enqueue("A", "a0")
+      job = scheduler.checkout
+      2.times { scheduler.complete("A", slot_id: job[:slot_id]) }
+      expect(scheduler.stats[:inflight_total]).to eq(0)  # not -1
+    end
+
+    it "reclaims an expired lease on the next checkout, unsticking a wedged tenant" do
+      KafkaBatch.config.fairness_global_concurrency = 1   # budget of one slot
+      2.times { |i| scheduler.enqueue("A", "a#{i}") }
+
+      first = scheduler.checkout               # holds the only slot
+      expect(first[:payload]).to eq("a0")
+      expect(scheduler.checkout).to be_nil     # budget full — lane wedged
+
+      # Simulate a hard-killed consumer (Scheduler#complete never ran): force the
+      # leaked lease's score into the past so the next checkout's pre-pass expires it.
+      redis.zadd("#{scheduler.lease_prefix}A", 0, first[:slot_id])
+
+      second = scheduler.checkout              # pre-pass reclaims, then dispatches
+      expect(second[:payload]).to eq("a1")
+      expect(scheduler.stats[:inflight_total]).to eq(1)  # only the fresh lease
+    end
+
+    it "reclaim_expired_leases! sweeps leases leaked by a now-idle tenant" do
+      scheduler.enqueue("A", "a0")
+      job = scheduler.checkout                 # A's queue drains → A leaves the ring
+      redis.zadd("#{scheduler.lease_prefix}A", 0, job[:slot_id])  # expire the leaked lease
+
+      expect(scheduler.reclaim_expired_leases!).to eq(1)
+      expect(scheduler.stats[:inflight_total]).to eq(0)
+      expect(scheduler.inflight_by_tenant).to be_empty
+    end
+  end
+
   describe "#stats" do
     it "reports active tenants and in-flight total" do
       2.times { |i| scheduler.enqueue("A", "a#{i}") }
