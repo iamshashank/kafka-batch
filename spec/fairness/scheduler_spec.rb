@@ -193,9 +193,10 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       KafkaBatch.config.fairness_global_concurrency = 2
       4.times { |i| scheduler.enqueue("A", "a#{i}") }
 
-      expect(drain(5).size).to eq(2)          # capped at budget
+      picked = drain(5)
+      expect(picked.size).to eq(2)             # capped at budget
       expect(scheduler.checkout).to be_nil     # at budget
-      scheduler.complete("A")                  # free one slot
+      scheduler.complete("A", slot_id: picked.first[:slot_id])  # free one slot
       expect(scheduler.checkout).not_to be_nil
     end
   end
@@ -205,10 +206,11 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       KafkaBatch.config.fairness_max_inflight_per_tenant = 1
       3.times { |i| scheduler.enqueue("A", "a#{i}") }
 
-      expect(scheduler.checkout).not_to be_nil  # 1st (inflight 1)
-      expect(scheduler.checkout).to be_nil       # capped at 1 in-flight
-      scheduler.complete("A")
-      expect(scheduler.checkout).not_to be_nil   # freed
+      first = scheduler.checkout
+      expect(first).not_to be_nil               # 1st (inflight 1)
+      expect(scheduler.checkout).to be_nil      # capped at 1 in-flight
+      scheduler.complete("A", slot_id: first[:slot_id])
+      expect(scheduler.checkout).not_to be_nil  # freed
     end
   end
 
@@ -278,10 +280,12 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       expect(scheduler.checkout).to be_nil     # budget full — lane wedged
 
       # Simulate a hard-killed consumer (Scheduler#complete never ran): force the
-      # leaked lease's score into the past so the next checkout's pre-pass expires it.
+      # leaked lease's score into the past in BOTH the global (budget) and
+      # per-tenant (cap) sets, so the next checkout treats it as expired.
+      redis.zadd(scheduler.leases, 0, first[:slot_id])
       redis.zadd("#{scheduler.lease_prefix}A", 0, first[:slot_id])
 
-      second = scheduler.checkout              # pre-pass reclaims, then dispatches
+      second = scheduler.checkout              # reclaims the expired lease, then dispatches
       expect(second[:payload]).to eq("a1")
       expect(scheduler.stats[:inflight_total]).to eq(1)  # only the fresh lease
     end
@@ -289,11 +293,44 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
     it "reclaim_expired_leases! sweeps leases leaked by a now-idle tenant" do
       scheduler.enqueue("A", "a0")
       job = scheduler.checkout                 # A's queue drains → A leaves the ring
-      redis.zadd("#{scheduler.lease_prefix}A", 0, job[:slot_id])  # expire the leaked lease
+      # Expire the leaked lease in both the global and per-tenant sets.
+      redis.zadd(scheduler.leases, 0, job[:slot_id])
+      redis.zadd("#{scheduler.lease_prefix}A", 0, job[:slot_id])
 
-      expect(scheduler.reclaim_expired_leases!).to eq(1)
+      expect(scheduler.reclaim_expired_leases!).to eq(1)   # one expired global lease reclaimed
       expect(scheduler.stats[:inflight_total]).to eq(0)
       expect(scheduler.inflight_by_tenant).to be_empty
+    end
+
+    it "ignores a stale pre-upgrade in-flight counter and never pins the budget" do
+      # Reproduces the production incident: before leases, in-flight was a plain
+      # counter that a hard crash could inflate and permanently pin. The
+      # authoritative ZCARD-of-live-leases budget must ignore any such leftover.
+      KafkaBatch.config.fairness_global_concurrency = 2
+      redis.set("#{scheduler.ns}:inflight_total", "999")  # stale legacy counter
+
+      2.times { |i| scheduler.enqueue("A", "a#{i}") }
+      expect(scheduler.checkout).not_to be_nil  # pre-fix this was wedged forever
+      expect(scheduler.checkout).not_to be_nil
+    end
+
+    it "floors fairness_lease_ttl so a zero/tiny value can't silently disable the budget" do
+      KafkaBatch.config.fairness_lease_ttl          = 0   # misconfiguration
+      KafkaBatch.config.fairness_global_concurrency = 1
+      sched = described_class.new(type: :throughput)      # picks up the floored ttl
+      2.times { |i| sched.enqueue("A", "a#{i}") }
+
+      expect(sched.checkout).not_to be_nil  # takes the one slot
+      expect(sched.checkout).to be_nil      # budget still enforced (lease didn't instantly expire)
+    end
+
+    it "treats a legacy completion (no slot_id) as a harmless no-op" do
+      scheduler.enqueue("A", "a0")
+      job = scheduler.checkout
+      expect { scheduler.complete("A") }.not_to raise_error  # pre-upgrade message
+      expect(scheduler.stats[:inflight_total]).to eq(1)      # real lease untouched
+      scheduler.complete("A", slot_id: job[:slot_id])        # correct, id-matched release
+      expect(scheduler.stats[:inflight_total]).to eq(0)
     end
   end
 
@@ -351,7 +388,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
         t = result[:tenant_id]
         tenant_log << t
         duration = t == "A" ? 2.0 : 1.0
-        scheduler.complete(t, duration: duration)
+        scheduler.complete(t, slot_id: result[:slot_id], duration: duration)
       end
 
       counts = tenant_log.tally
@@ -369,7 +406,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       r1 = scheduler.checkout
       expect(r1[:tenant_id]).to eq("A")
       # A was removed from ring (queue would now have 2 left)
-      scheduler.complete("A", duration: 1.0)
+      scheduler.complete("A", slot_id: r1[:slot_id], duration: 1.0)
       # After complete, A should be back in the ring
       r2 = scheduler.checkout
       expect(r2).not_to be_nil
@@ -387,7 +424,7 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       3.times do
         r = scheduler.checkout
         expect(r).not_to be_nil
-        scheduler.complete("A", duration: 3.0)
+        scheduler.complete("A", slot_id: r[:slot_id], duration: 3.0)
       end
 
       # Check vtime via Redis directly

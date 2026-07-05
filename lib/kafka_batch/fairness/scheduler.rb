@@ -43,6 +43,12 @@ module KafkaBatch
     # (WHERE fairness_type = this lane).
     #
     class Scheduler
+      # Minimum in-flight lease TTL (seconds). A lease shorter than a job's runtime
+      # would be reclaimed mid-run (concurrency overshoot); a value of 0 would make
+      # every lease expire on the next checkout, silently DISABLING the concurrency
+      # budget. So fairness_lease_ttl is floored to this.
+      LEASE_TTL_FLOOR = 60.0
+
       # Append to a tenant's bounded ready window. Re-admits an idle tenant into
       # the ring at the current minimum vtime so it starts on an equal footing.
       # Returns 1 if stored, 0 if the window is full (caller should apply
@@ -75,15 +81,25 @@ module KafkaBatch
       # Weight is looked up from the WEIGHT hash inside Lua (one HGET per
       # successful checkout — acceptable since the Lua call is already one
       # Redis round-trip).
+      # ── In-flight accounting: authoritative TTL leases (no drift-prone counter) ──
+      # In-flight is the set of live LEASES, not an incremented counter. Each slot
+      # is a ZSET member (slot_id) scored by its expiry (now + lease_ttl), held in
+      # BOTH a global ZSET (KEYS: leases → authoritative budget) and a per-tenant
+      # ZSET (lprefix..tenant → authoritative fair-share cap). `ZREMRANGEBYSCORE …
+      # -inf now` drops expired leases (a dead consumer's slot), then `ZCARD` is the
+      # live count. Because the count is DERIVED from the leases every checkout, a
+      # leaked slot (SIGKILL/OOM) or a pre-upgrade counter can NEVER permanently pin
+      # the lane — it self-heals the moment its lease expires. Completion removes the
+      # slot by id, so it is idempotent and immune to double-release.
+      #
       # ARGV[5] = fetch_n (bounded scan depth; avoids full ZRANGE on large rings)
       # ARGV[6] = weighted (1 = weight-proportional per-tenant cap, 0 = equal share)
       # ARGV[9]=now  ARGV[10]=lease_ttl  ARGV[11]=slot_id  ARGV[12]=lease_prefix
       CHECKOUT_LUA_COUNT = <<~LUA.freeze
         local ring     = KEYS[1]
         local vth      = KEYS[2]
-        local inf      = KEYS[3]
-        local inftot   = KEYS[4]
-        local wh       = KEYS[5]
+        local gl       = KEYS[3]   -- global leases ZSET (authoritative budget)
+        local wh       = KEYS[4]
         local budget   = tonumber(ARGV[1])
         local cap      = tonumber(ARGV[2])
         local rprefix  = ARGV[3]
@@ -97,26 +113,9 @@ module KafkaBatch
         local slot_id  = ARGV[11]
         local lprefix  = ARGV[12]
 
-        local members = redis.call('ZRANGE', ring, 0, fetch_n)
-
-        -- Lease reclaim pre-pass: expire dead-pod slots BEFORE the budget check so
-        -- a SIGKILL/OOM that skipped Scheduler#complete can never permanently pin
-        -- the budget or a tenant's cap. Each expired lease decrements inf + inftot.
-        for i = 1, #members do
-          local t  = members[i]
-          local lk = lprefix .. t
-          local expired = redis.call('ZREMRANGEBYSCORE', lk, '-inf', now)
-          if expired > 0 then
-            local cur = (tonumber(redis.call('HGET', inf, t) or '0')) - expired
-            if cur < 0 then cur = 0 end
-            redis.call('HSET', inf, t, cur)
-            local tt = (tonumber(redis.call('GET', inftot) or '0')) - expired
-            if tt < 0 then tt = 0 end
-            redis.call('SET', inftot, tt)
-          end
-        end
-
-        local total = tonumber(redis.call('GET', inftot) or '0')
+        -- Authoritative global budget: drop expired leases, then count the live ones.
+        redis.call('ZREMRANGEBYSCORE', gl, '-inf', now)
+        local total = redis.call('ZCARD', gl)
         if budget > 0 and total >= budget then return {0, 'budget'} end
 
         -- Per-tenant in-flight cap.
@@ -158,11 +157,16 @@ module KafkaBatch
         -- tenant uses the whole budget) without starving newcomers: fairness only
         -- binds under contention (when the fair pass can fill the budget), and any
         -- freed slot goes to the lowest-vtime tenant first as jobs complete.
+        local members = redis.call('ZRANGE', ring, 0, fetch_n)
         for round = 1, 2 do
           local fallback = (round == 2)
           for i = 1, #members do
-            local t   = members[i]
-            local tin = tonumber(redis.call('HGET', inf, t) or '0')
+            local t  = members[i]
+            local lk = lprefix .. t
+            -- Per-tenant live in-flight: prune this tenant's expired leases, then
+            -- ZCARD. Authoritative (never drifts) and self-heals leaked slots.
+            redis.call('ZREMRANGEBYSCORE', lk, '-inf', now)
+            local tin = redis.call('ZCARD', lk)
 
             local dispatchable
             if fallback then
@@ -198,11 +202,10 @@ module KafkaBatch
                 else
                   redis.call('ZADD', ring, vt, t)
                 end
-                redis.call('HINCRBY', inf, t, 1)
-                redis.call('INCR', inftot)
-                -- Record the in-flight lease (member=slot_id, score=expiry) so a
-                -- dead consumer's slot self-heals via the reclaim pre-pass above.
-                redis.call('ZADD', lprefix .. t, now + ttl, slot_id)
+                -- Record the lease (same slot_id) in the global AND per-tenant sets.
+                local exp = now + ttl
+                redis.call('ZADD', gl, exp, slot_id)
+                redis.call('ZADD', lk, exp, slot_id)
                 return {1, t, job}
               else
                 redis.call('ZREM', ring, t)  -- stale entry: self-heal
@@ -215,16 +218,15 @@ module KafkaBatch
 
       # ── Time fairness checkout ─────────────────────────────────────────────
       # Vtime is NOT advanced at dispatch — that happens at completion
-      # (COMPLETE_LUA_TIME) using the actual job duration. The ring ordering
+      # (COMPLETE_LUA_TIME_LEASE) using the actual job duration. The ring ordering
       # reflects accumulated slot-time consumed, not dispatch count.
       # WEIGHT hash (KEYS[4]) + dw (ARGV[5]) are used only for the weighted cap.
       # ARGV[6] = weighted (1 = weight-proportional per-tenant cap, 0 = equal share)
       # ARGV[9]=now  ARGV[10]=lease_ttl  ARGV[11]=slot_id  ARGV[12]=lease_prefix
       CHECKOUT_LUA_TIME = <<~LUA.freeze
         local ring     = KEYS[1]
-        local inf      = KEYS[2]
-        local inftot   = KEYS[3]
-        local wh       = KEYS[4]
+        local gl       = KEYS[2]   -- global leases ZSET (authoritative budget)
+        local wh       = KEYS[3]
         local budget   = tonumber(ARGV[1])
         local cap      = tonumber(ARGV[2])
         local rprefix  = ARGV[3]
@@ -238,25 +240,9 @@ module KafkaBatch
         local slot_id  = ARGV[11]
         local lprefix  = ARGV[12]
 
-        local members = redis.call('ZRANGE', ring, 0, fetch_n)
-
-        -- Lease reclaim pre-pass (see CHECKOUT_LUA_COUNT): expire dead-pod slots
-        -- before the budget check so a crash can never permanently pin capacity.
-        for i = 1, #members do
-          local t  = members[i]
-          local lk = lprefix .. t
-          local expired = redis.call('ZREMRANGEBYSCORE', lk, '-inf', now)
-          if expired > 0 then
-            local cur = (tonumber(redis.call('HGET', inf, t) or '0')) - expired
-            if cur < 0 then cur = 0 end
-            redis.call('HSET', inf, t, cur)
-            local tt = (tonumber(redis.call('GET', inftot) or '0')) - expired
-            if tt < 0 then tt = 0 end
-            redis.call('SET', inftot, tt)
-          end
-        end
-
-        local total = tonumber(redis.call('GET', inftot) or '0')
+        -- Authoritative global budget: drop expired leases, then count the live ones.
+        redis.call('ZREMRANGEBYSCORE', gl, '-inf', now)
+        local total = redis.call('ZCARD', gl)
         if budget > 0 and total >= budget then return {0, 'budget'} end
 
         -- Per-tenant in-flight cap. In time mode vtime only advances at
@@ -292,11 +278,15 @@ module KafkaBatch
         -- fills any remaining global budget ignoring the dynamic cap (honoring the
         -- absolute hard cap). Guarantees full utilization when few tenants are
         -- active without starving newcomers.
+        local members = redis.call('ZRANGE', ring, 0, fetch_n)
         for round = 1, 2 do
           local fallback = (round == 2)
           for i = 1, #members do
-            local t   = members[i]
-            local tin = tonumber(redis.call('HGET', inf, t) or '0')
+            local t  = members[i]
+            local lk = lprefix .. t
+            -- Per-tenant live in-flight: prune expired leases, then ZCARD.
+            redis.call('ZREMRANGEBYSCORE', lk, '-inf', now)
+            local tin = redis.call('ZCARD', lk)
 
             local dispatchable
             if fallback then
@@ -327,10 +317,9 @@ module KafkaBatch
                 end
                 -- vtime intentionally NOT advanced here; done at completion with
                 -- the actual duration so accounting reflects wall-clock usage.
-                redis.call('HINCRBY', inf, t, 1)
-                redis.call('INCR', inftot)
-                -- Record the in-flight lease so a dead consumer's slot self-heals.
-                redis.call('ZADD', lprefix .. t, now + ttl, slot_id)
+                local exp = now + ttl
+                redis.call('ZADD', gl, exp, slot_id)
+                redis.call('ZADD', lk, exp, slot_id)
                 return {1, t, job}
               else
                 redis.call('ZREM', ring, t)  -- stale entry: self-heal
@@ -341,97 +330,62 @@ module KafkaBatch
         return {0, 'none'}
       LUA
 
-      # ── Throughput (job-count) mode completion ─────────────────────────────
-      # Legacy path (no lease): unconditional release. Used only for messages
-      # forwarded before the lease upgrade (no _fair_slot_id in the payload).
-      COMPLETE_LUA_COUNT = <<~LUA.freeze
-        local tin = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '0')
-        if tin > 0 then redis.call('HINCRBY', KEYS[1], ARGV[1], -1) end
-        local tot = tonumber(redis.call('GET', KEYS[2]) or '0')
-        if tot > 0 then redis.call('DECR', KEYS[2]) end
-        return 1
-      LUA
-
-      # Lease-aware throughput completion. Removes THIS job's lease by slot_id and
-      # only decrements when the lease was still present — so a slot already
-      # reclaimed by expiry (dead pod) is not double-decremented, and a redelivered
-      # completion is idempotent.
-      #   KEYS[1]=inf hash  KEYS[2]=inftot  KEYS[3]=lease zset (this tenant)
-      #   ARGV[1]=tenant    ARGV[2]=slot_id
+      # ── Completion: release the lease (authoritative, idempotent) ───────────
+      # Release removes THIS job's slot_id from the global AND per-tenant lease
+      # ZSETs. Because in-flight is DERIVED from the leases (ZCARD), there is no
+      # counter to under/over-shoot: a redelivered completion, or one for a slot
+      # already reclaimed by expiry, removes nothing and is a harmless no-op.
+      #   KEYS[1]=global leases  KEYS[2]=per-tenant lease zset   ARGV[1]=slot_id
       COMPLETE_LUA_COUNT_LEASE = <<~LUA.freeze
-        if redis.call('ZREM', KEYS[3], ARGV[2]) == 1 then
-          local tin = tonumber(redis.call('HGET', KEYS[1], ARGV[1]) or '0')
-          if tin > 0 then redis.call('HINCRBY', KEYS[1], ARGV[1], -1) end
-          local tot = tonumber(redis.call('GET', KEYS[2]) or '0')
-          if tot > 0 then redis.call('DECR', KEYS[2]) end
-        end
+        redis.call('ZREM', KEYS[1], ARGV[1])
+        redis.call('ZREM', KEYS[2], ARGV[1])
         return 1
       LUA
 
-      # ── Time mode completion ───────────────────────────────────────────────
-      # Release in-flight slot AND advance vtime by (duration_seconds / weight).
-      # vtime_increment is pre-computed in Ruby using the process-local weight
-      # cache — avoids a per-completion HGET on WEIGHT.
-      # After advancing vtime, re-adds the tenant to the RING at the new score
-      # if it still has queued ready jobs (ENQUEUE_LUA may have pushed more
-      # while the job was in-flight, or the tenant was removed when its queue
-      # ran dry at checkout time).
-      # ZADD updates the score when the member already exists, so this is safe
-      # regardless of whether the tenant is currently in the ring.
-      COMPLETE_LUA_TIME = <<~LUA.freeze
-        -- KEYS: [1]=INFLIGHT [2]=INFLIGHT_TOTAL [3]=VTIME [4]=RING
-        -- ARGV: [1]=tenant   [2]=vtime_increment [3]=ready_prefix
-        local t       = ARGV[1]
-        local inc     = tonumber(ARGV[2])
-        local rprefix = ARGV[3]
-
-        local tin = tonumber(redis.call('HGET', KEYS[1], t) or '0')
-        if tin > 0 then redis.call('HINCRBY', KEYS[1], t, -1) end
-        local tot = tonumber(redis.call('GET', KEYS[2]) or '0')
-        if tot > 0 then redis.call('DECR', KEYS[2]) end
-
-        -- Advance vtime by actual slot-time consumed (duration / weight).
-        -- VTIME is the durable ledger; it persists even when the tenant has no
-        -- ready jobs and is absent from the RING, so a returning tenant is
-        -- correctly charged for work it did earlier in the hour.
-        local vt = tonumber(redis.call('HGET', KEYS[3], t) or '0') + inc
-        redis.call('HSET', KEYS[3], t, vt)
-
-        -- Re-add / update ring score only if the tenant still has ready jobs.
-        local rk = rprefix .. t
-        if redis.call('LLEN', rk) > 0 then
-          redis.call('ZADD', KEYS[4], vt, t)
-        end
-
-        return 1
-      LUA
-
-      # Lease-aware time completion. Removes THIS job's lease by slot_id; releases
-      # the in-flight slot only if the lease was still present (see
-      # COMPLETE_LUA_COUNT_LEASE). vtime is ALWAYS advanced by the actual duration
-      # — the job ran and consumed slot-time even if its lease had expired.
-      #   KEYS[1]=inf  KEYS[2]=inftot  KEYS[3]=vtime  KEYS[4]=ring  KEYS[5]=lease zset
-      #   ARGV[1]=tenant  ARGV[2]=vtime_increment  ARGV[3]=ready_prefix  ARGV[4]=slot_id
+      # Time-lane completion: release the lease, then advance vtime by
+      # (duration / weight) — but ONLY when this call actually released a live
+      # lease (per-tenant ZREM == 1). Gating vtime on the release makes completion
+      # idempotent: an at-least-once redelivery (or a completion after the lease
+      # already expired) neither double-charges the tenant nor double-releases.
+      #   KEYS[1]=global leases KEYS[2]=per-tenant lease KEYS[3]=vtime KEYS[4]=ring
+      #   ARGV[1]=tenant ARGV[2]=vtime_increment ARGV[3]=ready_prefix ARGV[4]=slot_id
       COMPLETE_LUA_TIME_LEASE = <<~LUA.freeze
         local t       = ARGV[1]
         local inc     = tonumber(ARGV[2])
         local rprefix = ARGV[3]
 
-        if redis.call('ZREM', KEYS[5], ARGV[4]) == 1 then
-          local tin = tonumber(redis.call('HGET', KEYS[1], t) or '0')
-          if tin > 0 then redis.call('HINCRBY', KEYS[1], t, -1) end
-          local tot = tonumber(redis.call('GET', KEYS[2]) or '0')
-          if tot > 0 then redis.call('DECR', KEYS[2]) end
+        redis.call('ZREM', KEYS[1], ARGV[4])
+        if redis.call('ZREM', KEYS[2], ARGV[4]) == 1 then
+          -- VTIME is the durable ledger; it persists even when the tenant has no
+          -- ready jobs and is absent from the RING, so a returning tenant is
+          -- correctly charged for work it did earlier.
+          local vt = tonumber(redis.call('HGET', KEYS[3], t) or '0') + inc
+          redis.call('HSET', KEYS[3], t, vt)
+          -- Re-add / update ring score only if the tenant still has ready jobs.
+          local rk = rprefix .. t
+          if redis.call('LLEN', rk) > 0 then
+            redis.call('ZADD', KEYS[4], vt, t)
+          end
         end
 
-        local vt = tonumber(redis.call('HGET', KEYS[3], t) or '0') + inc
-        redis.call('HSET', KEYS[3], t, vt)
+        return 1
+      LUA
 
-        local rk = rprefix .. t
+      # Legacy time-lane completion for a message forwarded BEFORE the lease
+      # upgrade (no _fair_slot_id → no lease exists). There is no slot to release
+      # — just advance vtime so the tenant is charged for the time it consumed.
+      # Throughput-lane legacy messages need no completion at all (their vtime
+      # advanced at checkout), so Ruby skips the Redis call entirely for those.
+      #   KEYS[1]=vtime KEYS[2]=ring  ARGV[1]=tenant ARGV[2]=vtime_increment ARGV[3]=ready_prefix
+      COMPLETE_LUA_TIME_LEGACY = <<~LUA.freeze
+        local t   = ARGV[1]
+        local inc = tonumber(ARGV[2])
+        local vt  = tonumber(redis.call('HGET', KEYS[1], t) or '0') + inc
+        redis.call('HSET', KEYS[1], t, vt)
+        local rk = ARGV[3] .. t
         if redis.call('LLEN', rk) > 0 then
-          redis.call('ZADD', KEYS[4], vt, t)
+          redis.call('ZADD', KEYS[2], vt, t)
         end
-
         return 1
       LUA
 
@@ -449,10 +403,12 @@ module KafkaBatch
         @ring             = "#{@ns}:ring"            # ZSET tenant => vtime (ready tenants only)
         @vtime            = "#{@ns}:vtime"           # HASH tenant => remembered vtime
         @weight           = "#{@ns}:weight"          # HASH tenant => weight override
-        @inflight         = "#{@ns}:inflight"        # HASH tenant => in-flight count
-        @inflight_total   = "#{@ns}:inflight_total"  # global in-flight counter
         @ready_prefix     = "#{@ns}:ready:"          # LIST per tenant
-        @lease_prefix     = "#{@ns}:lease:"          # ZSET per tenant (slot_id => expiry)
+        # In-flight is tracked as TTL LEASES, not a counter — the count is derived
+        # from these ZSETs (ZCARD of live members), so it can never drift or pin.
+        @leases           = "#{@ns}:leases"          # ZSET slot_id => expiry (authoritative GLOBAL in-flight)
+        @lease_prefix     = "#{@ns}:lease:"          # ZSET per tenant: slot_id => expiry (authoritative per-tenant in-flight)
+        @reclaim_lock     = "#{@ns}:reclaim_lock"    # single-flight lock for the periodic sweep
 
         @pool             = pool || ConnectionPool.new(size: cfg.redis_pool_size, timeout: 5) do
           KafkaBatch::RedisClient.new(cfg) || raise(ConfigurationError, "Redis is not configured")
@@ -460,7 +416,15 @@ module KafkaBatch
         @window           = cfg.fairness_ready_window.to_i
         @budget           = cfg.fairness_global_concurrency.to_i
         @cap              = cfg.fairness_max_inflight_per_tenant.to_i
-        @lease_ttl        = cfg.fairness_lease_ttl.to_f
+        raw_lease_ttl     = cfg.fairness_lease_ttl.to_f
+        @lease_ttl        = raw_lease_ttl >= LEASE_TTL_FLOOR ? raw_lease_ttl : LEASE_TTL_FLOOR
+        if raw_lease_ttl < LEASE_TTL_FLOOR
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][Scheduler] fairness_lease_ttl=#{raw_lease_ttl}s is below the " \
+            "#{LEASE_TTL_FLOOR.to_i}s floor; using #{LEASE_TTL_FLOOR.to_i}s. Set it above your " \
+            "longest job runtime to avoid premature in-flight slot reclaim."
+          )
+        end
         @default_weight   = cfg.fairness_default_weight.to_f
         @weighted         = cfg.fairness_weighted_concurrency ? 1 : 0
         @active_count_ttl    = cfg.fairness_active_count_ttl.to_f
@@ -486,7 +450,7 @@ module KafkaBatch
       attr_reader :type
 
       # Per-lane Redis key names (exposed for tooling / tests).
-      attr_reader :ns, :ring, :vtime, :weight, :inflight, :inflight_total, :ready_prefix, :lease_prefix
+      attr_reader :ns, :ring, :vtime, :weight, :ready_prefix, :leases, :lease_prefix
 
       # Smoothed active-tenant view used as the cap denominator in #checkout.
       def active_view
@@ -530,12 +494,12 @@ module KafkaBatch
         res = with do |r|
           if @time_mode
             r.eval(CHECKOUT_LUA_TIME,
-              keys: [@ring, @inflight, @inflight_total, @weight],
+              keys: [@ring, @leases, @weight],
               argv: [@budget.to_s, @cap.to_s, @ready_prefix, @fetch_n.to_s, @default_weight.to_s, @weighted.to_s, ahint, shint,
                      now, @lease_ttl.to_s, slot_id, @lease_prefix])
           else
             r.eval(CHECKOUT_LUA_COUNT,
-              keys: [@ring, @vtime, @inflight, @inflight_total, @weight],
+              keys: [@ring, @vtime, @leases, @weight],
               argv: [@budget.to_s, @cap.to_s, @ready_prefix, @default_weight.to_s, @fetch_n.to_s, @weighted.to_s, ahint, shint,
                      now, @lease_ttl.to_s, slot_id, @lease_prefix])
           end
@@ -565,64 +529,54 @@ module KafkaBatch
           inc = w > 0 ? dur / w : dur
           with do |r|
             if lease.empty?
-              r.eval(COMPLETE_LUA_TIME,
-                keys: [@inflight, @inflight_total, @vtime, @ring],
+              # Pre-upgrade message (no lease): no slot to release, just charge vtime.
+              r.eval(COMPLETE_LUA_TIME_LEGACY,
+                keys: [@vtime, @ring],
                 argv: [t, inc.to_s, @ready_prefix])
             else
               r.eval(COMPLETE_LUA_TIME_LEASE,
-                keys: [@inflight, @inflight_total, @vtime, @ring, "#{@lease_prefix}#{t}"],
+                keys: [@leases, "#{@lease_prefix}#{t}", @vtime, @ring],
                 argv: [t, inc.to_s, @ready_prefix, lease])
             end
           end
-        else
+        elsif !lease.empty?
           with do |r|
-            if lease.empty?
-              r.eval(COMPLETE_LUA_COUNT, keys: [@inflight, @inflight_total], argv: [t])
-            else
-              r.eval(COMPLETE_LUA_COUNT_LEASE,
-                keys: [@inflight, @inflight_total, "#{@lease_prefix}#{t}"],
-                argv: [t, lease])
-            end
+            r.eval(COMPLETE_LUA_COUNT_LEASE,
+              keys: [@leases, "#{@lease_prefix}#{t}"],
+              argv: [lease])
           end
         end
+        # Throughput-lane legacy (no lease): nothing to do — vtime advanced at
+        # checkout and there is no lease to release. Skip the Redis round-trip.
         nil
       end
 
-      # Sweep ALL of this lane's lease ZSETs, dropping leases whose TTL has
-      # elapsed and correcting the per-tenant in-flight counts + the global total
-      # to match. The checkout pre-pass already reclaims leases for any tenant
-      # that still has ready work; this catches the residual case — a tenant that
-      # leaked slots on a hard crash and then went permanently idle, whose stale
-      # count would otherwise keep shrinking the global budget until batch_ttl.
-      # Cheap and idempotent; call periodically (the Forwarder does).
-      # @return [Integer] number of expired leases reclaimed
+      # Drop expired leases from the global set and every per-tenant set, freeing
+      # memory for tenants that leaked slots and then went idle. This is only a
+      # memory/hygiene sweep: the budget and per-tenant caps are ALREADY
+      # authoritative on every checkout (they ZREMRANGEBYSCORE + ZCARD the live
+      # leases), so nothing is ever pinned waiting for this. Single-flighted via a
+      # short Redis lock so N forwarder pods don't all sweep the keyspace at once.
+      # @return [Integer] number of expired global leases reclaimed (0 if another
+      #   pod holds the sweep lock or Redis is unavailable)
       def reclaim_expired_leases!
-        now      = Time.now.to_f
-        reclaimed = 0
-        cursor   = "0"
+        now = Time.now.to_f
         with do |r|
-          loop do
-            cursor, keys = r.scan(cursor, match: "#{@lease_prefix}*", count: 200)
-            keys.each do |lk|
-              tenant = lk.sub(@lease_prefix, "")
-              expired = r.zremrangebyscore(lk, "-inf", now)
-              next if expired.zero?
+          # nx+ex: only one pod sweeps per interval; the lock self-expires.
+          return 0 unless r.set(@reclaim_lock, "1", nx: true, ex: 25)
 
-              reclaimed += expired
-              r.hincrby(@inflight, tenant, -expired)
-              tin = r.hget(@inflight, tenant).to_i
-              r.hset(@inflight, tenant, 0) if tin.negative?
-              # Keep the global counter consistent (never below zero).
-              new_total = r.decrby(@inflight_total, expired)
-              r.set(@inflight_total, 0) if new_total.negative?
-            end
+          reclaimed = r.zremrangebyscore(@leases, "-inf", now)
+          cursor    = "0"
+          loop do
+            cursor, keys = r.scan(cursor, match: "#{@lease_prefix}*", count: 500)
+            keys.each { |lk| r.zremrangebyscore(lk, "-inf", now) }
             break if cursor == "0"
           end
+          reclaimed
         end
-        reclaimed
       rescue StandardError => e
         KafkaBatch.logger.warn("[KafkaBatch][Scheduler] reclaim_expired_leases! failed: #{e.message}")
-        reclaimed
+        0
       end
 
       # Set a per-tenant weight override for THIS lane.
@@ -658,13 +612,13 @@ module KafkaBatch
       def all_tenants
         backend_weights = fetch_all_weights_from_backend
 
-        inflight, ring_members, vtimes = with do |r|
+        ring_members, vtimes = with do |r|
           r.pipelined do |pipe|
-            pipe.hgetall(@inflight)
             pipe.zrange(@ring, 0, -1)
             pipe.hgetall(@vtime)
           end
         end
+        inflight = inflight_by_tenant   # live per-tenant lease counts (separate call)
 
         all_ids = (backend_weights.keys + inflight.keys + ring_members + vtimes.keys).uniq.sort
         all_ids.map do |t|
@@ -685,22 +639,40 @@ module KafkaBatch
         with { |r| r.llen("#{@ready_prefix}#{tenant_id}") }
       end
 
-      # Snapshot for dashboards / metrics.
+      # Snapshot for dashboards / metrics. inflight_total is the number of LIVE
+      # leases (expiry in the future) in the global set — authoritative, never a
+      # stale counter. Read-only: it does not prune (checkout/sweep do that).
       def stats
-        active, total = with { |r| r.multi { |m| m.zcard(@ring); m.get(@inflight_total) } }
+        now = Time.now.to_f
+        active, live = with { |r| r.multi { |m| m.zcard(@ring); m.zcount(@leases, "(#{now}", "+inf") } }
         {
           type:           @type,
           active_tenants: active.to_i,
-          inflight_total: total.to_i,
+          inflight_total: live.to_i,
           budget:         @budget,
           window:         @window,
           weight_backend: @weight_backend
         }
       end
 
-      # In-flight count per tenant (for the fairness dashboard).
+      # Live in-flight count per tenant (for the fairness dashboard), derived from
+      # each tenant's lease ZSET. Counts only leases whose expiry is still in the
+      # future, so a dead pod's leaked slots never show as in-flight. Read-only.
       def inflight_by_tenant
-        with { |r| r.hgetall(@inflight) }.transform_values(&:to_i).reject { |_, v| v.zero? }
+        now = Time.now.to_f
+        out = {}
+        with do |r|
+          cursor = "0"
+          loop do
+            cursor, keys = r.scan(cursor, match: "#{@lease_prefix}*", count: 500)
+            unless keys.empty?
+              counts = r.pipelined { |p| keys.each { |k| p.zcount(k, "(#{now}", "+inf") } }
+              keys.each_with_index { |k, i| out[k.sub(@lease_prefix, "")] = counts[i] if counts[i].to_i.positive? }
+            end
+            break if cursor == "0"
+          end
+        end
+        out
       end
 
       # Configured default weight (used when a tenant has no override).
@@ -746,15 +718,10 @@ module KafkaBatch
         if @active_count_source == :ingest_lag
           { count: ingest_active_count, sum_weight: 0.0 }
         else
-          ring_members, inflight = with do |r|
-            r.pipelined do |pipe|
-              pipe.zrange(@ring, 0, -1)
-              pipe.hgetall(@inflight)
-            end
-          end
-          active_ids = ring_members.to_a
-          inflight.each { |t, n| active_ids << t if n.to_i > 0 }
-          active_ids.uniq!
+          # Active = tenants with ready jobs (ring) OR live in-flight leases. Two
+          # sequential calls (NOT nested `with`) so we never hold two pool conns.
+          ring_members = with { |r| r.zrange(@ring, 0, -1) }
+          active_ids   = (ring_members.to_a + inflight_by_tenant.keys).uniq
           sum_w = @weighted == 1 ? active_ids.sum { |t| weight_for(t) } : 0.0
           { count: active_ids.size, sum_weight: sum_w }
         end

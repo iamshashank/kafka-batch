@@ -377,7 +377,7 @@ Every option on `KafkaBatch.config`:
 | `fairness_min_ingest_partitions` | Integer | `2` | Warns (raises when `validate_topics_on_boot`) if the ingest topic has fewer partitions; set near max concurrent tenants |
 | `fairness_dispatcher_batch_size` | Integer | `50` | Max ingest messages the Dispatcher drains into the Redis window per consume call (`max_messages` in the route) |
 | `fairness_dispatcher_concurrency` | Integer | `5` | Expected Karafka concurrency on the dispatch process. **Boot warning only** — logged if `Karafka::App.config.concurrency` is lower |
-| `fairness_lease_ttl` | Integer (s) | `1800` | TTL on a fair-lane in-flight slot. Each checkout writes a lease scored by `now + this`; it's removed on completion. If a consumer dies mid-job (SIGKILL / OOM / node loss) the slot is reclaimed automatically when the lease expires — no wedged lane. **Must exceed your longest expected job runtime** (+ forwarding latency); a job running longer has its slot reclaimed early (harmless soft concurrency overshoot) |
+| `fairness_lease_ttl` | Integer (s) | `1800` | TTL on a fair-lane in-flight slot. In-flight is the set of live **leases** (a global + per-tenant Redis ZSET), and the concurrency budget is the live-lease count — so a leaked slot (SIGKILL / OOM / node loss) is reclaimed automatically when its lease expires and can never permanently pin the lane. **Must exceed your longest expected job runtime** (+ forwarding latency); a job running longer has its slot reclaimed early (harmless soft concurrency overshoot). **Floored to 60s** — a smaller value would let leases expire on the next checkout and silently disable the budget |
 | `fairness_tenant_partitions` | Hash | `{}` | Explicit `tenant_id → partition_number` overrides. Bypasses the hash partitioner entirely — the producer sends directly to that partition via WaterDrop's `partition:` parameter. Tenants not listed fall back to murmur2\_random. Out-of-range values are logged and ignored. |
 | `max_reconcile_per_run` | Integer | `100` | Max batches the reconciler processes per sweep (both stuck-running and lost-callback independently); caps callback bursts during incidents |
 | `max_message_bytes` | Integer | `1_048_576` | Raise `ProducerError` if an encoded payload exceeds this size (1 MiB default, matches Kafka's `message.max.bytes`); `0` disables the guard |
@@ -1501,7 +1501,7 @@ Rails.application.config.after_initialize do
 end
 ```
 
-With this in place, `checkout` and `complete` write to `kafka_batch:fair_<type>:inflight` and `kafka_batch:fair_<type>:ring` (per lane), so the **In-flight now** and **Queued** counters on the `/weights` page become live. Weights set via the UI propagate to all dispatcher processes within `fairness_weight_cache_ttl` seconds.
+With this in place, `checkout` and `complete` write to `kafka_batch:fair_<type>:leases` (+ the per-tenant `…:lease:<tenant_id>`) and `kafka_batch:fair_<type>:ring` (per lane), so the **In-flight now** and **Queued** counters on the `/weights` page become live. Weights set via the UI propagate to all dispatcher processes within `fairness_weight_cache_ttl` seconds.
 
 > **Checkout returns `nil` when:**
 > - The global concurrency budget (`fairness_global_concurrency`) is exhausted — all slots full.
@@ -1987,17 +1987,19 @@ Keys are namespaced **per lane**: `<ns>` is `kafka_batch:fair_time` or `kafka_ba
 | `<ns>:weight` | HASH | field = `tenant_id`, value = Float weight override. Primary store when `config.store = :redis`; mirrored from MySQL (WHERE `fairness_type` = lane) when `store = :mysql` |
 | `<ns>:vtime` | HASH | field = `tenant_id`, value = Float accumulated virtual time. Persists across idle periods so a returning tenant can't exploit accrued capacity |
 | `<ns>:ring` | ZSET | member = `tenant_id`, score = vtime. Only **currently active** tenants (with queued ready jobs). The Scheduler always picks the lowest score |
-| `<ns>:inflight` | HASH | field = `tenant_id`, value = Integer in-flight job count for this tenant |
-| `<ns>:inflight_total` | STRING | Global in-flight counter across all tenants in the lane. Capped by `fairness_global_concurrency` |
+| `<ns>:leases` | ZSET | member = `slot_id`, score = lease-expiry epoch (`checkout-time + fairness_lease_ttl`). **Authoritative global in-flight** for the lane: the concurrency budget is the count of members whose score is still in the future. Expired members (a dead consumer's leaked slot) are dropped on the next checkout, so the budget self-heals and can never be permanently pinned. Capped by `fairness_global_concurrency` |
+| `<ns>:lease:<tenant_id>` | ZSET | member = `slot_id`, score = lease-expiry epoch. **Authoritative per-tenant in-flight**, drives the dynamic fair-share and hard (`fairness_max_inflight_per_tenant`) caps. Same self-healing expiry as the global set. A completion removes the `slot_id` from both this and `<ns>:leases` |
 | `<ns>:ready:<tenant_id>` | LIST | Queued job payloads (JSON strings) for this tenant. LPOP'd at checkout; RPUSH'd at enqueue. Bounded by `fairness_ready_window` |
+| `<ns>:reclaim_lock` | STRING | Short-lived (`SET NX EX`) single-flight lock so only one process runs the periodic expired-lease sweep at a time |
 
 > **Quick debug commands** (swap `fair_time` for `fair_throughput` to inspect the other lane):
 > ```bash
 > redis-cli HGETALL kafka_batch:fair_time:weight         # all custom weights (time lane)
 > redis-cli HGETALL kafka_batch:fair_time:vtime          # accumulated vtime per tenant
 > redis-cli ZRANGE  kafka_batch:fair_time:ring 0 -1 WITHSCORES  # active tenants + their vtime
-> redis-cli HGETALL kafka_batch:fair_time:inflight       # in-flight counts
-> redis-cli GET     kafka_batch:fair_time:inflight_total # global in-flight (this lane)
+> redis-cli ZCOUNT  kafka_batch:fair_time:leases "($(date +%s))" +inf  # LIVE global in-flight (what the budget uses)
+> redis-cli ZCARD   kafka_batch:fair_time:leases         # global leases incl. any not-yet-pruned expired
+> redis-cli ZCARD   kafka_batch:fair_time:lease:acme     # in-flight for one tenant (per-tenant cap)
 > redis-cli HGETALL kafka_batch:fair_throughput:weight   # throughput-lane weights
 > redis-cli HGETALL kafka_batch:counts                   # batch status summary
 > redis-cli ZCARD   kafka_batch:index:running            # how many batches are running
