@@ -54,4 +54,36 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
       expect(inst.send(:should_yield_to_higher?, spec)).to be(true)
     end
   end
+
+  describe "#consume" do
+    let(:mode) { :strict }
+
+    it "rank 0 does not check higher-topic lag" do
+      rank0 = described_class.build(spec.merge(rank: 0, higher_topics: [], mode: :strict))
+      inst  = build_consumer(rank0)
+      allow(inst).to receive(:messages).and_return([])
+      expect(inst).not_to receive(:higher_topics_have_lag?)
+      inst.consume
+    end
+
+    it "rank 1 pauses and skips processing when higher topics have lag" do
+      inst = build_consumer(klass)
+      msg  = instance_double("Karafka::Messages::Message")
+      allow(inst).to receive(:messages).and_return([msg])
+      allow(inst).to receive(:higher_topics_have_lag?).and_return(true)
+      expect(inst).to receive(:pause).with(2_000)
+      expect(inst).not_to receive(:process_message)
+      inst.consume
+    end
+
+    it "rank 1 processes when higher topics have no lag" do
+      inst = build_consumer(klass)
+      msg  = instance_double("Karafka::Messages::Message")
+      allow(inst).to receive(:messages).and_return([msg])
+      allow(inst).to receive(:higher_topics_have_lag?).and_return(false)
+      expect(inst).not_to receive(:pause)
+      expect(inst).to receive(:process_message).with(msg)
+      inst.consume
+    end
+  end
 end

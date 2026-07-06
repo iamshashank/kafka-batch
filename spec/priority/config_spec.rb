@@ -48,4 +48,31 @@ RSpec.describe KafkaBatch::Priority::Config do
   ensure
     File.delete(path) if File.file?(path)
   end
+
+  it "computes rank and cumulative higher topics" do
+    config = described_class.load(fixture, cfg: cfg)
+    expect(config.rank_for("kafka_batch.jobs.p1")).to eq(1)
+    expect(config.higher_topics_for("kafka_batch.jobs.p1")).to eq(["kafka_batch.jobs.p0"])
+    expect(config.higher_topics_for("kafka_batch.jobs.p0")).to eq([])
+  end
+end
+
+RSpec.describe KafkaBatch::Configuration do
+  describe "#resolved_priority_config_paths" do
+    it "merges config paths with ENV variables" do
+      cfg = KafkaBatch.config
+      cfg.priority_config_paths = ["/app/a.yml"]
+      allow(ENV).to receive(:[]).and_call_original
+      allow(ENV).to receive(:[]).with("KAFKA_BATCH_PRIORITY_CONFIG").and_return("/app/b.yml")
+      allow(ENV).to receive(:[]).with("KAFKA_BATCH_PRIORITY_CONFIGS").and_return("/app/c.yml,/app/d.yml")
+
+      paths = cfg.resolved_priority_config_paths
+      expect(paths).to include(
+        File.expand_path("/app/a.yml"),
+        File.expand_path("/app/b.yml"),
+        File.expand_path("/app/c.yml"),
+        File.expand_path("/app/d.yml")
+      )
+    end
+  end
 end

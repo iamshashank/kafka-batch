@@ -27,6 +27,20 @@ RSpec.describe KafkaBatch::Priority::Registry do
     File.delete(overlap) if File.file?(overlap)
   end
 
+  it "raises when two files target the same consumer group suffix" do
+    dupe = File.join(Dir.mktmpdir, "dupe_group.yml")
+    File.write(dupe, <<~YAML)
+      consumer_group_suffix: jobs-fast
+      mode: strict
+      topics:
+        - kafka_batch.jobs.other
+    YAML
+    expect { described_class.load([fast, dupe], cfg: cfg) }
+      .to raise_error(KafkaBatch::ConfigurationError, /duplicate consumer group/)
+  ensure
+    File.delete(dupe) if File.file?(dupe)
+  end
+
   it "raises when a topic would also be on flat -jobs" do
     registry = described_class.load([fast], cfg: cfg)
     expect { registry.validate_plain_topics!(["kafka_batch.jobs.p1", "test.success"]) }

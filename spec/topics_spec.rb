@@ -68,6 +68,15 @@ RSpec.describe KafkaBatch::Topics do
       end
     end
 
+    it "includes topics from priority YAML config paths" do
+      KafkaBatch.config.priority_config_paths = [
+        File.expand_path("fixtures/priority/fast.yml", __dir__)
+      ]
+      names = described_class.specs.map { |s| s[:name] }
+
+      expect(names).to include("kafka_batch.jobs.p0", "kafka_batch.jobs.p1")
+    end
+
     it "forces every topic to the given partition count when provided" do
       specs = described_class.specs(partitions: 9)
       expect(specs.map { |s| s[:partitions] }).to all(eq(9))
