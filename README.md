@@ -28,6 +28,7 @@ Built on [Karafka](https://karafka.io) (WaterDrop + consumers).
 - [Instrumentation](#instrumentation)
 - [Migrating from Sidekiq Pro](#migrating-from-sidekiq-pro)
 - [Reference](#reference)
+- [TCO vs Sidekiq at scale](#tco-vs-sidekiq-at-scale)
 - [Contributing](#contributing)
 
 ---
@@ -687,6 +688,78 @@ bundle exec rake kafka_batch:reconcile
 | Completion counting | Exactly-once per `batch_seq` (bitmap dedup) |
 | Callback delivery | At-least-once (idempotent callbacks required) |
 | Batch create atomicity | Redis record before produce; rollback on partial produce failure |
+
+---
+
+## TCO vs Sidekiq at scale
+
+Rough **full annual TCO** (AWS infrastructure + Sidekiq license) for large **pending backlogs**. Intended for capacity planning — not a quote.
+
+### Scope & assumptions
+
+| Assumption | Value |
+|---|---|
+| **Pending jobs** | 100M or 200M jobs **waiting** in the queue (not yet consumed) |
+| **Payload size** | ~800 bytes average JSON per job (class + args + metadata) |
+| **Region** | us-east-1, on-demand list pricing |
+| **Excluded** | Worker/compute pods (Sidekiq processes **and** Karafka consumers), data-transfer egress, support/SRE headcount |
+| **Sidekiq Enterprise threads** | 1,500 production threads (e.g. 150 pods × concurrency 10) — [volume pricing](https://billing.contribsys.com/sent/new.cgi) at 13+ packs ($189/mo per 100 threads) |
+| **kafka-batch license** | MIT — **$0** (Karafka OSS; Karafka Pro is separate if needed) |
+
+**Sidekiq** stores every pending job in **Redis (RAM)**. **kafka-batch** stores job payloads in **Kafka (disk)**; Redis holds coordination only (batch ledger, fairness, uniq locks).
+
+**Feature parity:** Batches alone maps to **Sidekiq Pro**. Unique jobs, rate limiting, periodic jobs, and weighted queues map to **Sidekiq Enterprise** — closer to kafka-batch’s full feature set.
+
+### Licensing (annual)
+
+| Product | Annual license | Notes |
+|---|---|---|
+| **Sidekiq Pro** | **$995/yr** | Batches + reliable scheduler; unlimited processes per org |
+| **Sidekiq Enterprise** | **~$34,020/yr** | Pro + unique jobs, rate limiting, periodic jobs, etc.; priced per 100 **production** threads |
+| **kafka-batch** | **$0** | MIT |
+
+Enterprise unlimited license is **$79,500/yr** — typically cheaper above ~3,500 production threads. See the [Commercial FAQ](https://github.com/sidekiq/sidekiq/wiki/Commercial-FAQ).
+
+### AWS infrastructure (annual)
+
+| Stack | 100M pending | 200M pending |
+|---|---|---|
+| **Sidekiq (ElastiCache Redis)** | ~**$30k–$60k**/yr | ~**$60k–$120k**/yr |
+| **kafka-batch (MSK + Redis ± RDS)** | ~**$13k–$30k**/yr | ~**$14k–$34k**/yr |
+
+Sidekiq infra scales ~linearly with backlog (RAM for every job). kafka-batch infra is dominated by **MSK broker baseline**; disk grows sub-linearly thanks to compression — doubling backlog does not double cost.
+
+### Full annual TCO (infra + license)
+
+#### 100M pending jobs
+
+| | License / yr | AWS infra / yr | **Total / yr** | **Total / mo** |
+|---|---|---|---|---|
+| **Sidekiq Pro** | $995 | ~$30k–$60k | **~$31k–$61k** | **~$2.6k–$5.1k** |
+| **Sidekiq Enterprise** | ~$34k | ~$30k–$60k | **~$64k–$94k** | **~$5.3k–$7.8k** |
+| **kafka-batch** | $0 | ~$13k–$30k | **~$13k–$30k** | **~$1.1k–$2.5k** |
+
+#### 200M pending jobs
+
+| | License / yr | AWS infra / yr | **Total / yr** | **Total / mo** |
+|---|---|---|---|---|
+| **Sidekiq Pro** | $995 | ~$60k–$120k | **~$61k–$121k** | **~$5.1k–$10.1k** |
+| **Sidekiq Enterprise** | ~$34k | ~$60k–$120k | **~$94k–$154k** | **~$7.8k–$12.8k** |
+| **kafka-batch** | $0 | ~$14k–$34k | **~$14k–$34k** | **~$1.2k–$2.8k** |
+
+At 200M pending with Enterprise-equivalent features and ~1,500 Sidekiq threads, kafka-batch is roughly **~$80k–$120k/yr** cheaper all-in — mostly Redis RAM vs Kafka disk, plus ~$34k/yr license.
+
+### What moves these numbers
+
+| Factor | Effect |
+|---|---|
+| **Larger payloads (2 KB)** | Sidekiq Redis cost **~2.5×**; kafka-batch Kafka disk **~2×** |
+| **Fewer Sidekiq threads** | Enterprise license drops (5 packs ≈ $13.7k/yr); infra unchanged |
+| **Reserved Instances / Savings Plans** | 30–40% off AWS; Sidekiq license unchanged |
+| **Long pending duration** | Sidekiq holds RAM until processed; Kafka retention can grow disk if jobs sit for weeks |
+| **200M jobs in one batch** | Sidekiq batch dedup pain; kafka-batch still hits one Redis hash hotspot per batch ([pitfall #6](#non-negotiable-pitfalls)) |
+
+> **Reality check:** 100–200M jobs pending in Redis is uncommon — most Sidekiq fleets shard queues or cap backlog. kafka-batch is designed for durable, partition-parallel backlogs on Kafka.
 
 ---
 
