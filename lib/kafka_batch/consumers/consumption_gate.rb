@@ -3,7 +3,7 @@ module KafkaBatch
     # Prepended before #consume on gem consumers. When the Web UI marks a topic
     # or partition paused (Redis or MySQL), the consumer pauses indefinitely
     # until resume is requested. Pause state is refreshed at most every
-    # config.consumption_control_refresh_interval seconds (default 60).
+    # config.consumption_control_refresh_interval seconds (default 30).
     module ConsumptionGate
       def consume
         KafkaBatch::Liveness.heartbeat(topic: heartbeat_topic)

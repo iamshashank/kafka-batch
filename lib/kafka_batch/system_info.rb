@@ -198,7 +198,10 @@ module KafkaBatch
             row("Forwarder idle sleep", "#{config.fairness_forwarder_idle_sleep}s"),
             row("Dispatcher batch size", config.fairness_dispatcher_batch_size),
             row("Dispatcher concurrency (hint)", config.fairness_dispatcher_concurrency),
-            row("Min ingest partitions", config.fairness_min_ingest_partitions)
+            row("Min ingest partitions", config.fairness_min_ingest_partitions),
+            row("Dynamic tenant partitions", fmt_bool(config.fairness_dynamic_tenant_partitions)),
+            row("Tenant partition cache TTL", fmt_duration(config.fairness_tenant_partition_cache_ttl)),
+            row("Pinned tenant partitions", config.fairness_tenant_partitions.empty? ? "none" : config.fairness_tenant_partitions.size)
           ]
         )
       end

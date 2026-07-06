@@ -76,12 +76,12 @@ TOPICS=(
 
 # Fairness lanes (time + throughput). A worker picks one via `fairness_type`;
 # both lanes run at once, each with its own ingest → ready topics. Ingest topics
-# need many partitions (≈ max concurrent tenants).
+# need many partitions (≈ max unique tenants on the fair lane).
 if [ "${INCLUDE_FAIRNESS}" = "true" ]; then
   TOPICS+=(
-    "${PREFIX}kafka_batch.fair_time_ingest:64"
+    "${PREFIX}kafka_batch.fair_time_ingest:300"
     "${PREFIX}kafka_batch.fair_time_ready:768"
-    "${PREFIX}kafka_batch.fair_throughput_ingest:64"
+    "${PREFIX}kafka_batch.fair_throughput_ingest:300"
     "${PREFIX}kafka_batch.fair_throughput_ready:768"
   )
 fi

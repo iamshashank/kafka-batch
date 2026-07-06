@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "securerandom"
+require_relative "dlt/stats"
+require_relative "dlt/reader"
 
 module KafkaBatch
   # Central dead-letter publish helper — every DLT path should go through here

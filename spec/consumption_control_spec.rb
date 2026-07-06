@@ -126,7 +126,7 @@ RSpec.describe KafkaBatch::ConsumptionControl do
     before do
       skip "Redis unavailable" unless KafkaBatchSpec::RedisHelper.available?
       KafkaBatch.config.redis_url = KafkaBatchSpec::RedisHelper::TEST_URL
-      KafkaBatch.config.consumption_control_refresh_interval = 60
+      KafkaBatch.config.consumption_control_refresh_interval = 30
       described_class.reset!
       KafkaBatchSpec::RedisHelper.flush!
     end
@@ -153,7 +153,7 @@ RSpec.describe KafkaBatch::ConsumptionControl do
       described_class.send(:redis_resume_topic, "g", "demo")
       expect(described_class.paused?(group: "g", topic: "demo", partition: 0)).to eq(true)
 
-      t = 61.0
+      t = 31.0
       expect(described_class.paused?(group: "g", topic: "demo", partition: 0)).to eq(false)
     end
   end

@@ -583,4 +583,74 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("No scheduled job matches")
     end
   end
+
+  describe "GET /reconciler" do
+    it "renders when no run has been recorded" do
+      allow(KafkaBatch::Reconciler::RunSummary).to receive(:load_last).and_return(nil)
+      allow(KafkaBatch::Reconciler::RunSummary).to receive(:load_skip).and_return(nil)
+      html = get("/reconciler").last.join
+      expect(html).to include("No reconciler run recorded")
+    end
+
+    it "shows last run metrics when present" do
+      allow(KafkaBatch::Reconciler::RunSummary).to receive(:load_last).and_return(
+        ran_at: Time.now.utc.iso8601(3),
+        triggered_by: "consumer",
+        duration: 0.42,
+        recovered_stale: 2,
+        refired_lost: 1,
+        produce_failed: 0,
+        found_stale: 2,
+        processed_stale: 2,
+        found_lost: 1,
+        processed_lost: 1,
+        capped_stale: "0",
+        capped_lost: "0",
+        skipped_stale: 0,
+        details: []
+      )
+      allow(KafkaBatch::Reconciler::RunSummary).to receive(:load_skip).and_return(nil)
+      html = get("/reconciler").last.join
+      expect(html).to include("Stuck batches recovered")
+      expect(html).to include("consumer")
+    end
+  end
+
+  describe "GET /dead_letter" do
+    it "renders unavailable state when stats cannot be loaded" do
+      allow(KafkaBatch::Dlt::Stats).to receive(:fetch).and_return(nil)
+      html = get("/dead_letter").last.join
+      expect(html).to include("Could not read")
+    end
+
+    it "renders totals and messages when stats and page are available" do
+      allow(KafkaBatch::Dlt::Stats).to receive(:fetch).and_return(
+        topic: "kafka_batch.dead_letter",
+        partitions: 3,
+        total: 42,
+        by_type: { "job" => 40 },
+        sample_size: 10,
+        sample_limited: true
+      )
+      allow(KafkaBatch::Dlt::Reader).to receive(:new).and_return(
+        instance_double(
+          KafkaBatch::Dlt::Reader,
+          fetch_page: {
+            messages: [{
+              partition: 0, offset: 9, dlt_at: Time.now.iso8601, dlt_type: "job",
+              worker_class: "MyWorker", batch_id: "b1", job_id: "j1",
+              source_topic: "t", error_class: "RuntimeError", error_message: "boom"
+            }],
+            has_older: false,
+            cursor_older: nil
+          },
+          close: nil
+        )
+      )
+      html = get("/dead_letter").last.join
+      expect(html).to include("Messages in DLT")
+      expect(html).to include("42")
+      expect(html).to include("MyWorker")
+    end
+  end
 end

@@ -97,6 +97,10 @@ module KafkaBatch
         ledger.with_reconciler_lock(**kwargs, &block)
       end
 
+      def with_redis(&block)
+        ledger.with_redis(&block)
+      end
+
       # ── Failures (MySQL) ───────────────────────────────────────────────────
 
       def record_failure(batch_id:, job_id:, worker_class:, error_class:, error_message:, attempt: 0, status: "failed", next_retry_at: nil)

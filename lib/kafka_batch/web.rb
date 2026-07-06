@@ -4,6 +4,9 @@ require "securerandom"
 require "time"
 require_relative "system_info"
 require_relative "weight_shares"
+require_relative "reconciler/run_summary"
+require_relative "dlt/stats"
+require_relative "dlt/reader"
 
 module KafkaBatch
   # A minimal, dependency-free Rack application for inspecting batches –
@@ -110,6 +113,10 @@ module KafkaBatch
           html(render_scheduled(params), title: "Scheduled")
         elsif method == "GET" && path == "/system"
           html(render_system, title: "System")
+        elsif method == "GET" && path == "/reconciler"
+          html(render_reconciler, title: "Reconciler")
+        elsif method == "GET" && path == "/dead_letter"
+          html(render_dead_letter(params), title: "Dead letter")
         elsif method == "GET" && (path == "/weights" || path == "/weights/time")
           html(render_weights(params, type: :time), title: "Time Fairness Weights")
         elsif method == "GET" && path == "/weights/throughput"
@@ -349,12 +356,154 @@ module KafkaBatch
     end
 
     def render_system
+      recon = reconciler_status_banner
       cards = KafkaBatch::SystemInfo.sections.map { |section| system_card(section) }.join
 
       <<~HTML
+        #{recon}
         <p class="muted sys-lead">Read-only view of the active KafkaBatch configuration. Passwords and secrets are masked.</p>
         <div class="sys-grid">#{cards}</div>
       HTML
+    end
+
+    def render_reconciler
+      last  = KafkaBatch::Reconciler::RunSummary.load_last
+      skip  = KafkaBatch::Reconciler::RunSummary.load_skip
+      cfg   = KafkaBatch.config
+
+      metrics = if last
+        <<~HTML
+          <div class="metrics">
+            <div class="metric"><div class="metric-value">#{h(fmt_time(last[:ran_at]))}</div><div class="metric-label">Last run</div></div>
+            <div class="metric"><div class="metric-value">#{h(last[:triggered_by].to_s)}</div><div class="metric-label">Triggered by</div></div>
+            <div class="metric"><div class="metric-value">#{h(last[:duration].to_s)}s</div><div class="metric-label">Duration</div></div>
+            <div class="metric"><div class="metric-value">#{last[:recovered_stale].to_i}</div><div class="metric-label">Stuck batches recovered</div></div>
+            <div class="metric"><div class="metric-value">#{last[:refired_lost].to_i}</div><div class="metric-label">Callbacks refired</div></div>
+            <div class="metric"><div class="metric-value">#{last[:produce_failed].to_i}</div><div class="metric-label">Produce failures</div></div>
+          </div>
+        HTML
+      else
+        "<p class='muted'>No reconciler run recorded yet. Runs automatically from <code>EventConsumer</code> every " \
+        "#{h(cfg.reconciliation_interval.to_s)}s or via <code>rake kafka_batch:reconcile</code>.</p>"
+      end
+
+      skip_note =
+        if skip && skip[:at]
+          "<p class='muted'>Last lock skip: #{h(fmt_time(skip[:at]))} (#{h(skip[:reason].to_s)}) — another process held the reconciler lock.</p>"
+        else
+          ""
+        end
+
+      summary_rows = ""
+      if last
+        summary_rows = <<~HTML
+          <div class="card">
+            <h2>Last sweep</h2>
+            <table class="detail"><tbody>
+              <tr><th>Stuck-running found / processed</th><td>#{last[:found_stale].to_i} / #{last[:processed_stale].to_i}#{last[:capped_stale].to_s == "1" ? " (capped)" : ""}</td></tr>
+              <tr><th>Lost-callback found / processed</th><td>#{last[:found_lost].to_i} / #{last[:processed_lost].to_i}#{last[:capped_lost].to_s == "1" ? " (capped)" : ""}</td></tr>
+              <tr><th>Skipped (open / in progress)</th><td>#{last[:skipped_stale].to_i}</td></tr>
+              <tr><th>Interval</th><td>#{h(cfg.reconciliation_interval.to_s)}s</td></tr>
+              <tr><th>Max per run</th><td>#{h(cfg.max_reconcile_per_run.to_s)}</td></tr>
+            </tbody></table>
+          </div>
+        HTML
+      end
+
+      details = Array(last&.dig(:details))
+      detail_rows = details.map do |d|
+        bid = d["batch_id"] || d[:batch_id]
+        action = d["action"] || d[:action]
+        link = bid ? "<a href='#{show_path(bid)}'>#{h(bid[0, 8])}…</a>" : "—"
+        <<~ROW.gsub(/\n\s*/, "")
+          <tr>
+            <td class="mono">#{link}</td>
+            <td>#{h(action.to_s)}</td>
+            <td>#{h((d["outcome"] || d[:outcome]).to_s)}</td>
+            <td>#{h((d["total_jobs"] || d[:total_jobs]).to_s)}</td>
+            <td>#{h((d["failed_count"] || d[:failed_count]).to_s)}</td>
+          </tr>
+        ROW
+      end.join
+      detail_rows = "<tr><td colspan='5' class='empty'>No per-batch actions on the last run.</td></tr>" if detail_rows.empty?
+
+      <<~HTML
+        #{metrics}
+        #{skip_note}
+        #{summary_rows}
+        <div class="card">
+          <h2>Last run detail</h2>
+          <table>
+            <thead><tr><th>Batch</th><th>Action</th><th>Outcome</th><th>Total</th><th>Failed</th></tr></thead>
+            <tbody>#{detail_rows}</tbody>
+          </table>
+          <p class="muted">Shows up to #{KafkaBatch::Reconciler::RunSummary::MAX_DETAILS} batches from the most recent sweep. In-flight jobs are not preempted.</p>
+        </div>
+      HTML
+    end
+
+    def render_dead_letter(params)
+      type   = non_empty(params["type"])
+      before = non_empty(params["before"])
+      stats  = safe_dlt_stats
+      page   = safe_dlt_page(type: type, before: before)
+
+      unless stats
+        return <<~HTML
+          <div class="card"><h2>Dead letter topic</h2>
+          <p class="muted">Could not read <code>#{h(KafkaBatch.config.dead_letter_topic)}</code>. Ensure Kafka brokers are configured and reachable from this process.</p>
+          <p class="muted">The <a href="#{failures_path}">Failures</a> page shows batch job failures from the store — not the same as the Kafka dead-letter topic.</p></div>
+        HTML
+      end
+
+      type_note = stats[:sample_limited] ? " <span class='muted'>(type counts from recent sample of #{stats[:sample_size].to_i})</span>" : ""
+      type_chips = dlt_type_chips(type, stats[:by_type] || {})
+
+      metrics = <<~HTML
+        <div class="metrics">
+          <div class="metric"><div class="metric-value">#{stats[:total].to_i}</div><div class="metric-label">Messages in DLT</div></div>
+          <div class="metric"><div class="metric-value">#{stats[:partitions].to_i}</div><div class="metric-label">Partitions</div></div>
+          <div class="metric"><div class="metric-value mono" style="font-size:14px">#{h(stats[:topic].to_s)}</div><div class="metric-label">Topic</div></div>
+        </div>
+      HTML
+
+      rows = page[:messages].map { |m| dlt_row(m) }.join
+      rows = "<tr><td colspan='7' class='empty'>No dead-letter messages on this page.</td></tr>" if rows.empty?
+
+      older_q = type ? "&type=#{CGI.escape(type)}" : ""
+      older_link = page[:has_older] && page[:cursor_older] ?
+        "<a class='btn' href='#{dead_letter_path}?before=#{CGI.escape(page[:cursor_older])}#{older_q}'>Older →</a>" : ""
+
+      <<~HTML
+        #{metrics}
+        <p class="muted">Newest first. Type breakdown#{type_note}. See also <a href="#{failures_path}">Failures</a> (batch retry log in Redis/MySQL).</p>
+        <div class="filterbar"><div class="chips">#{type_chips}</div></div>
+        <div class="card">
+          <h2>Dead letter messages</h2>
+          <table>
+            <thead><tr><th>When</th><th>Type</th><th>Worker / callback</th><th>Batch / job</th><th>Source</th><th>Error</th><th>Location</th></tr></thead>
+            <tbody>#{rows}</tbody>
+          </table>
+          <div class="pager">#{older_link}</div>
+        </div>
+      HTML
+    end
+
+    def reconciler_status_banner
+      last = KafkaBatch::Reconciler::RunSummary.load_last
+      return "" unless last
+
+      age = reconciler_age_label(last[:ran_at])
+      <<~HTML
+        <div class="card" style="margin-bottom:12px">
+          <strong>Reconciler</strong> — last run #{h(age)} (#{h(last[:triggered_by].to_s)}):
+          #{last[:recovered_stale].to_i} stuck recovered,
+          #{last[:refired_lost].to_i} callbacks refired.
+          <a href="#{reconciler_path}">Details →</a>
+        </div>
+      HTML
+    rescue StandardError
+      ""
     end
 
     def render_index(params)
@@ -609,13 +758,16 @@ module KafkaBatch
       pause_note =
         if paused
           refresh = KafkaBatch.config.consumption_control_refresh_interval
+          tip = lag_pause_tooltip(refresh)
           case KafkaBatch::ConsumptionControl.backend
           when :redis
             "<p class='muted'>Pause/resume uses Redis (<code>#{h(KafkaBatch.config.redis_url)}</code>). " \
-            "Karafka consumers refresh pause state every #{refresh}s.</p>"
+            "<span title='#{h(tip)}' style='cursor:help;border-bottom:1px dotted #9ca3af'>Consumers pick up changes within ~#{refresh}s</span> " \
+            "(<code>consumption_control_refresh_interval</code>).</p>"
           when :mysql
             "<p class='muted'>Pause/resume uses MySQL (<code>kafka_batch_consumption_pauses</code>). " \
-            "Karafka consumers refresh pause state every #{refresh}s.</p>"
+            "<span title='#{h(tip)}' style='cursor:help;border-bottom:1px dotted #9ca3af'>Consumers pick up changes within ~#{refresh}s</span> " \
+            "(<code>consumption_control_refresh_interval</code>).</p>"
           end
         else
           "<p class='muted'>Pause/resume requires Redis (<code>config.redis_url</code>) or MySQL " \
@@ -701,7 +853,7 @@ module KafkaBatch
 
       inactive_notice =
         unless KafkaBatch.active_fairness_types.include?(type)
-          "<div class='card'><p class='muted'>No registered workers use the <code>#{type}</code> fairness lane yet (set <code>fairness true</code> and <code>fairness_type :#{type}</code> on a Worker class). Lag below reflects the lane's ingest/ready topics.</p></div>"
+          "<div class='card'><p class='muted'>No registered workers use the <code>#{type}</code> fairness lane yet (set <code>fairness_type :#{type}</code> on a Worker class). Lag below reflects the lane's ingest/ready topics.</p></div>"
         end
       unless KafkaBatch::Lag.available?
         return "#{back}#{inactive_notice}#{ingest_partition_lookup_widget(tenant_q, action: fairness_path(type), type: type)}<div class='card'><h2>#{lane_label}</h2><p class='muted'>This view needs Karafka's admin API (<code>Karafka::Admin</code>), which isn't available in this process.</p></div>"
@@ -1061,10 +1213,19 @@ module KafkaBatch
       qs   = lag_control_query(scope: scope, group: group, topic: topic, partition: partition, tenant_q: tenant_q)
       path = action == :pause ? "#{lag_path}/pause" : "#{lag_path}/resume"
       cls  = action == :pause ? "btn btn-sm danger-btn" : "btn btn-sm"
+      tip  = h(lag_pause_tooltip(KafkaBatch.config.consumption_control_refresh_interval))
       # #23: lag forms POST all params via query string (no body); embed the CSRF
       # token there too so it arrives in env["QUERY_STRING"] and passes validation.
       csrf_qs = "&#{url_encode(CSRF_FIELD)}=#{url_encode(csrf_token)}"
-      %(<form class="inline-form" method="post" action="#{path}?#{qs}#{csrf_qs}"><button type="submit" class="#{cls}">#{verb}</button></form>)
+      %(<form class="inline-form" method="post" action="#{path}?#{qs}#{csrf_qs}"><button type="submit" class="#{cls}" title="#{tip}">#{verb}</button></form>)
+    end
+
+    def lag_pause_tooltip(refresh_seconds)
+      secs = refresh_seconds.to_i
+      secs = 30 if secs <= 0
+      "Pause/resume is written immediately, but Karafka consumers cache pause state " \
+        "for up to #{secs}s (consumption_control_refresh_interval). Processing may " \
+        "continue briefly after you click Pause; lag can take up to #{secs}s to stop falling."
     end
 
     def lag_control_query(scope:, group:, topic:, tenant_q:, partition: nil)
@@ -1112,20 +1273,27 @@ module KafkaBatch
         return "<p class='muted'>Could not read partition count for <code>#{h(topic)}</code>.</p>"
       end
 
-      # Resolve partition: explicit map wins, murmur2_random hash is the fallback.
+      # Resolve partition: configured map → dynamic Redis → murmur2 hash fallback.
       configured = (KafkaBatch.config.fairness_tenant_partitions || {})[tenant_id.to_s]
-      if configured && configured.to_i < count
-        partition    = configured.to_i
-        source_badge = "<span class='badge' style='background:#6366f1'>configured</span> "
-      else
-        partition    = KafkaBatch::Partition.for_key(tenant_id, count)
+      dynamic    = KafkaBatch.config.fairness_dynamic_tenant_partitions
+      resolved   = KafkaBatch.tenant_ingest_partition(tenant_id, type)
+
+      if resolved
+        partition = resolved
         source_badge =
-          if configured
-            # Configured value exists but is out of range — warn visually.
-            "<span class='badge' style='background:#ef4444'>configured partition #{configured} out of range</span> "
+          if configured && configured.to_i == partition
+            "<span class='badge' style='background:#6366f1'>configured</span> "
+          elsif dynamic
+            "<span class='badge' style='background:#10b981'>dynamic</span> "
           else
             ""
           end
+      elsif configured && configured.to_i >= count
+        partition    = KafkaBatch::Partition.for_key(tenant_id, count)
+        source_badge = "<span class='badge' style='background:#ef4444'>configured partition #{configured} out of range</span> "
+      else
+        partition    = KafkaBatch::Partition.for_key(tenant_id, count)
+        source_badge = dynamic ? "<span class='badge' style='background:#f59e0b'>hash fallback</span> " : ""
       end
 
       lag_row = lag_rows&.find do |r|
@@ -1689,6 +1857,71 @@ module KafkaBatch
       nil
     end
 
+    def safe_dlt_stats
+      KafkaBatch::Dlt::Stats.fetch
+    rescue StandardError => e
+      KafkaBatch.logger.warn("[KafkaBatch::Web] DLT stats failed: #{e.message}")
+      nil
+    end
+
+    def safe_dlt_page(type:, before:)
+      reader = KafkaBatch::Dlt::Reader.new
+      reader.fetch_page(type: type, before: before, limit: PER_PAGE)
+    rescue StandardError => e
+      KafkaBatch.logger.warn("[KafkaBatch::Web] DLT page failed: #{e.message}")
+      { messages: [], has_older: false, cursor_older: nil }
+    ensure
+      reader&.close
+    end
+
+    def dlt_type_chips(active, by_type)
+      chips = [["All", nil, by_type.values.sum]]
+      KafkaBatch::Dlt::Reader::DLT_TYPES.each do |t|
+        n = by_type[t].to_i
+        chips << [t, t, n] if n.positive? || active == t
+      end
+      chips.map do |label, t, n|
+        cls = (active == t || (t.nil? && active.nil?)) ? "chip active" : "chip"
+        href = t ? "#{dead_letter_path}?type=#{CGI.escape(t)}" : dead_letter_path
+        suffix = n.positive? ? " (#{n})" : ""
+        "<a class='#{cls}' href='#{href}'>#{h(label)}#{suffix}</a>"
+      end.join
+    end
+
+    def dlt_row(m)
+      when_at = m[:dlt_at] || m[:timestamp]
+      worker = m[:worker_class] || m[:callback_class]
+      err    = [m[:error_class], m[:error_message]].compact.join(": ")
+      err    = err[0, 120] + "…" if err.length > 120
+      batch_link = m[:batch_id] ? "<a href='#{show_path(m[:batch_id])}'>#{h(short_id(m[:batch_id]))}</a>" : "—"
+      job        = m[:job_id] ? h(short_id(m[:job_id])) : "—"
+      <<~ROW.gsub(/\n\s*/, "")
+        <tr>
+          <td>#{h(fmt_time(when_at))}</td>
+          <td><span class="badge">#{h(m[:dlt_type].to_s)}</span></td>
+          <td class="mono">#{h(worker.to_s)}</td>
+          <td>#{batch_link} / <span class="mono">#{job}</span></td>
+          <td class="mono">#{h(m[:source_topic].to_s)}</td>
+          <td class="mono">#{h(err)}</td>
+          <td class="mono">#{m[:partition]}:#{m[:offset]}</td>
+        </tr>
+      ROW
+    end
+
+    def reconciler_age_label(ran_at)
+      return "unknown" if ran_at.nil? || ran_at.to_s.empty?
+
+      t = Time.parse(ran_at.to_s)
+      secs = (Time.now - t).to_i
+      return "just now" if secs < 60
+      return "#{secs / 60}m ago" if secs < 3600
+      return "#{secs / 3600}h ago" if secs < 86_400
+
+      "#{secs / 86_400}d ago"
+    rescue StandardError
+      ran_at.to_s
+    end
+
     def short_id(id)
       id.to_s[0, 8]
     end
@@ -1723,6 +1956,14 @@ module KafkaBatch
 
     def scheduled_path
       "#{@script_name}/scheduled"
+    end
+
+    def reconciler_path
+      "#{@script_name}/reconciler"
+    end
+
+    def dead_letter_path
+      "#{@script_name}/dead_letter"
     end
 
     def weights_reset_path(type = :time)
@@ -1866,9 +2107,11 @@ module KafkaBatch
             <nav class="header-nav">
               #{nav_btn("/", "Batches")}
               #{nav_btn("/failures", "⚠ Failures")}
+              #{nav_btn("/dead_letter", "☠ Dead letter")}
               #{nav_btn("/live", "▶ Consumer Process")}
               #{nav_btn("/lag", "▦ Kafka Lag")}
               #{nav_btn("/scheduled", "⏰ Scheduled")}
+              #{nav_btn("/reconciler", "⟳ Reconciler")}
               #{nav_btn("/fairness/time", "⏱ Time Fairness")}
               #{nav_btn("/weights/time", "⚖ Time Weights")}
               #{nav_btn("/fairness/throughput", "⚡ Throughput Fairness")}

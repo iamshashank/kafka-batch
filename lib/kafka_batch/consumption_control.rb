@@ -8,9 +8,9 @@ module KafkaBatch
   #   :redis – config.redis_url (SET members)
   #   :mysql – kafka_batch_consumption_pauses when config.store = :mysql
   #
-  # Karafka consumers refresh pause state at most once per
-  # config.consumption_control_refresh_interval (default 60s). The /lag UI
-  # always reads fresh state.
+    # Karafka consumers refresh pause state at most once per
+    # config.consumption_control_refresh_interval (default 30s). The /lag UI
+    # always reads fresh state.
   module ConsumptionControl
     TOPICS_KEY     = "kafka_batch:consumption:topics"
     PARTITIONS_KEY = "kafka_batch:consumption:partitions"
@@ -74,6 +74,12 @@ module KafkaBatch
         invalidate_snapshot_cache!
       end
 
+      def topic_level_paused?(group:, topic:)
+        return false unless available?
+
+        topic_paused?(snapshot(refresh: false), group.to_s, topic.to_s)
+      end
+
       # @return [Boolean]
       def paused?(group:, topic:, partition:)
         snap = snapshot(refresh: false)
@@ -134,7 +140,7 @@ module KafkaBatch
 
       def cached_snapshot
         interval = KafkaBatch.config.consumption_control_refresh_interval.to_i
-        interval = 60 if interval <= 0
+        interval = 30 if interval <= 0
         now      = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
         cache_mutex.synchronize do

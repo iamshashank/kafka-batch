@@ -71,7 +71,9 @@ module KafkaBatch
           rank:           spec[:rank],
           higher_topics:  higher
         )
-        pause(pause_ms)
+        # Karafka::BaseConsumer#pause(offset, timeout_ms) — NOT pause(timeout_ms).
+        seek = messages.empty? ? :consecutive : messages.first.offset
+        pause(seek, pause_ms)
       end
     end
   end

@@ -133,6 +133,31 @@ RSpec.describe KafkaBatch::Reconciler do
 
       expect(FakeProducer.for_topic(KafkaBatch.config.callbacks_topic).size).to eq(2)
     end
+
+    it "persists a run summary for the dashboard" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
+      KafkaBatchSpec::RedisHelper.simulate_stuck_running!(id, completed_count: 1)
+
+      described_class.run(triggered_by: :rake)
+
+      last = KafkaBatch::Reconciler::RunSummary.load_last
+      expect(last).not_to be_nil
+      expect(last[:triggered_by]).to eq("rake")
+      expect(last[:recovered_stale].to_i).to eq(1)
+    end
+
+    it "records lock skips when the reconciler lock is held" do
+      Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL).set(
+        "kafka_batch:b:reconciler_lock", "other", nx: true, ex: 300
+      )
+      allow(KafkaBatch.store).to receive(:with_reconciler_lock).and_call_original
+
+      expect(described_class.run).to eq(:lock_skipped)
+
+      skip = KafkaBatch::Reconciler::RunSummary.load_skip
+      expect(skip[:reason]).to eq("lock_held")
+    end
   end
 
   # ── with_reconciler_lock (Redis-backed for all store modes) ──────────────

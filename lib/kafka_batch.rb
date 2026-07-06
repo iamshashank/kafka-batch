@@ -17,6 +17,7 @@ require_relative "kafka_batch/consumers/consumption_gate"
 require_relative "kafka_batch/consumers/expired_job_handler"
 require_relative "kafka_batch/topics"
 require_relative "kafka_batch/fairness/scheduler"
+require_relative "kafka_batch/fairness/tenant_partitions"
 require_relative "kafka_batch/fairness/forwarder"
 require_relative "kafka_batch/fairness/dispatcher"
 require_relative "kafka_batch/worker"
@@ -230,6 +231,12 @@ module KafkaBatch
         raise ConfigurationError, msg if strict
         logger.warn(msg)
       end
+
+      if config.fairness_dynamic_tenant_partitions
+        active_fairness_types.each do |type|
+          Fairness::TenantPartitions.warm!(type)
+        end
+      end
     end
 
     # ── Reset (full — overrides core.rb's minimal version) ────────────────
@@ -252,6 +259,7 @@ module KafkaBatch
       Liveness.reset!
       Uniqueness.reset! if defined?(Uniqueness)
       ConsumptionControl.reset!
+      Fairness::TenantPartitions.reset! if defined?(Fairness::TenantPartitions)
       Fairness::Forwarder.stop! if defined?(Fairness::Forwarder)
       SchedulePoller.stop! if defined?(SchedulePoller)
     end

@@ -29,7 +29,7 @@ module KafkaBatch
       retry:       12,  # per tier
       scheduled:   48,  # perform_in/at payload store; poller reads by partition
       dead_letter: 3,
-      ingest:      64,  # fairness ingest (per lane): ≈ max concurrent tenants
+      ingest:      300, # fairness ingest (per lane): ≈ max unique tenants on fair lane
       ready:       768  # fairness ready (per lane): pods × concurrency
     }.freeze
 

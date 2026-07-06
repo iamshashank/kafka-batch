@@ -201,7 +201,7 @@ CallbackConsumer: invoke callback → then claim (at-least-once)
 | Fairness ordering | Kafka ingest → Redis WFQ → Kafka ready | `Dispatcher` + `Forwarder` |
 | Delayed jobs | Kafka scheduled + Redis/MySQL index | `SchedulePoller` |
 
-**Fair workers** (`fairness true`) route through ingest → scheduler → ready instead of their own topic. **Priority workers** use topics from a priority YAML group. **Plain workers** use `kafka_topic` or the shared default `kafka_batch.jobs`.
+**Fair workers** (`fairness_type :time` or `:throughput`) route through ingest → scheduler → ready instead of their own topic. **Priority workers** use topics from a priority YAML group. **Plain workers** use `kafka_topic` or the shared default `kafka_batch.jobs`.
 
 ---
 
@@ -211,11 +211,11 @@ CallbackConsumer: invoke callback → then claim (at-least-once)
 class MyWorker
   include KafkaBatch::Worker
 
-  kafka_topic "orders.process"   # optional — defaults to config.jobs_topic
+  kafka_topic "orders.process"   # optional — defaults to config.jobs_topic;
+                                   # topic_prefix applied automatically (see below)
   max_retries 5
   retry_tier :large            # pin all retries to one tier (optional)
-  fairness true                # opt into WFQ lane (optional)
-  fairness_type :time          # :time (default) or :throughput
+  fairness_type :time          # :time or :throughput — opts into WFQ lane (optional)
   uniq true                    # dedup enqueue by payload (optional)
 
   def perform(payload)
@@ -293,6 +293,7 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | `validate_topics_on_boot` | `false` | Raise if topics missing at boot |
 | `skip_cancelled_jobs` | `true` | |
 | `cancellation_cache_ttl` | `120` | seconds |
+| `consumption_control_refresh_interval` | `30` | How often consumers re-read pause state from Redis/MySQL |
 | `priority_config_paths` | `[]` | Paths to priority YAML files |
 | `fairness_weighted_concurrency` | `true` | Set `false` for equal in-flight cap per tenant (weights → order only) |
 | `fairness_global_concurrency` | `50` | Per-lane in-flight window (install template: `1000`) |
@@ -402,20 +403,25 @@ config.priority_config_paths = [
 ]
 ```
 
-Topic names get `topic_prefix` applied automatically.
+Topic names in priority YAML **and** worker `kafka_topic` declarations get `config.topic_prefix` applied automatically (same as `resolve_topic`). Use base names in workers; or pass the full prefixed name to pin it. `apply_prefix: false` opts out.
 
 ### Enroll workers
 
 ```ruby
 class CriticalWorker
   include KafkaBatch::Worker
-  kafka_topic "kafka_batch.jobs.p0"   # rank 0 — no gate
+  kafka_topic "kafka_batch.jobs.p0"   # → myapp.kafka_batch.jobs.p0 when prefix set
 end
 
 class NormalWorker
   include KafkaBatch::Worker
   kafka_topic "kafka_batch.jobs.p1"   # yields while p0 has lag
 end
+
+# Explicit full name (no double-prefix):
+# kafka_topic "myapp.kafka_batch.jobs.p0"
+# Literal override (ignore global prefix):
+# kafka_topic "legacy.queue", apply_prefix: false
 ```
 
 ### Modes
@@ -425,13 +431,15 @@ end
 | **`strict`** | Lower ranks do **not** start new work until all higher topics are empty |
 | **`weighted`** | Lower ranks interleave — default 1-in-4 messages proceed (`priority_weighted_interleave`) |
 
+A higher topic **paused via `/lag`** is treated as inactive for the gate — lower ranks (p1) keep processing.
+
 Lag checks use the Kafka Admin API, rate-limited per `priority_lag_check_interval` (default 2s). Unreachable cluster → **fail open** (process anyway).
 
 ### Boot rules
 
 - Each topic → **one** consumer group (validated at boot)
 - `kafka_batch.jobs` (default flat queue) **cannot** appear in priority YAML
-- `fairness true` on a worker bypasses priority topics
+- `fairness_type` on a worker bypasses priority topics
 
 Run the priority group on dedicated pods:
 
@@ -443,7 +451,7 @@ bundle exec karafka server --include-consumer-groups myapp.kafka-batch-jobs-fast
 
 ## Multi-tenant fairness
 
-Opt in per worker with `fairness true`. Two independent lanes run simultaneously:
+Opt in per worker with `fairness_type :time` or `:throughput`. Two independent lanes run simultaneously:
 
 | Lane | `fairness_type` | Shares |
 |---|---|---|
@@ -466,10 +474,34 @@ Fair jobs re-enter **ready** on retry (skip scheduler). Everything downstream (e
 config.fairness_global_concurrency      = 1000   # in-flight window per lane
 config.fairness_weighted_concurrency    = true   # default; false = equal cap per tenant
 config.fairness_lease_ttl               = 7200   # must exceed longest job
-config.fairness_min_ingest_partitions   = 64     # boot check
+config.fairness_min_ingest_partitions   = 300    # boot check (match ingest topic size)
 ```
 
 Tune live weights at `/kafka_batch/weights` (stored in Redis per fairness lane, regardless of `config.store`).
+
+### Tenant → ingest partition
+
+Fair jobs should land on **one partition per tenant** so the Dispatcher processes each tenant serially on ingest. Three modes:
+
+| Mode | Config | Behavior |
+|---|---|---|
+| Hash (default) | neither set | `tenant_id` keyed via murmur2 — many tenants can collide on one partition |
+| Pinned | `fairness_tenant_partitions` | Static map; always wins |
+| Dynamic | `fairness_dynamic_tenant_partitions = true` | On first enqueue, checkout a free partition from Redis (per lane); cached 30s in-process |
+
+```ruby
+# Option A — pin VIP tenants, dynamic for the rest:
+config.fairness_tenant_partitions = { "acme" => 0 }
+config.fairness_dynamic_tenant_partitions = true
+
+# Option B — fully automatic (no big YAML map):
+config.fairness_dynamic_tenant_partitions = true
+config.fairness_tenant_partition_cache_ttl = 30
+```
+
+On boot the system reads each lane's ingest topic partition count and seeds a Redis free-pool (`kafka_batch:tenant_partitions:time`, etc.). When all partitions are assigned, new tenants log a warning and fall back to hash until you add partitions.
+
+Lookup a tenant's partition on `/kafka_batch/fairness/time` (partition lookup widget).
 
 ### Enqueue
 
@@ -549,7 +581,7 @@ Default partition targets (`KafkaBatch::Topics::DEFAULT_PARTITIONS`):
 |---|---|---|
 | Execution | 768 | jobs, priority, fair ready |
 | Events | 48 | completion events |
-| Fair ingest | 64 | per lane |
+| Fair ingest | 300 | per lane |
 | Scheduled | 48 | delayed payloads |
 | Retry | 12 | per tier |
 
@@ -574,12 +606,26 @@ Mount `KafkaBatch::Web` at `/kafka_batch`:
 | Page | Shows |
 |---|---|
 | `/` | Batch list, status, cancel |
-| `/lag` | Per-group/topic lag, pause/resume |
+| `/lag` | Per-group/topic lag, pause/resume (consumers see changes within `consumption_control_refresh_interval`, default **30s**) |
 | `/live` | Running jobs & consumer heartbeats |
 | `/weights` | Tenant fairness weights |
 | `/failures` | Failure log |
+| `/dead_letter` | Kafka dead-letter topic (paginated, newest first) |
+| `/reconciler` | Last reconciler sweep + recovery counts |
 
-**Reconciler** (inside `EventConsumer`, periodic): recovers stuck `running` batches and re-dispatches lost callbacks. Manual: `rake kafka_batch:reconcile`.
+**Reconciler** (inside `EventConsumer`, periodic): recovers stuck `running` batches and re-dispatches lost callbacks. Summary is persisted in Redis for `/reconciler`. Manual: `rake kafka_batch:reconcile`.
+
+### Pause / resume (`/lag`)
+
+Pause state is written to Redis (or MySQL when `store = :mysql`) **immediately** when you click Pause. Karafka consumers **cache** that state and re-read it at most every `consumption_control_refresh_interval` seconds (default **30**). Until the cache refreshes, jobs may still run and lag can keep falling — wait up to one interval after pausing.
+
+```ruby
+config.consumption_control_refresh_interval = 30  # seconds; lower = faster pause, more Redis reads
+```
+
+The `/lag` page shows a tooltip on Pause/Resume buttons explaining the delay. Pause is keyed on **consumer group + topic** (use the row’s group/topic, not the topic name alone).
+
+**Priority queues:** pausing a higher topic (e.g. p0) via `/lag` stops draining that topic but does **not** block lower ranks (p1 keeps processing). Strict priority only applies while higher topics are actively consuming.
 
 ---
 

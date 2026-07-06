@@ -8,12 +8,15 @@ module KafkaBatch
       # consumer group.  Result is cached for priority_lag_check_interval
       # seconds (monotonic clock, per instance) unless +force+ is true.
       #
+      # Topics paused at topic level via /lag are excluded — a paused p0 must not
+      # block p1 (the operator intentionally stopped draining the higher rank).
+      #
       # @param higher_topics [Array<String>]
       # @param consumer_group [String]
       # @param force [Boolean] bypass cache (used after a strict-mode pause)
       # @return [Boolean]
       def higher_topics_have_lag?(higher_topics, consumer_group, force: false)
-        topics = Array(higher_topics).map(&:to_s).reject(&:empty?)
+        topics = active_higher_topics(higher_topics, consumer_group)
         return false if topics.empty?
 
         now      = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -43,6 +46,16 @@ module KafkaBatch
             )
             false
           end
+      end
+
+      private
+
+      def active_higher_topics(higher_topics, consumer_group)
+        Array(higher_topics).map(&:to_s).reject(&:empty?).reject do |topic|
+          KafkaBatch::ConsumptionControl.topic_level_paused?(
+            group: consumer_group, topic: topic
+          )
+        end
       end
     end
   end

@@ -205,43 +205,14 @@ module KafkaBatch
       Partition.for_key(tenant_id.to_s, count)
     end
 
-    # Returns the explicit ingest partition for a tenant, or nil to fall back
-    # to key-hash partitioning.
+    # Returns the ingest partition for a tenant, or nil to fall back to key-hash.
     #
-    # Resolution order:
-    #   1. config.fairness_tenant_partitions[tenant_id] — explicit map wins
-    #   2. nil → caller uses murmur2_random key-hash (partition: not set)
-    #
-    # The configured value is validated against the actual partition count so a
-    # mis-configured entry (e.g. partition 11 on an 8-partition topic) never
-    # causes a broker error — it silently falls back to murmur2_random instead.
-    #
-    # The fairness_tenant_partitions map is COMMON to both lanes, so it is
-    # validated against the given lane's ingest-topic partition count.
+    # Resolution order (Fairness::TenantPartitions):
+    #   1. config.fairness_tenant_partitions[tenant_id]
+    #   2. Redis checkout when fairness_dynamic_tenant_partitions
+    #   3. nil → murmur2_random key-hash
     def tenant_ingest_partition(tenant_id, type = :time)
-      return nil if tenant_id.nil?
-
-      map = config.fairness_tenant_partitions
-      return nil if map.nil? || map.empty?
-
-      configured = map[tenant_id.to_s]
-      return nil if configured.nil?
-
-      n = configured.to_i
-
-      # Bounds-check: reject if out of range for the actual topic.
-      # On failure to read count we let the configured value through — the broker
-      # will error if it's truly invalid and the caller will see a ProducerError.
-      count = fairness_ingest_partition_count(type)
-      if count && n >= count
-        logger.warn(
-          "[KafkaBatch] fairness_tenant_partitions[#{tenant_id}]=#{n} is out of range " \
-          "(topic has #{count} partitions). Falling back to key-hash."
-        )
-        return nil
-      end
-
-      n
+      Fairness::TenantPartitions.resolve(tenant_id, type)
     end
 
     # Lazily configure Karafka with the minimum settings needed for
@@ -304,6 +275,7 @@ module KafkaBatch
       CancellationCache.reset! if defined?(CancellationCache)
       Liveness.reset!          if defined?(Liveness)
       ConsumptionControl.reset! if defined?(ConsumptionControl)
+      Fairness::TenantPartitions.reset! if defined?(Fairness::TenantPartitions)
     end
 
     private

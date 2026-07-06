@@ -25,6 +25,30 @@ RSpec.describe KafkaBatch::Worker do
       expect(FairWorker.fairness?).to eq(true)
     end
 
+    it "opts in via fairness_type alone (no fairness true needed)" do
+      klass = Class.new do
+        include KafkaBatch::Worker
+        kafka_topic "test.fair_type_only"
+        fairness_type :throughput
+      end
+      expect(klass.fairness?).to eq(true)
+      expect(klass.fairness_type).to eq(:throughput)
+    end
+
+    it "still supports legacy fairness true (defaults to :time lane)" do
+      klass = Class.new do
+        include KafkaBatch::Worker
+        kafka_topic "test.legacy_fair"
+        fairness true
+      end
+      expect(klass.fairness?).to eq(true)
+      expect(klass.fairness_type).to eq(:time)
+    end
+
+    it "returns nil fairness_type for plain workers" do
+      expect(SuccessfulWorker.fairness_type).to be_nil
+    end
+
     it "supports a per-worker retry_tier override" do
       expect(TierPinnedWorker.retry_tier).to eq(:large)
     end
@@ -32,6 +56,33 @@ RSpec.describe KafkaBatch::Worker do
     it "falls back to config.jobs_topic when no topic is set" do
       klass = Class.new { include KafkaBatch::Worker }
       expect(klass.kafka_topic).to eq(KafkaBatch.config.jobs_topic)
+    end
+
+    it "applies config.topic_prefix to declared kafka_topic names" do
+      KafkaBatch.config.topic_prefix = "myapp"
+      klass = Class.new do
+        include KafkaBatch::Worker
+        kafka_topic "kafka_batch.jobs.p0"
+      end
+      expect(klass.kafka_topic).to eq("myapp.kafka_batch.jobs.p0")
+    end
+
+    it "does not double-prefix when the worker already includes the prefix" do
+      KafkaBatch.config.topic_prefix = "myapp"
+      klass = Class.new do
+        include KafkaBatch::Worker
+        kafka_topic "myapp.kafka_batch.jobs.p0"
+      end
+      expect(klass.kafka_topic).to eq("myapp.kafka_batch.jobs.p0")
+    end
+
+    it "supports apply_prefix: false for a literal topic override" do
+      KafkaBatch.config.topic_prefix = "myapp"
+      klass = Class.new do
+        include KafkaBatch::Worker
+        kafka_topic "legacy.queue", apply_prefix: false
+      end
+      expect(klass.kafka_topic).to eq("legacy.queue")
     end
 
     describe "complete_after_retries" do

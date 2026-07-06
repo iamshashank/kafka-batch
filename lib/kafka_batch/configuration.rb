@@ -90,7 +90,7 @@ module KafkaBatch
     # Karafka consumers reload pause state from Redis (or MySQL when store is
     # :mysql and Redis is unavailable) at most this often. The Web UI always
     # reads fresh state.
-    attr_accessor :consumption_control_refresh_interval # Integer – seconds; default 60
+    attr_accessor :consumption_control_refresh_interval # Integer – seconds; default 30
 
     # ── Retry behaviour ──────────────────────────────────────────────────────
     # Tiered retries: each delay tier has its own Kafka topic, so a slow tier
@@ -312,8 +312,19 @@ module KafkaBatch
 
     # Explicit tenant → ingest-partition map. When a tenant_id is present, jobs
     # are produced directly to that partition (bypassing the hash partitioner).
-    # Out-of-range values fall back to key-hash (murmur2_random). Default {}.
+    # Out-of-range values are ignored. Default {}.
+    #
+    # When fairness_dynamic_tenant_partitions is true, unmapped tenants are
+    # assigned exclusively at first use via Redis (see Fairness::TenantPartitions).
     attr_accessor :fairness_tenant_partitions       # Hash{String => Integer}
+
+    # When true, new tenants checkout a dedicated ingest partition from Redis on
+    # first enqueue (per fairness lane). Config map entries always win. Requires
+    # Redis and a warmed partition pool (boot / first checkout).
+    attr_accessor :fairness_dynamic_tenant_partitions  # Boolean – default false
+
+    # In-process TTL for tenant → partition lookups (config + Redis). Default 30s.
+    attr_accessor :fairness_tenant_partition_cache_ttl  # Integer – seconds
 
     # Max ingest messages the Dispatcher drains into the Redis window per consume
     # call (wired as Karafka `max_messages`). Fairness ordering is done by the
@@ -391,7 +402,7 @@ module KafkaBatch
       @uniq_enabled             = true
       @uniq_lock_ttl            = 7 * 24 * 3600  # 7 days — covers max_schedule_horizon + retries
       @uniq_on_duplicate        = :skip
-      @consumption_control_refresh_interval = 60
+      @consumption_control_refresh_interval = 30
       @max_retries              = 3
       @retry_jitter             = 0.1  # +/- 10%
       @retry_tiers              = { short: 30, medium: 7 * 60, large: 20 * 60 }
@@ -425,6 +436,8 @@ module KafkaBatch
       @fairness_weight_cache_ttl        = 60
       @fairness_forwarder_idle_sleep    = 0.05
       @fairness_tenant_partitions       = {}
+      @fairness_dynamic_tenant_partitions = false
+      @fairness_tenant_partition_cache_ttl = 30
       @fairness_dispatcher_batch_size   = 50
       @fairness_dispatcher_concurrency  = 5
       @fairness_min_ingest_partitions   = 2

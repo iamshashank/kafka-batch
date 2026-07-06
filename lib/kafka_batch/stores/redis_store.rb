@@ -760,6 +760,13 @@ module KafkaBatch
         KafkaBatch.logger.error("[KafkaBatch][RedisStore] Reconciler lock error: #{e.message}")
       end
 
+      # Raw Redis for dashboard metadata keys (reconciler / DLT stats).
+      def with_redis(&block)
+        @pool.with(&block)
+      rescue Redis::BaseError => e
+        raise StoreError, "Redis error: #{e.message}"
+      end
+
       private
 
       def batch_key(id)
@@ -838,12 +845,6 @@ module KafkaBatch
 
       def sort_paginate(entries, limit, offset)
         entries.sort_by { |e| e[:failed_at].to_s }.reverse.drop(offset).first(limit)
-      end
-
-      def with_redis(&block)
-        @pool.with(&block)
-      rescue Redis::BaseError => e
-        raise StoreError, "Redis error: #{e.message}"
       end
 
       def hash_to_batch(h)

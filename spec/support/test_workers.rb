@@ -39,7 +39,7 @@ end
 class FairWorker
   include KafkaBatch::Worker
   kafka_topic "test.fair"
-  fairness true
+  fairness_type :time
 
   def perform(payload)
     KafkaBatchSpec::WorkerRuns.record(:fair, payload)
@@ -50,7 +50,6 @@ end
 class ThroughputFairWorker
   include KafkaBatch::Worker
   kafka_topic "test.fair_throughput"
-  fairness true
   fairness_type :throughput
 
   def perform(payload)

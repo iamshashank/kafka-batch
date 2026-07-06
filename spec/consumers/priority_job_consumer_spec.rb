@@ -66,12 +66,12 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
       inst.consume
     end
 
-    it "rank 1 pauses and skips processing when higher topics have lag" do
+    it "rank 1 pauses at the batch offset and skips processing when higher topics have lag" do
       inst = build_consumer(klass)
-      msg  = instance_double("Karafka::Messages::Message")
+      msg  = instance_double("Karafka::Messages::Message", offset: 42)
       allow(inst).to receive(:messages).and_return([msg])
       allow(inst).to receive(:higher_topics_have_lag?).and_return(true)
-      expect(inst).to receive(:pause).with(2_000)
+      expect(inst).to receive(:pause).with(42, 2_000)
       expect(inst).not_to receive(:process_message)
       inst.consume
     end
@@ -81,6 +81,16 @@ RSpec.describe KafkaBatch::Consumers::PriorityJobConsumer do
       msg  = instance_double("Karafka::Messages::Message")
       allow(inst).to receive(:messages).and_return([msg])
       allow(inst).to receive(:higher_topics_have_lag?).and_return(false)
+      expect(inst).not_to receive(:pause)
+      expect(inst).to receive(:process_message).with(msg)
+      inst.consume
+    end
+    it "rank 1 processes when a higher topic is topic-paused via /lag" do
+      inst = build_consumer(klass)
+      msg  = instance_double("Karafka::Messages::Message")
+      allow(inst).to receive(:messages).and_return([msg])
+      allow(KafkaBatch::ConsumptionControl).to receive(:topic_level_paused?)
+        .with(group: spec[:consumer_group], topic: "kafka_batch.jobs.p0").and_return(true)
       expect(inst).not_to receive(:pause)
       expect(inst).to receive(:process_message).with(msg)
       inst.consume

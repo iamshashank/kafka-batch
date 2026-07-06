@@ -31,13 +31,34 @@ module KafkaBatch
       # it falls back to the shared default queue (config.jobs_topic) — multiple
       # such workers share that topic, and JobConsumer dispatches each message to
       # the right worker via its embedded worker_class.
-      def kafka_topic(name = nil)
-        if name
-          @kafka_topic = name.to_s
+      #
+      # Declared names are passed through config.resolve_topic (same as priority
+      # YAML), so config.topic_prefix is applied automatically. Write the base
+      # name in the worker; or pass the fully-qualified name if you've already
+      # included the prefix. Set apply_prefix: false to pin a literal topic name.
+      #
+      #   kafka_topic "kafka_batch.jobs.p0"              # → myapp.kafka_batch.jobs.p0
+      #   kafka_topic "myapp.kafka_batch.jobs.p0"      # unchanged when prefix is myapp
+      #   kafka_topic "legacy.queue", apply_prefix: false
+      def kafka_topic(name = nil, apply_prefix: true)
+        if !name.nil?
+          @kafka_topic_base = name.to_s
+          @kafka_topic_apply_prefix = apply_prefix ? true : false
         else
-          @kafka_topic || KafkaBatch.config.jobs_topic
+          resolved_kafka_topic
         end
       end
+
+      def resolved_kafka_topic
+        if @kafka_topic_base
+          return @kafka_topic_base unless @kafka_topic_apply_prefix
+
+          KafkaBatch.config.resolve_topic(@kafka_topic_base)
+        else
+          KafkaBatch.config.jobs_topic
+        end
+      end
+      private :resolved_kafka_topic
 
       # Maximum retry attempts before a job is sent to the DLT.
       # Defaults to KafkaBatch.config.max_retries.
@@ -66,42 +87,47 @@ module KafkaBatch
       # no global switch — so fair and plain workers run side by side in the same
       # process. Tenant isolation comes from the `tenant_id` set on the batch/push.
       #
-      #   fairness true    # this worker shares the fair lane across tenants
+      # Prefer setting a lane directly:
+      #   fairness_type :time        # or :throughput
+      #
+      # `fairness true` alone still opts into the :time lane (legacy shorthand).
       #
       # @return [Boolean]
       def fairness(enabled = :__unset__)
         if enabled == :__unset__
-          @fairness.nil? ? false : @fairness
+          fairness?
         else
           @fairness = enabled ? true : false
+          @fairness_type = nil unless enabled
         end
       end
 
       # Predicate form of #fairness.
       def fairness?
-        fairness
+        @fairness == true || !@fairness_type.nil?
       end
 
-      # Which fairness LANE this worker's jobs flow through when `fairness true`:
-      #   :time       – weighted wall-clock-time fairness (default). Best for
+      # Which fairness LANE this worker's jobs flow through. Setting this opts the
+      # worker into the fair lane — no separate `fairness true` needed.
+      #   :time       – weighted wall-clock-time fairness (default lane). Best for
       #                 uneven runtimes (e.g. 20-60s jobs).
       #   :throughput – weighted job-count fairness. Best when runtimes are similar.
       # Both lanes run simultaneously, so a single batch may contain jobs of both
-      # types. Ignored unless the worker also sets `fairness true`.
+      # types.
       #
-      #   fairness true
       #   fairness_type :throughput
       #
-      # @return [Symbol] :time (default) | :throughput
+      # @return [Symbol, nil] :time | :throughput when fair; nil when plain
       def fairness_type(type = :__unset__)
         if type == :__unset__
-          @fairness_type || :time
+          @fairness_type || (@fairness ? :time : nil)
         else
           t = type&.to_sym
           unless KafkaBatch::Configuration::FAIRNESS_TYPES.include?(t)
             raise ArgumentError, "fairness_type must be :time or :throughput (got #{type.inspect})"
           end
           @fairness_type = t
+          @fairness = true
         end
       end
 

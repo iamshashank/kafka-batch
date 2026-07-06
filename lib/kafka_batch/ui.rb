@@ -56,7 +56,11 @@ require_relative "lag"
 require_relative "partition"
 require_relative "consumption_control"
 require_relative "cancellation_cache"
+require_relative "reconciler/run_summary"
+require_relative "dlt/stats"
+require_relative "dlt/reader"
 require_relative "fairness/scheduler"
+require_relative "fairness/tenant_partitions"
 require_relative "web"
 
 require_relative "railtie" if defined?(Rails::Railtie)

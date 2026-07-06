@@ -78,7 +78,6 @@ KafkaBatch.configure do |config|
   #
   #   class MyWorker
   #     include KafkaBatch::Worker
-  #     fairness true
   #     fairness_type :time        # weighted wall-clock time (default; uneven runtimes)
   #     # fairness_type :throughput  # weighted job count (similar runtimes)
   #   end
@@ -96,7 +95,7 @@ KafkaBatch.configure do |config|
   # longest job runtime (a longer job's slot is reclaimed early — soft overshoot).
   config.fairness_lease_ttl = 7200   # 2 hours — raise for longer jobs
   # Boot check: warn/raise if fair ingest has fewer partitions than this.
-  # config.fairness_min_ingest_partitions = 64
+  # config.fairness_min_ingest_partitions = 300
 
   # Per-tenant weights control throughput share (edit live on /kafka_batch/weights).
   # Default is true — a weight-N tenant gets ~N× the in-flight concurrency of a
@@ -104,9 +103,13 @@ KafkaBatch.configure do |config|
   # config.fairness_weighted_concurrency = false
   # config.fairness_weight_cache_ttl = 60   # secs before a weight change propagates across pods
 
-  # Pin specific tenants to ingest partitions (common to both lanes; others use
-  # hash routing):
+  # Pin specific tenants to ingest partitions (common to both lanes):
   # config.fairness_tenant_partitions = { "acme" => 0, "globex" => 1 }
+  #
+  # Or let the system assign partitions automatically on first enqueue (Redis-backed,
+  # one dedicated partition per tenant until the ingest topic is full):
+  # config.fairness_dynamic_tenant_partitions = true
+  # config.fairness_tenant_partition_cache_ttl = 30  # in-process lookup cache (seconds)
 
   # ── Priority queues (Sidekiq.yml-style, optional) ─────────────────────────────
   # One YAML file per consumer group; topics listed highest-priority first.
@@ -120,6 +123,11 @@ KafkaBatch.configure do |config|
   # config.priority_lag_check_interval  = 2   # seconds between lag re-checks
   # config.priority_weighted_interleave = 4   # weighted mode: 1-in-N lower-rank jobs
 
+  # ── /lag pause/resume ─────────────────────────────────────────────────────────
+  # How often Karafka consumers re-read pause state from Redis/MySQL (default 30s).
+  # Lower = pause/resume takes effect faster; higher = fewer Redis reads.
+  # config.consumption_control_refresh_interval = 30
+
   # ── Producer safety ───────────────────────────────────────────────────────────
   # Raise a clear ProducerError instead of an opaque rdkafka error on oversized
   # payloads. 0/nil disables. Matches Kafka's typical 1 MiB broker default.
@@ -128,7 +136,7 @@ KafkaBatch.configure do |config|
   # ── Kafka topic sizing ────────────────────────────────────────────────────────
   # Partition counts are fixed at topic creation. bin/create_kafka_topics.sh (and
   # rake kafka_batch:create_topics) default to ~150 pods × concurrency 10:
-  #   jobs / priority / fair ready → 768   events → 48   fair ingest → 64
+  #   jobs / priority / fair ready → 768   events → 48   fair ingest → 300
   # Override before first deploy, e.g. PARTITIONS=1500 ./bin/create_kafka_topics.sh
   # (forces one count for every topic — prefer per-topic tuning in the shell script).
 

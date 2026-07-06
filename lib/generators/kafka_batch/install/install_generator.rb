@@ -111,7 +111,7 @@ module KafkaBatch
 
         say "\n5. Review config/initializers/kafka_batch.rb and tune:\n"
         say "   - retry_tiers / max_retries\n"
-        say "   - per-worker fairness: `fairness true` + `fairness_type :time | :throughput`\n"
+        say "   - per-worker fairness: `fairness_type :time | :throughput`\n"
         say "   - schedule_store (:redis / :mysql) + max_schedule_horizon (perform_in/at)\n"
         say "   - max_message_bytes  (1 MiB default; match your broker limit)\n"
         say "   - reconciliation_interval / max_reconcile_per_run\n"

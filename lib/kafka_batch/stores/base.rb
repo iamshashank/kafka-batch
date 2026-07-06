@@ -197,6 +197,11 @@ module KafkaBatch
       def with_reconciler_lock(ttl: 300)
         raise NotImplementedError, "#{self.class}#with_reconciler_lock"
       end
+
+      # Raw Redis access for UI metadata (reconciler summary, DLT stats cache).
+      def with_redis(&block)
+        raise NotImplementedError, "#{self.class}#with_redis"
+      end
     end
   end
 end
