@@ -111,6 +111,18 @@ KafkaBatch.configure do |config|
   # hash routing):
   # config.fairness_tenant_partitions = { "acme" => 0, "globex" => 1 }
 
+  # ── Priority queues (Sidekiq.yml-style, optional) ─────────────────────────────
+  # One YAML file per consumer group; topics listed highest-priority first.
+  # Workers opt in with kafka_topic; each topic may belong to exactly one group.
+  # Also set via ENV KAFKA_BATCH_PRIORITY_CONFIG (one path) or
+  # KAFKA_BATCH_PRIORITY_CONFIGS (comma-separated). Example files ship in
+  # config/kafka_batch/priority/.
+  # config.priority_config_paths = [
+  #   Rails.root.join("config/kafka_batch/priority/jobs-fast.yml").to_s
+  # ]
+  # config.priority_lag_check_interval  = 2   # seconds between lag re-checks
+  # config.priority_weighted_interleave = 4   # weighted mode: 1-in-N lower-rank jobs
+
   # ── Producer safety ───────────────────────────────────────────────────────────
   # Raise a clear ProducerError instead of an opaque rdkafka error on oversized
   # payloads. 0/nil disables. Matches Kafka's typical 1 MiB broker default.

@@ -86,13 +86,17 @@ RSpec.describe KafkaBatch::Lag do
 
       it "folds registry worker topics into -jobs, excluding fair and priority workers" do
         KafkaBatch.config.extra_job_topics = []
+        KafkaBatch.config.priority_config_paths = [
+          File.expand_path("fixtures/priority/fast.yml", __dir__)
+        ]
         plain    = double("plain",    fairness?: false, kafka_topic: "orders.process")
         fair     = double("fair",     fairness?: true,  kafka_topic: "should.be.ignored")
-        priority = double("priority", fairness?: false, kafka_topic: KafkaBatch.config.fast_p0_topic)
+        priority = double("priority", fairness?: false, kafka_topic: "kafka_batch.jobs.p0")
         allow(KafkaBatch).to receive(:workers).and_return([plain, fair, priority])
 
         result = described_class.gem_groups_with_topics
         expect(result["kb-jobs"]).to eq(%w[kafka_batch.jobs orders.process])
+        expect(result["kb-jobs-fast"]).to eq(%w[kafka_batch.jobs.p0 kafka_batch.jobs.p1])
       end
     end
   end

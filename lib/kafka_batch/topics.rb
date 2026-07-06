@@ -79,13 +79,11 @@ module KafkaBatch
       plain_topics = [cfg.jobs_topic].compact if plain_topics.empty? && fair_workers.empty?
       plain_topics.each { |t| add.call(t, :jobs) }
 
-      # Priority queue topics: always provisioned so they're available when
-      # workers adopt them. uniq at the end deduplicates against any plain
-      # worker that already declared the same kafka_topic.
-      add.call(cfg.fast_p0_topic, :priority)
-      add.call(cfg.fast_p1_topic, :priority)
-      add.call(cfg.slow_p0_topic, :priority)
-      add.call(cfg.slow_p1_topic, :priority)
+      # Priority topics from Sidekiq.yml-style config files.
+      registry = KafkaBatch::Priority::Registry.load(
+        cfg.resolved_priority_config_paths, cfg: cfg
+      )
+      registry.all_topics.each { |t| add.call(t, :priority) }
 
       add.call(cfg.events_topic, :events)
       add.call(cfg.callbacks_topic, :callbacks)

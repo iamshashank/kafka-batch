@@ -66,11 +66,9 @@ TOPICS=(
   "${PREFIX}kafka_batch.jobs.retry.medium:12"
   "${PREFIX}kafka_batch.jobs.retry.large:12"
 
-  # ── Priority queue topics (fast/slow × p0/p1) ─────────────────────────────
-  "${PREFIX}kafka_batch.jobs.fast_p0:768"
-  "${PREFIX}kafka_batch.jobs.fast_p1:768"
-  "${PREFIX}kafka_batch.jobs.slow_p0:768"
-  "${PREFIX}kafka_batch.jobs.slow_p1:768"
+  # ── Priority queue topics ─────────────────────────────────────────────────
+  # Declared in config/kafka_batch/priority/*.yml (see priority_config_paths).
+  # Prefer: bundle exec rake kafka_batch:create_topics (reads those YAML files).
 
   # ── Delayed jobs (perform_in / perform_at) durable payload store ───────────
   "${PREFIX}kafka_batch.scheduled:48"

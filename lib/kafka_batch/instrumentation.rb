@@ -221,17 +221,21 @@ module KafkaBatch
       # priority queue contention and tune lag_check_interval or worker counts.
       #
       # Payload keys:
-      #   consumer_class  – e.g. "KafkaBatch::Consumers::FastP1Consumer"
+      #   consumer_class  – e.g. "KafkaBatch::Consumers::PriorityJobConsumer"
       #   p0_topic        – topic name the lag was detected on
       #   consumer_group  – the consumer group owning that topic
       #   pause_ms        – how long the partition will be paused
-      def consumer_priority_yielded(consumer_class:, p0_topic:, consumer_group:, pause_ms:)
+      def consumer_priority_yielded(consumer_class:, p0_topic:, consumer_group:, pause_ms:,
+                                    mode: nil, rank: nil, higher_topics: nil)
         instrument("consumer.priority_yielded", {
           consumer_class: consumer_class.to_s,
           p0_topic:       p0_topic,
           consumer_group: consumer_group,
-          pause_ms:       pause_ms
-        })
+          pause_ms:       pause_ms,
+          mode:           mode,
+          rank:           rank,
+          higher_topics:  higher_topics
+        }.compact)
       end
 
       # ── Reconciler events ──────────────────────────────────────────────

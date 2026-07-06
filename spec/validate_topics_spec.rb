@@ -35,11 +35,7 @@ RSpec.describe "KafkaBatch.validate_topics!" do
                 KafkaBatch.config.callbacks_topic,
                 KafkaBatch.config.dead_letter_topic,
                 KafkaBatch.config.scheduled_topic,
-                *KafkaBatch.config.retry_topics,
-                KafkaBatch.config.fast_p0_topic,
-                KafkaBatch.config.fast_p1_topic,
-                KafkaBatch.config.slow_p0_topic,
-                KafkaBatch.config.slow_p1_topic]
+                *KafkaBatch.config.retry_topics]
     stub_cluster_topics(existing)
 
     expect { KafkaBatch.validate_topics! }.not_to raise_error

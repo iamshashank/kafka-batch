@@ -1,0 +1,5 @@
+consumer_group_suffix: jobs-slow
+mode: strict
+topics:
+  - kafka_batch.jobs.slow_p0
+  - kafka_batch.jobs.slow_p1

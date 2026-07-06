@@ -50,6 +50,11 @@ module KafkaBatch
         in_root { chmod "bin/create_kafka_topics.sh", 0o755 rescue nil }
       end
 
+      def copy_priority_examples
+        copy_file "priority/jobs-fast.yml", "config/kafka_batch/priority/jobs-fast.yml"
+        copy_file "priority/jobs-slow.yml", "config/kafka_batch/priority/jobs-slow.yml"
+      end
+
       def copy_migrations
         # Copy only what each chosen store needs:
         #   --store mysql          → failures / pauses / tenant-weights tables

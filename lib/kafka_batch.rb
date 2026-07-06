@@ -26,10 +26,9 @@ require_relative "kafka_batch/schedule_poller"
 require_relative "kafka_batch/reconciler"
 require_relative "kafka_batch/consumers/job_consumer"
 require_relative "kafka_batch/consumers/priority_gate"
-require_relative "kafka_batch/consumers/fast_p0_consumer"
-require_relative "kafka_batch/consumers/fast_p1_consumer"
-require_relative "kafka_batch/consumers/slow_p0_consumer"
-require_relative "kafka_batch/consumers/slow_p1_consumer"
+require_relative "kafka_batch/priority/config"
+require_relative "kafka_batch/priority/registry"
+require_relative "kafka_batch/consumers/priority_job_consumer"
 require_relative "kafka_batch/consumers/retry_consumer"
 require_relative "kafka_batch/consumers/event_consumer"
 require_relative "kafka_batch/consumers/callback_consumer"
@@ -72,6 +71,11 @@ module KafkaBatch
       workers.select(&:fairness?).map(&:fairness_type).uniq
     end
 
+    # Loaded priority group definitions from YAML (empty when no paths configured).
+    def priority_registry
+      @priority_registry ||= Priority::Registry.load(config.resolved_priority_config_paths)
+    end
+
     # ── Consumer groups ────────────────────────────────────────────────────
     # Returns the groups that exist given the current worker registry.
     # Used by draw_routes and (legacy) lag page fallback.
@@ -82,14 +86,12 @@ module KafkaBatch
         groups << dispatch_consumer_group(ft) << jobs_fair_consumer_group(ft)
       end
 
+      registry = priority_registry
+      groups.concat(registry.consumer_groups)
+
+      reserved = registry.reserved_topics
       plain    = workers.reject(&:fairness?)
-      fast_set = [config.fast_p0_topic, config.fast_p1_topic]
-      slow_set = [config.slow_p0_topic, config.slow_p1_topic]
-
-      groups << fast_consumer_group if plain.any? { |w| fast_set.include?(w.kafka_topic) }
-      groups << slow_consumer_group if plain.any? { |w| slow_set.include?(w.kafka_topic) }
-
-      other = plain.reject { |w| (fast_set + slow_set).include?(w.kafka_topic) }
+      other    = plain.reject { |w| reserved.include?(w.kafka_topic) }
       groups << jobs_consumer_group unless other.empty?
 
       groups
@@ -99,27 +101,15 @@ module KafkaBatch
 
     def draw_routes(builder)
       cfg          = config
+      registry     = priority_registry
       all_workers  = KafkaBatch.workers
       fair_workers = all_workers.select(&:fairness?)
       plain_topics = all_workers.reject(&:fairness?).map(&:kafka_topic).uniq
-      any_fair     = fair_workers.any?
-      # Fairness lanes actually in use (a lane's topics/consumers are only wired
-      # when at least one worker opts into it). Captured as a local so it is
-      # visible inside the builder.instance_eval closure below.
       active_fair_types = active_fairness_types
 
-      fast_set = [cfg.fast_p0_topic, cfg.fast_p1_topic]
-      slow_set = [cfg.slow_p0_topic, cfg.slow_p1_topic]
-      all_prio = fast_set + slow_set
-
-      fast_p0_used = plain_topics.include?(cfg.fast_p0_topic)
-      fast_p1_used = plain_topics.include?(cfg.fast_p1_topic)
-      slow_p0_used = plain_topics.include?(cfg.slow_p0_topic)
-      slow_p1_used = plain_topics.include?(cfg.slow_p1_topic)
-      any_fast     = fast_p0_used || fast_p1_used
-      any_slow     = slow_p0_used || slow_p1_used
-
-      other_plain_topics = plain_topics.reject { |t| all_prio.include?(t) }
+      reserved           = registry.reserved_topics
+      other_plain_topics = plain_topics.reject { |t| reserved.include?(t) }
+      registry.validate_plain_topics!(other_plain_topics) unless registry.empty?
 
       builder.instance_eval do
         consumer_group "#{cfg.consumer_group}-control" do
@@ -130,21 +120,10 @@ module KafkaBatch
           end
         end
 
-        # Each fairness lane gets its OWN dispatch + jobs-fair consumer groups
-        # (…-dispatch-<lane> / …-jobs-fair-<lane>), so a lane can be isolated in its
-        # own process — dedicated thread pool, dispatcher, and forwarder — via
-        # `karafka server --include-consumer-groups <cg>-jobs-fair-time` etc. The
-        # Dispatcher still derives its lane from the ingest topic name at runtime.
         active_fair_types.each do |ft|
           consumer_group "#{cfg.consumer_group}-dispatch-#{ft}" do
-            # Karafka OSS concurrency is global (Karafka::App.config.concurrency).
-            # On a dispatch process, set it >= config.fairness_dispatcher_concurrency
-            # so multiple ingest partitions can forward in parallel.
             topic(cfg.fairness_ingest_topic(ft)) do
               consumer KafkaBatch::Fairness::Dispatcher
-              # Bound how many ingest messages the Dispatcher drains into the
-              # Redis WFQ window per consume call. Fairness ordering is done by
-              # the Scheduler/Forwarder, not by this batch size.
               max_messages cfg.fairness_dispatcher_batch_size
             end
           end
@@ -153,17 +132,19 @@ module KafkaBatch
           end
         end
 
-        if any_fast
-          consumer_group "#{cfg.consumer_group}-jobs-fast" do
-            topic(cfg.fast_p0_topic) { consumer KafkaBatch::Consumers::FastP0Consumer } if fast_p0_used
-            topic(cfg.fast_p1_topic) { consumer KafkaBatch::Consumers::FastP1Consumer } if fast_p1_used
-          end
-        end
-
-        if any_slow
-          consumer_group "#{cfg.consumer_group}-jobs-slow" do
-            topic(cfg.slow_p0_topic) { consumer KafkaBatch::Consumers::SlowP0Consumer } if slow_p0_used
-            topic(cfg.slow_p1_topic) { consumer KafkaBatch::Consumers::SlowP1Consumer } if slow_p1_used
+        registry.configs.each do |prio_cfg|
+          consumer_group prio_cfg.consumer_group do
+            prio_cfg.topics.each_with_index do |topic_name, rank|
+              consumer_klass = KafkaBatch::Consumers::PriorityJobConsumer.build(
+                rank:                rank,
+                mode:                prio_cfg.mode,
+                higher_topics:       prio_cfg.higher_topics_for(topic_name),
+                consumer_group:      prio_cfg.consumer_group,
+                topic:               topic_name,
+                weighted_interleave: prio_cfg.weighted_interleave
+              )
+              topic(topic_name) { consumer consumer_klass }
+            end
           end
         end
 
@@ -254,6 +235,7 @@ module KafkaBatch
 
     def reset!
       @configuration   = nil
+      @priority_registry = nil
       @store           = nil
       @schedulers      = nil   # per-lane, shared with core.rb via fairness_scheduler alias
       @ingest_partition_count_cache = nil

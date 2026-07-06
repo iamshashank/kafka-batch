@@ -243,15 +243,25 @@ module KafkaBatch
       end
 
       def priority_section(config)
+        paths = config.resolved_priority_config_paths
+        rows  = [
+          row("Config paths", paths.empty? ? "(none)" : paths.join(", ")),
+          row("Lag check interval", fmt_duration(config.priority_lag_check_interval)),
+          row("Weighted interleave", config.priority_weighted_interleave.to_s)
+        ]
+        if paths.any?
+          begin
+            registry = KafkaBatch::Priority::Registry.load(paths, cfg: config)
+            registry.configs.each do |c|
+              rows << row(c.consumer_group, "#{c.mode} — #{c.topics.join(' → ')}")
+            end
+          rescue StandardError => e
+            rows << row("Load error", e.message)
+          end
+        end
         Section.new(
           id: "priority", title: "Priority queues", icon: "⇅", accent: "#db2777",
-          rows: [
-            row("Fast P0 topic", config.fast_p0_topic),
-            row("Fast P1 topic", config.fast_p1_topic),
-            row("Slow P0 topic", config.slow_p0_topic),
-            row("Slow P1 topic", config.slow_p1_topic),
-            row("Lag check interval", fmt_duration(config.priority_lag_check_interval))
-          ]
+          rows: rows
         )
       end
 

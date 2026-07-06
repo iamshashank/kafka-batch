@@ -37,11 +37,7 @@ module KafkaBatch
       fair_time_ingest_topic:       "kafka_batch.fair_time_ingest",       # time-fairness intake
       fair_time_ready_topic:        "kafka_batch.fair_time_ready",        # time-fairness execution queue
       fair_throughput_ingest_topic: "kafka_batch.fair_throughput_ingest", # throughput-fairness intake
-      fair_throughput_ready_topic:  "kafka_batch.fair_throughput_ready",  # throughput-fairness execution queue
-      fast_p0_topic:         "kafka_batch.jobs.fast_p0",
-      fast_p1_topic:         "kafka_batch.jobs.fast_p1",
-      slow_p0_topic:         "kafka_batch.jobs.slow_p0",
-      slow_p1_topic:         "kafka_batch.jobs.slow_p1"
+      fair_throughput_ready_topic:  "kafka_batch.fair_throughput_ready"  # throughput-fairness execution queue
     }.freeze
 
     PREFIXED_SETTINGS.each do |name, base|
@@ -343,13 +339,18 @@ module KafkaBatch
     # (or raises under validate_topics_on_boot) if the ingest topic has fewer.
     attr_accessor :fairness_min_ingest_partitions   # Integer – default 2
 
-    # ── Priority queues (non-fair, 4-topic 2-group design) ───────────────────
-    # Workers opt in by setting kafka_topic to one of the fast_*/slow_* topic
-    # names (above, prefix-aware). fairness true always takes precedence.
-    #   fast-group – p1 yields briefly when p0 has lag (weighted priority)
-    #   slow-group – p1 pauses entirely while p0 has lag (strict priority)
-    # How often (seconds) p1 consumers re-check p0 lag.
-    attr_accessor :priority_lag_check_interval  # Integer – default 2
+    # ── Priority queues (Sidekiq.yml-style, per-process YAML) ────────────────
+    # Paths to priority group YAML files (see lib/kafka_batch/priority/config.rb).
+    # Also read from ENV KAFKA_BATCH_PRIORITY_CONFIG (one path) and
+    # KAFKA_BATCH_PRIORITY_CONFIGS (comma-separated). Workers opt in by setting
+    # kafka_topic to a topic listed in a group's topics array. fairness true
+    # always takes precedence. Each topic may belong to at most one consumer
+    # group (validated at boot).
+    attr_accessor :priority_config_paths          # Array<String> – default []
+    # How often (seconds) lower-ranked consumers re-check higher-topic lag.
+    attr_accessor :priority_lag_check_interval    # Integer – default 2
+    # Weighted mode: lower ranks proceed 1-in-N while higher topics have lag.
+    attr_accessor :priority_weighted_interleave   # Integer – default 4
 
     # ── Reconciliation ───────────────────────────────────────────────────────
     # A periodic sweep (inside the EventConsumer) that re-checks stuck "running"
@@ -429,6 +430,8 @@ module KafkaBatch
       @fairness_min_ingest_partitions   = 2
       @fairness_lease_ttl               = 1800  # 30 min; must exceed max job runtime
       @priority_lag_check_interval = 2
+      @priority_config_paths         = []
+      @priority_weighted_interleave  = 4
       @reconciliation_interval  = 300
       @reconciler_lock_ttl      = 600
       @max_reconcile_per_run    = 100
@@ -510,6 +513,32 @@ module KafkaBatch
           "fairness_max_inflight_per_tenant > 0. Otherwise a single tenant can " \
           "monopolise the in-flight window (vtime only advances at completion)."
       end
+    end
+
+    # Apply topic_prefix to a topic name from a priority YAML file.
+    # @param name [String]
+    # @return [String]
+    def resolve_topic(name)
+      name = name.to_s.strip
+      return name if name.empty?
+
+      p = @topic_prefix.to_s.strip
+      return name if p.empty? || name.start_with?("#{p}.")
+
+      "#{p}.#{name}"
+    end
+
+    # All priority YAML paths from config + ENV.
+    # @return [Array<String>]
+    def resolved_priority_config_paths
+      paths = Array(@priority_config_paths).map(&:to_s).map(&:strip).reject(&:empty?)
+      single = ENV["KAFKA_BATCH_PRIORITY_CONFIG"].to_s.strip
+      paths << single unless single.empty?
+      multi = ENV["KAFKA_BATCH_PRIORITY_CONFIGS"].to_s.strip
+      unless multi.empty?
+        paths.concat(multi.split(",").map(&:strip).reject(&:empty?))
+      end
+      paths.map { |p| File.expand_path(p) }.uniq
     end
 
     private

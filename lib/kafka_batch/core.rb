@@ -79,14 +79,6 @@ module KafkaBatch
       "#{config.consumer_group}-jobs"
     end
 
-    def fast_consumer_group
-      "#{config.consumer_group}-jobs-fast"
-    end
-
-    def slow_consumer_group
-      "#{config.consumer_group}-jobs-slow"
-    end
-
     # ── Node identity ──────────────────────────────────────────────────────
 
     # Identifier for THIS process/pod. Prefers the K8s pod name (ENV["HOSTNAME"])

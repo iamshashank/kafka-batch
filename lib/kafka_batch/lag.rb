@@ -157,9 +157,13 @@ module KafkaBatch
       groups["#{prefix}-control"] =
         [cfg.events_topic, cfg.callbacks_topic].compact + Array(cfg.retry_topics)
 
-      # Priority queues — always provisioned (topics.rb adds them unconditionally).
-      groups["#{prefix}-jobs-fast"] = [cfg.fast_p0_topic, cfg.fast_p1_topic].compact
-      groups["#{prefix}-jobs-slow"] = [cfg.slow_p0_topic, cfg.slow_p1_topic].compact
+      # Priority groups — from YAML config when paths are set.
+      registry = KafkaBatch::Priority::Registry.load(
+        cfg.resolved_priority_config_paths, cfg: cfg
+      )
+      registry.configs.each do |prio|
+        groups[prio.consumer_group] = prio.topics
+      end
 
       # Fair lanes — each lane has its OWN dispatch / jobs-fair groups.
       KafkaBatch::Configuration::FAIRNESS_TYPES.each do |t|
@@ -174,10 +178,9 @@ module KafkaBatch
       # (a) the worker registry when the full backend happens to be loaded, and
       # (b) config.extra_job_topics (the reliable path for a pure UI-only service
       # that never loads worker classes).
-      priority = [cfg.fast_p0_topic, cfg.fast_p1_topic,
-                  cfg.slow_p0_topic, cfg.slow_p1_topic].compact
+      reserved = registry.reserved_topics
       groups["#{prefix}-jobs"] =
-        ([cfg.jobs_topic] + registry_job_topics(priority) + Array(cfg.extra_job_topics))
+        ([cfg.jobs_topic] + registry_job_topics(reserved) + Array(cfg.extra_job_topics))
         .compact.uniq
 
       groups.reject { |_, topics| topics.empty? }
@@ -186,7 +189,7 @@ module KafkaBatch
     # Custom plain-worker topics recovered from the in-process worker registry,
     # if the full backend is loaded (UI-only processes require "kafka_batch/ui"
     # and have no registry — respond_to? guards that). Fair workers own no topic;
-    # priority topics belong to the fast/slow groups, so both are excluded.
+    # priority topics belong to priority YAML groups, so both are excluded.
     # @api private
     def registry_job_topics(priority)
       return [] unless KafkaBatch.respond_to?(:workers)

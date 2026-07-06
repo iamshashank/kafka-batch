@@ -1,0 +1,5 @@
+consumer_group_suffix: jobs-fast
+mode: weighted
+topics:
+  - kafka_batch.jobs.p0
+  - kafka_batch.jobs.p1

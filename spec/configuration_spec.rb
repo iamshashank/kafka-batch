@@ -108,7 +108,7 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.consumer_group).to eq("myapp.kafka-batch")
       expect(config.fairness_ingest_topic(:time)).to eq("myapp.kafka_batch.fair_time_ingest")
       expect(config.fairness_ready_topic(:throughput)).to eq("myapp.kafka_batch.fair_throughput_ready")
-      expect(config.fast_p0_topic).to eq("myapp.kafka_batch.jobs.fast_p0")
+      expect(config.resolve_topic("kafka_batch.jobs.p0")).to eq("myapp.kafka_batch.jobs.p0")
     end
 
     it "lets an explicit topic name override the prefix" do
