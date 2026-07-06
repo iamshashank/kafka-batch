@@ -128,6 +128,12 @@ module KafkaBatch
         job = sched.checkout
         return false unless job
 
+        data = Oj.load(job[:payload])
+        if KafkaBatch::JobExpiry.expired?(data)
+          drop_expired_forwarded!(sched, job, data)
+          return true
+        end
+
         payload = mark_slot(job[:payload], job[:tenant_id], job[:slot_id])
         KafkaBatch::Producer.produce_sync(
           topic:   KafkaBatch.config.fairness_ready_topic(@type),
@@ -177,6 +183,20 @@ module KafkaBatch
         Oj.load(raw)["job_id"]
       rescue StandardError
         nil
+      end
+
+      # Checkout already claimed an in-flight lease — release it and drop the job.
+      def drop_expired_forwarded!(sched, job, data)
+        sched.complete(job[:tenant_id], slot_id: job[:slot_id], duration: 0)
+        topic, partition, offset = KafkaBatch::JobExpiry.source_coords(data)
+        KafkaBatch::JobExpiry.drop!(
+          data: data, topic: topic, partition: partition, offset: offset,
+          log_tag: "Fairness::Forwarder"
+        )
+      rescue StandardError => e
+        KafkaBatch.logger.error(
+          "[KafkaBatch][Fairness::Forwarder] expired drop failed lane=#{@type}: #{e.message}"
+        )
       end
     end
   end

@@ -14,14 +14,14 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     allow(KafkaBatch::Reconciler).to receive(:run)
   end
 
-  # Completion events carry the job message's source coordinates and are
-  # deduplicated by job_id.
-  def event(id:, status:, src_offset:, src_partition: 0, src_topic: "wt")
+  # Completion events carry batch_seq for bitmap dedup plus source coordinates.
+  def event(id:, status:, src_offset:, batch_seq:, src_partition: 0, src_topic: "wt")
     FakeMessage.new(
       topic:   KafkaBatch.config.events_topic,
       payload: {
         "batch_id"      => id,
         "job_id"        => "j#{src_offset}",
+        "batch_seq"     => batch_seq,
         "status"        => status,
         "occurred_at"   => Time.now.iso8601,
         "src_topic"     => src_topic,
@@ -35,10 +35,10 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 2, on_complete: "RecordingCallback")
 
-    consumer.send(:process_event, event(id: id, status: "success", src_offset: 10))
+    consumer.send(:process_event, event(id: id, status: "success", src_offset: 10, batch_seq: 1))
     expect(FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)).to be_empty
 
-    consumer.send(:process_event, event(id: id, status: "success", src_offset: 11))
+    consumer.send(:process_event, event(id: id, status: "success", src_offset: 11, batch_seq: 2))
     cb = FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)
     expect(cb.size).to eq(1)
     expect(cb.first.payload["outcome"]).to eq("success")
@@ -50,17 +50,17 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     KafkaBatch.store.create_batch(id: id, total_jobs: 3, on_complete: "RecordingCallback")
 
     msgs = [
-      event(id: id, status: "success", src_offset: 10),
-      event(id: id, status: "success", src_offset: 11),
-      event(id: id, status: "success", src_offset: 10),  # duplicate job_id – must not double-count
-      event(id: id, status: "failed",  src_offset: 12)
+      event(id: id, status: "success", src_offset: 10, batch_seq: 1),
+      event(id: id, status: "success", src_offset: 11, batch_seq: 2),
+      event(id: id, status: "success", src_offset: 10, batch_seq: 1),  # duplicate batch_seq – must not double-count
+      event(id: id, status: "failed",  src_offset: 12, batch_seq: 3)
     ]
     allow(consumer).to receive(:messages).and_return(msgs)
 
     consumer.consume
 
     b = KafkaBatch.store.find_batch(id)
-    expect(b[:completed_count]).to eq(2)  # job j10 counted once
+    expect(b[:completed_count]).to eq(2)  # batch_seq 1 counted once
     expect(b[:failed_count]).to eq(1)
 
     cb = FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)
@@ -71,7 +71,8 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
   it "commits the poll exactly once (marks only the last message consumed)" do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 2)
-    msgs = [event(id: id, status: "success", src_offset: 1), event(id: id, status: "success", src_offset: 2)]
+    msgs = [event(id: id, status: "success", src_offset: 1, batch_seq: 1),
+            event(id: id, status: "success", src_offset: 2, batch_seq: 2)]
     allow(consumer).to receive(:messages).and_return(msgs)
 
     consumer.consume
@@ -82,18 +83,31 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 2)
 
-    consumer.send(:process_event, event(id: id, status: "success", src_offset: 10))
-    consumer.send(:process_event, event(id: id, status: "failed", src_offset: 11))
+    consumer.send(:process_event, event(id: id, status: "success", src_offset: 10, batch_seq: 1))
+    consumer.send(:process_event, event(id: id, status: "failed", src_offset: 11, batch_seq: 2))
 
     expect(FakeProducer.for_topic(KafkaBatch.config.callbacks_topic).first.payload["outcome"]).to eq("complete")
   end
 
-  it "deduplicates a re-produced/redelivered event by source offset" do
+  it "deduplicates a re-produced/redelivered event by batch_seq" do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 2)
 
-    2.times { consumer.send(:process_event, event(id: id, status: "success", src_offset: 10)) }
+    2.times { consumer.send(:process_event, event(id: id, status: "success", src_offset: 10, batch_seq: 1)) }
     expect(KafkaBatch.store.find_batch(id)[:completed_count]).to eq(1)
+  end
+
+  it "skips events missing batch_seq" do
+    id = SecureRandom.uuid
+    KafkaBatch.store.create_batch(id: id, total_jobs: 1)
+    msg = FakeMessage.new(topic: KafkaBatch.config.events_topic,
+                          payload: {
+                            "batch_id" => id, "job_id" => "j1", "status" => "success",
+                            "src_topic" => "wt", "src_partition" => 0, "src_offset" => 1
+                          })
+
+    consumer.send(:process_event, msg)
+    expect(KafkaBatch.store.find_batch(id)[:completed_count]).to eq(0)
   end
 
   it "routes malformed JSON to the DLT" do
@@ -129,7 +143,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
         raise KafkaBatch::ProducerError, "broker timeout" if topic == KafkaBatch.config.callbacks_topic
       end
 
-      msgs = [event(id: id, status: "success", src_offset: 1)]
+      msgs = [event(id: id, status: "success", src_offset: 1, batch_seq: 1)]
       allow(consumer).to receive(:messages).and_return(msgs)
 
       expect { consumer.consume }.to raise_error(KafkaBatch::ProducerError, /broker timeout/)
@@ -143,7 +157,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
         raise KafkaBatch::ProducerError, "broker timeout" if topic == KafkaBatch.config.callbacks_topic
       end
 
-      msgs = [event(id: id, status: "success", src_offset: 1)]
+      msgs = [event(id: id, status: "success", src_offset: 1, batch_seq: 1)]
       allow(consumer).to receive(:messages).and_return(msgs)
 
       begin
@@ -169,6 +183,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
       events = [{
         batch_id:         id,
         job_id:           "j1",
+        batch_seq:        1,
         source_topic:     "wt",
         source_partition: 0,
         source_offset:    1,

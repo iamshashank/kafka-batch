@@ -22,6 +22,7 @@ module KafkaBatch
     #   be idempotent) and try event emission once more.
     class JobConsumer < Karafka::BaseConsumer
       prepend ConsumptionGate
+      include ExpiredJobHandler
       # Event-emission retry behaviour is configured via
       # KafkaBatch.config.event_emit_retries / .event_emit_backoff.
 
@@ -54,6 +55,11 @@ module KafkaBatch
         job_id        = data["job_id"]
         batch_id      = data["batch_id"]
         payload       = data["payload"] || {}
+
+        if expired_job?(data)
+          handle_expired_job(message: message, data: data)
+          return
+        end
 
         # Fair-lane bookkeeping: a message forwarded by Fairness::Forwarder carries
         # "_fair_slot" => true and a tenant_id. It holds exactly one Scheduler
@@ -93,6 +99,7 @@ module KafkaBatch
             )
             record_failure(batch_id, job_id, data["worker_class"], e)
             publish_to_dlt(data: data, error: e, topic: message.topic)
+            release_uniq_lock(data)
             mark_as_consumed!(message)
             return
           end
@@ -122,6 +129,7 @@ module KafkaBatch
             batch_id:     batch_id,
             worker_class: worker_class
           )
+          release_uniq_lock(data)
           mark_as_consumed!(message)
           return
         end
@@ -191,6 +199,7 @@ module KafkaBatch
             duration:     duration
           )
 
+          release_uniq_lock(data)
           mark_as_consumed!(message)
         ensure
           KafkaBatch::Liveness.job_finished(job_id)
@@ -361,6 +370,7 @@ module KafkaBatch
         )
 
         publish_to_dlt(data: data, error: error, topic: message.topic)
+        release_uniq_lock(data)
         mark_as_consumed!(message)
       end
 
@@ -404,6 +414,18 @@ module KafkaBatch
 
       # ── Helpers ──────────────────────────────────────────────────────────
 
+      def release_uniq_lock(data)
+        KafkaBatch::Uniqueness.release_by_name(
+          data["worker_class"],
+          data["payload"] || {},
+          job_id: data["job_id"]
+        )
+      rescue StandardError => e
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][JobConsumer] uniq lock release failed job_id=#{data['job_id']}: #{e.message}"
+        )
+      end
+
       # Build the completion-event payload and its partition key.
       #
       # The event carries the job message's immutable source coordinates
@@ -411,6 +433,7 @@ module KafkaBatch
       # by the source partition so a batch's events spread across the event-topic
       # partitions instead of funnelling through one. job_id is kept for logging.
       def build_event(batch_id:, job_id:, status:, worker_class:, message:)
+        data = decode(message.raw_payload)
         payload = {
           "batch_id"      => batch_id,
           "job_id"        => job_id,
@@ -421,6 +444,7 @@ module KafkaBatch
           "src_partition" => message.partition,
           "src_offset"    => message.offset
         }
+        payload["batch_seq"] = data["batch_seq"] if data["batch_seq"]
 
         [payload, "#{message.topic}/#{message.partition}"]
       end

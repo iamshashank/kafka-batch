@@ -15,6 +15,18 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     id
   end
 
+  def complete(batch_id:, seq:, status: "success", job_id: nil, source_topic: "wt", source_partition: 0, source_offset: nil)
+    store.record_completion_by_offset(
+      batch_id:         batch_id,
+      batch_seq:        seq,
+      source_topic:     source_topic,
+      source_partition: source_partition,
+      job_id:           job_id || "j#{seq}",
+      source_offset:    source_offset || seq,
+      status:           status
+    )
+  end
+
   describe "#create_batch / #find_batch" do
     it "persists and round-trips batch fields including meta" do
       id = new_batch(total: 3, on_success: "S", on_complete: "C", meta: { "k" => "v" })
@@ -37,7 +49,7 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     it "add_jobs grows total_jobs while the batch is held (block-form)" do
       id = SecureRandom.uuid
       store.create_batch(id: id, total_jobs: 0, sealed: false)
-      expect(store.add_jobs(id, 5)).to eq(:ok)
+      expect(store.add_jobs(id, 5)).to eq({ status: :ok, seq_start: 1, seq_end: 5 })
       expect(store.find_batch(id)[:total_jobs]).to eq(5)
       expect(store.find_batch(id)[:locked_at]).to be_nil
     end
@@ -45,7 +57,7 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     it "does not finalize a held batch even when complete" do
       id = SecureRandom.uuid
       store.create_batch(id: id, total_jobs: 1, sealed: false)
-      r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j1", source_offset: 1, status: "success")
+      r = complete(batch_id: id, seq: 1, status: "success")
       expect(r[:status]).to eq(:continue)
       expect(store.find_batch(id)[:status]).to eq("running")
     end
@@ -53,7 +65,7 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     it "seal_batch finalizes an already-complete batch and then closes it to add_jobs" do
       id = SecureRandom.uuid
       store.create_batch(id: id, total_jobs: 1, sealed: false)
-      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j1", source_offset: 1, status: "success")
+      complete(batch_id: id, seq: 1, status: "success")
 
       res = store.seal_batch(id)
       expect(res[:status]).to eq(:done)
@@ -71,7 +83,7 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     it "a sealed but still-running batch keeps accepting jobs (jobs adding jobs)" do
       id = SecureRandom.uuid
       store.create_batch(id: id, total_jobs: 1, sealed: true)
-      expect(store.add_jobs(id, 2)).to eq(:ok)
+      expect(store.add_jobs(id, 2)).to eq({ status: :ok, seq_start: 1, seq_end: 2 })
       expect(store.find_batch(id)[:total_jobs]).to eq(3)
     end
 
@@ -105,7 +117,7 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     it "sums pending jobs across running batches only" do
       a = SecureRandom.uuid
       store.create_batch(id: a, total_jobs: 10)
-      store.record_completion_by_offset(batch_id: a, source_topic: "t", source_partition: 0, job_id: "j1", source_offset: 1, status: "success")  # pending 9
+      complete(batch_id: a, seq: 1, source_topic: "t", status: "success")  # pending 9
       b = SecureRandom.uuid
       store.create_batch(id: b, total_jobs: 5)  # pending 5
       done = SecureRandom.uuid
@@ -117,13 +129,13 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
   end
 
   describe "#record_completions_batch" do
-    it "dedups by job_id, aggregates per batch, and finalizes once" do
+    it "dedups by batch_seq, aggregates per batch, and finalizes once" do
       id = SecureRandom.uuid
       store.create_batch(id: id, total_jobs: 2)
       events = [
-        { batch_id: id, job_id: "j1", source_topic: "wt", source_partition: 0, source_offset: 1, status: "success" },
-        { batch_id: id, job_id: "j1", source_topic: "wt", source_partition: 0, source_offset: 1, status: "success" }, # dup
-        { batch_id: id, job_id: "j2", source_topic: "wt", source_partition: 0, source_offset: 2, status: "failed" }
+        { batch_id: id, job_id: "j1", batch_seq: 1, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success" },
+        { batch_id: id, job_id: "j1", batch_seq: 1, source_topic: "wt", source_partition: 0, source_offset: 1, status: "success" }, # dup
+        { batch_id: id, job_id: "j2", batch_seq: 2, source_topic: "wt", source_partition: 0, source_offset: 2, status: "failed" }
       ]
       finalized = store.record_completions_batch(events)
 
@@ -137,13 +149,13 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
     it "does not double-count across calls (dedup persists)" do
       id = SecureRandom.uuid
       store.create_batch(id: id, total_jobs: 5)
-      ev = ->(jid, off, st) { { batch_id: id, job_id: jid, source_topic: "wt", source_partition: 0, source_offset: off, status: st } }
+      ev = ->(seq, st) { { batch_id: id, job_id: "j#{seq}", batch_seq: seq, source_topic: "wt", source_partition: 0, source_offset: seq, status: st } }
 
-      store.record_completions_batch([ev.call("j1", 1, "success"), ev.call("j2", 2, "success")])
-      store.record_completions_batch([ev.call("j2", 2, "success"), ev.call("j3", 3, "success")]) # j2 replayed
+      store.record_completions_batch([ev.call(1, "success"), ev.call(2, "success")])
+      store.record_completions_batch([ev.call(2, "success"), ev.call(3, "success")]) # seq 2 replayed
 
       b = store.find_batch(id)
-      expect(b[:completed_count]).to eq(3)  # j1,j2,j3 — j2 not counted twice
+      expect(b[:completed_count]).to eq(3)  # seq 1,2,3 — seq 2 not counted twice
     end
   end
 
@@ -157,12 +169,12 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
   end
 
   describe "#record_completion_by_offset" do
-    it "counts continue -> done by monotonic source offset" do
+    it "counts continue -> done" do
       id = new_batch(total: 2)
-      r1 = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j10", source_offset: 10, status: "success")
+      r1 = complete(batch_id: id, seq: 1, status: "success")
       expect(r1[:status]).to eq(:continue)
 
-      r2 = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j11", source_offset: 11, status: "success")
+      r2 = complete(batch_id: id, seq: 2, status: "success")
       expect(r2[:status]).to eq(:done)
       expect(r2[:outcome]).to eq("success")
       expect(store.find_batch(id)[:status]).to eq("success")
@@ -170,39 +182,39 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
 
     it "marks the batch :done with outcome complete when any job fails" do
       id = new_batch(total: 2)
-      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j10", source_offset: 10, status: "success")
-      result = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j11", source_offset: 11, status: "failed")
+      complete(batch_id: id, seq: 1, status: "success")
+      result = complete(batch_id: id, seq: 2, status: "failed")
       expect(result[:status]).to eq(:done)
       expect(result[:outcome]).to eq("complete")
     end
 
-    it "dedups a replayed event for the same job_id" do
+    it "dedups a replayed event for the same batch_seq" do
       id = new_batch(total: 2)
-      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j10", source_offset: 10, status: "success")
+      complete(batch_id: id, seq: 1, status: "success")
 
-      expect(store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j10", source_offset: 10, status: "success")[:status]).to eq(:duplicate)
+      expect(complete(batch_id: id, seq: 1, status: "success")[:status]).to eq(:duplicate)
 
       expect(store.find_batch(id)[:completed_count]).to eq(1)
     end
 
     it "counts out-of-order completions on the same partition" do
       id = new_batch(total: 2)
-      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j11", source_offset: 11, status: "success")
-      r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j10", source_offset: 10, status: "success")
+      complete(batch_id: id, seq: 2, status: "success")
+      r = complete(batch_id: id, seq: 1, status: "success")
       expect(r[:status]).to eq(:done)
       expect(store.find_batch(id)[:completed_count]).to eq(2)
     end
 
-    it "tracks cursors independently per (topic, partition)" do
+    it "tracks completions independently per (topic, partition)" do
       id = new_batch(total: 2)
-      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j5", source_offset: 5, status: "success")
-      # different partition, low offset still counts
-      r = store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 1, job_id: "j1", source_offset: 1, status: "success")
+      complete(batch_id: id, seq: 1, source_topic: "wt", source_partition: 0)
+      r = complete(batch_id: id, seq: 2, source_topic: "wt", source_partition: 1)
       expect(r[:status]).to eq(:done)
     end
 
     it "returns :not_found for an unknown batch" do
-      r = store.record_completion_by_offset(batch_id: "nope", source_topic: "wt", source_partition: 0, job_id: "j1", source_offset: 1, status: "success")
+      r = store.record_completion_by_offset(batch_id: "nope", source_topic: "wt", source_partition: 0,
+                                            job_id: "j1", batch_seq: 1, source_offset: 1, status: "success")
       expect(r[:status]).to eq(:not_found)
     end
   end
@@ -226,7 +238,7 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
 
     it "#done_batches_without_callback finds finished, unclaimed batches" do
       id = new_batch(total: 1)
-      store.record_completion_by_offset(batch_id: id, source_topic: "wt", source_partition: 0, job_id: "j1", source_offset: 1, status: "success")
+      complete(batch_id: id, seq: 1, status: "success")
 
       lost = store.done_batches_without_callback(older_than: Time.now + 60)
       expect(lost.map { |b| b[:id] }).to include(id)

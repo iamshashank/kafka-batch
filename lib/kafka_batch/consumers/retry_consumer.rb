@@ -28,6 +28,7 @@ module KafkaBatch
     # are independent.
     class RetryConsumer < Karafka::BaseConsumer
       prepend ConsumptionGate
+      include ExpiredJobHandler
       # #25 fix: MAX_PAUSE_SECONDS is now a config knob (config.retry_max_pause_seconds,
       # default 30). The constant is retained as a fallback for callers that read it
       # directly (e.g. tests), but the consumer reads from config at runtime.
@@ -116,14 +117,17 @@ module KafkaBatch
         end
 
         # ── Due: re-enqueue to original topic ──────────────────────────────
+        job_message = data.reject { |k, _| %w[retry_after retry_to].include?(k) }
+
+        if expired_job?(job_message)
+          handle_expired_job(message: message, data: job_message, log_tag: "RetryConsumer")
+          return true
+        end
+
         KafkaBatch.logger.info(
           "[KafkaBatch][RetryConsumer] Re-enqueuing job_id=#{data['job_id']} " \
           "attempt=#{data['attempt']} to #{retry_to}"
         )
-
-        # Strip retry metadata before re-enqueuing so the JobConsumer sees a
-        # clean message identical to the original job format.
-        job_message = data.reject { |k, _| %w[retry_after retry_to].include?(k) }
 
         KafkaBatch::Producer.produce_sync(
           topic:   retry_to,

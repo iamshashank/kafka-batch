@@ -16,8 +16,10 @@ module KafkaBatch
       end
 
       # Atomically grow a batch's total_jobs by +count+. Only completed or
-      # cancelled batches reject the push.
+      # cancelled batches reject the push. For positive counts also reserves a
+      # contiguous run of 1-based batch_seq values.
       # @return [Symbol] :ok | :closed | :cancelled | :not_found
+      # @return [Hash] { status: :ok, seq_start:, seq_end: } when count > 0
       def add_jobs(id, count)
         raise NotImplementedError, "#{self.class}#add_jobs"
       end
@@ -35,12 +37,12 @@ module KafkaBatch
       # whole Kafka poll's worth of counter updates costs far fewer row locks /
       # round-trips than one transaction per event.
       #
-      # MUST be exactly-once per event: each event is deduplicated by job_id so
-      # re-delivered events are never double-counted and out-of-order completions
-      # on the same source partition are all counted.
+      # MUST be exactly-once per event: each event is deduplicated by batch_seq
+      # (bitmap) so re-delivered events are never double-counted and out-of-order
+      # completions on the same source partition are all counted.
       #
-      # @param events [Array<Hash>] each: { batch_id:, job_id:, source_topic:,
-      #   source_partition:, source_offset:, status: }
+      # @param events [Array<Hash>] each: { batch_id:, job_id:, batch_seq:,
+      #   source_topic:, source_partition:, source_offset:, status: }
       # @return [Array<Hash>] batches that JUST finalized: { batch:, outcome: }
       def record_completions_batch(events)
         raise NotImplementedError, "#{self.class}#record_completions_batch"
@@ -52,16 +54,19 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#find_batch"
       end
 
-      # Atomically record that a single job finished, deduplicating by job_id.
-      # Each job counts at most once regardless of completion order on the
-      # source partition. source_* coords are retained for provenance.
+      # Atomically record that a single job finished, deduplicating by batch_seq
+      # (bitmap). Each job counts at most once regardless of completion order on
+      # the source partition. source_* coords are retained for provenance.
+      #
+      # @param batch_seq [Integer] 1-based slot assigned at enqueue (required).
       #
       # @return [Hash]
       #   { status: :done,      outcome: "success"|"complete", batch: <hash> }
       #   { status: :continue                                                 }
       #   { status: :duplicate                                                }
       #   { status: :not_found                                                }
-      def record_completion_by_offset(batch_id:, job_id:, source_topic:, source_partition:, source_offset:, status:)
+      #   { status: :invalid   }  – batch_seq missing or <= 0
+      def record_completion_by_offset(batch_id:, job_id:, source_topic:, source_partition:, source_offset:, status:, batch_seq:)
         raise NotImplementedError, "#{self.class}#record_completion_by_offset"
       end
 

@@ -196,6 +196,7 @@ module KafkaBatch
         KafkaBatch::Instrumentation.job_cancelled(
           job_id: job_id, batch_id: batch_id, worker_class: worker_name
         )
+        release_scheduled_uniq(data, job_id)
         return true  # drop: batch is cancelled, ack it
       end
 
@@ -205,6 +206,7 @@ module KafkaBatch
           "[KafkaBatch][SchedulePoller] unknown worker_class=#{worker_name.inspect} " \
           "for job_id=#{job_id} — dropping."
         )
+        release_scheduled_uniq(data, job_id)
         return true
       end
 
@@ -231,7 +233,27 @@ module KafkaBatch
       KafkaBatch.logger.error(
         "[KafkaBatch][SchedulePoller] malformed scheduled payload for job_id=#{job_id}: #{e.message} — dropping."
       )
+      release_scheduled_uniq_raw(payload, job_id) if payload
       true
+    end
+
+    def release_scheduled_uniq(data, job_id)
+      KafkaBatch::Uniqueness.release_by_name(
+        data["worker_class"],
+        data["payload"] || {},
+        job_id: job_id
+      )
+    rescue StandardError => e
+      KafkaBatch.logger.warn(
+        "[KafkaBatch][SchedulePoller] uniq lock release failed job_id=#{job_id}: #{e.message}"
+      )
+    end
+
+    def release_scheduled_uniq_raw(payload, job_id)
+      data = Oj.load(payload)
+      release_scheduled_uniq(data, job_id)
+    rescue StandardError
+      nil
     end
 
     def maybe_reclaim(st)

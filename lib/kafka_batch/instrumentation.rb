@@ -21,6 +21,8 @@ module KafkaBatch
   #   job.retried.kafka_batch          – job scheduled for retry
   #   job.failed.kafka_batch           – job exhausted all retries
   #   job.cancelled.kafka_batch        – job skipped (batch was cancelled)
+  #   job.uniq_skipped.kafka_batch     – duplicate rejected (worker has uniq true)
+  #   job.expired.kafka_batch          – job dropped (valid_till passed)
   #   job.emit_retried.kafka_batch     – completion-event produce retried inline
   #   batch.created.kafka_batch        – a new batch was persisted
   #   batch.sealed.kafka_batch         – block-form population finished; batch sealed
@@ -76,6 +78,24 @@ module KafkaBatch
           job_id:       job_id,
           batch_id:     batch_id,
           worker_class: worker_class.to_s
+        })
+      end
+
+      def job_uniq_skipped(worker_class:, payload:, job_id: nil, batch_id: nil)
+        instrument("job.uniq_skipped", {
+          job_id:       job_id,
+          batch_id:     batch_id,
+          worker_class: worker_class.to_s,
+          payload:      payload
+        })
+      end
+
+      def job_expired(job_id:, batch_id:, worker_class:, valid_till:)
+        instrument("job.expired", {
+          job_id:       job_id,
+          batch_id:     batch_id,
+          worker_class: worker_class.to_s,
+          valid_till:   valid_till
         })
       end
 

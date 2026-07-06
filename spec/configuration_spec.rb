@@ -72,6 +72,10 @@ RSpec.describe KafkaBatch::Configuration do
       expect(config.event_emit_backoff).to eq(1)
     end
 
+    it "disables the schedule poller by default" do
+      expect(config.schedule_poller_enabled).to eq(false)
+    end
+
     it "bounds failure-metadata retention separately from batch_ttl" do
       expect(config.batch_ttl).to eq(7 * 24 * 3600)
       expect(config.failures_ttl).to eq(24 * 3600)       # shorter than batch_ttl

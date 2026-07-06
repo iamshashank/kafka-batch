@@ -76,11 +76,19 @@ module KafkaBatch
     #            TTL, best-effort behind a circuit breaker.
     #   :off   – disabled.
     attr_accessor :liveness_backend            # Symbol – default :redis
-    attr_accessor :track_running_jobs          # Boolean – default true (gates :redis writes)
+    attr_accessor :track_running_jobs          # Boolean – default true (gates :redis per-job writes; set false at scale)
     attr_accessor :liveness_ttl                # Integer – seconds; default 30 (staleness window)
     # How often each consumer process re-samples its own RSS/CPU for /live.
     # 0 disables stats (heartbeats still update last_seen). Default 15s.
     attr_accessor :liveness_stats_interval     # Integer – seconds; default 15
+
+    # ── Job uniqueness (per-worker `uniq true`) ───────────────────────────────
+    # Redis-backed dedup of worker_class + payload while a job is queued or in
+    # progress. Keys use 8-byte binary XXHash64 digests (not hex) to save RAM.
+    attr_accessor :uniq_enabled                # Boolean – default true (master switch)
+    attr_accessor :uniq_lock_ttl               # Integer – seconds; default 7 days
+    # :skip – return nil from enqueue/push on duplicate; :raise – DuplicateJobError
+    attr_accessor :uniq_on_duplicate           # Symbol – :skip (default) | :raise
 
     # ── Consumption pause/resume (/lag dashboard) ─────────────────────────────
     # Karafka consumers reload pause state from Redis (or MySQL when store is
@@ -122,7 +130,7 @@ module KafkaBatch
     #   :mysql – kafka_batch_scheduled_jobs table; disk-resident, cheap at scale,
     #            native per-job cancel/lookup by primary key.
     attr_accessor :schedule_store            # Symbol – :redis (default) | :mysql
-    attr_accessor :schedule_poller_enabled   # Boolean – default true (consumer procs poll)
+    attr_accessor :schedule_poller_enabled   # Boolean – default false (opt in on scheduler pods)
     attr_accessor :schedule_poll_interval    # Float   – base seconds between polls when work is flowing; default 5.0
     # When a poll finds nothing due, the poller backs off (doubling the sleep up to
     # this cap) so idle pods stop hammering the schedule store; it snaps back to
@@ -379,6 +387,9 @@ module KafkaBatch
       @track_running_jobs       = true
       @liveness_ttl             = 30
       @liveness_stats_interval  = 15
+      @uniq_enabled             = true
+      @uniq_lock_ttl            = 7 * 24 * 3600  # 7 days — covers max_schedule_horizon + retries
+      @uniq_on_duplicate        = :skip
       @consumption_control_refresh_interval = 60
       @max_retries              = 3
       @retry_jitter             = 0.1  # +/- 10%
@@ -387,7 +398,7 @@ module KafkaBatch
       @retry_max_pause_seconds  = 30
       @complete_after_retries   = 3    # == max_retries default → no early completion by default
       @schedule_store           = :redis
-      @schedule_poller_enabled  = true
+      @schedule_poller_enabled  = false
       @schedule_poll_interval   = 5.0
       @schedule_poll_max_interval = 60.0
       @schedule_poll_jitter     = 0.1

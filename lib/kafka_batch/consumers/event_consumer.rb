@@ -182,9 +182,18 @@ module KafkaBatch
           return nil
         end
 
+        batch_seq = data["batch_seq"]
+        if batch_seq.nil? || batch_seq.to_i <= 0
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][EventConsumer] Event missing batch_seq – skipping: #{data.inspect}"
+          )
+          return nil
+        end
+
         {
           batch_id:         batch_id,
           job_id:           data["job_id"],
+          batch_seq:        batch_seq.to_i,
           status:           status,
           source_topic:     src_topic,
           source_partition: src_partition,

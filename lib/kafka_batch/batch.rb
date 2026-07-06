@@ -112,14 +112,19 @@ module KafkaBatch
 
     # Push a job into this (open) batch: atomically grows total_jobs and produces
     # the job. Raises BatchClosedError if the batch has completed or been
-    # cancelled. @return [String] job_id
-    def push(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
+    # cancelled. Returns nil when the worker opts into uniq and a duplicate is
+    # skipped (config.uniq_on_duplicate :skip). @return [String, nil] job_id
+    def push(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
       validate_worker!(worker_class)
-      reserve!(1)
+      return nil if self.class.uniq_duplicate?(worker_class, payload, job_id: job_id, batch_id: @id)
+
+      batch_seq = reserve!(1)
 
       begin
-        produce_job(worker_class, payload, job_id, tenant_id || @tenant_id)
+        produce_job(worker_class, payload, job_id, tenant_id || @tenant_id,
+                    batch_seq: batch_seq, valid_till: valid_till)
       rescue StandardError
+        self.class.release_uniq!(worker_class, payload, job_id: job_id)
         KafkaBatch.store.add_jobs(@id, -1) rescue nil  # roll back the reserved count
         raise
       end
@@ -136,26 +141,35 @@ module KafkaBatch
     #   batch.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
     #
     # @param payloads [Array<Hash>] one payload per job
-    # @return [Array<String>] the job ids, in order
-    def push_many(worker_class, payloads, tenant_id: nil)
+    # @return [Array<String, nil>] the job ids, in order (nil = uniq duplicate skipped)
+    def push_many(worker_class, payloads, tenant_id: nil, valid_till: nil)
       validate_worker!(worker_class)
       payloads = payloads.to_a
       return [] if payloads.empty?
 
-      reserve!(payloads.size)
+      tid     = tenant_id || @tenant_id
+      entries = []
+      job_ids = []
 
-      tid = tenant_id || @tenant_id
-
-      job_ids  = []
-      messages = payloads.map do |payload|
-        job_id  = SecureRandom.uuid
+      payloads.each do |payload|
+        job_id = SecureRandom.uuid
+        if self.class.uniq_duplicate?(worker_class, payload, job_id: job_id, batch_id: @id)
+          job_ids << nil
+          next
+        end
+        entries << [payload, job_id]
         job_ids << job_id
+      end
+      return job_ids if entries.empty?
+
+      reserve!(entries.size)
+
+      messages = entries.map do |payload, job_id|
         message = self.class.build_message(
           worker_class: worker_class, payload: payload,
-          job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid
+          job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid,
+          batch_seq: next_batch_seq!, valid_till: valid_till
         )
-        # route_for picks the right lane (per fairness_type) / plain topic and the
-        # partition key, identically to #push and #enqueue.
         route = self.class.route_for(worker_class, job_id: job_id, tenant_id: tid, batch_id: @id)
         msg   = { topic: route[:topic], payload: message }
         if route[:partition]
@@ -169,14 +183,11 @@ module KafkaBatch
       begin
         KafkaBatch::Producer.produce_many_sync(messages)
       rescue StandardError
-        # On broker failure the idempotent producer will have sent zero or all
-        # messages (partial produce is extremely rare with acks:all). Roll back
-        # the full reservation; the reconciler will catch any edge-case mismatch.
-        #
-        # Bug #2 fix: if the rollback itself fails, total_jobs is overstated and
-        # the batch can never drain. Force-cancel it so it doesn't hang forever.
+        entries.each do |payload, job_id|
+          self.class.release_uniq!(worker_class, payload, job_id: job_id)
+        end
         begin
-          KafkaBatch.store.add_jobs(@id, -payloads.size)
+          KafkaBatch.store.add_jobs(@id, -entries.size)
         rescue StandardError => rollback_err
           KafkaBatch.logger.error(
             "[KafkaBatch][Batch] push_many rollback failed for batch_id=#{@id}: " \
@@ -193,21 +204,25 @@ module KafkaBatch
     # Push a DELAYED job into this (open) batch, to run at an absolute time. Like
     # #push, it grows total_jobs immediately (reserve!) so the batch's completion
     # gate stays shut until the delayed job actually runs and completes — matching
-    # Sidekiq-Pro `batch.jobs { W.perform_at(...) }` semantics. @return [String] job_id
-    def push_at(time, worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
+    # Sidekiq-Pro `batch.jobs { W.perform_at(...) }` semantics. @return [String, nil] job_id
+    def push_at(time, worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
       validate_worker!(worker_class)
-      reserve!(1)
+      return nil if self.class.uniq_duplicate?(worker_class, payload, job_id: job_id, batch_id: @id)
+
+      batch_seq = reserve!(1)
 
       begin
         tid     = tenant_id || @tenant_id
         message = self.class.build_message(
           worker_class: worker_class, payload: payload,
-          job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid
+          job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid,
+          batch_seq: batch_seq, valid_till: valid_till
         )
         self.class.schedule_message(
           message, run_at: self.class.clamp_run_at(self.class.to_time(time)), batch_id: @id
         )
       rescue StandardError
+        self.class.release_uniq!(worker_class, payload, job_id: job_id)
         KafkaBatch.store.add_jobs(@id, -1) rescue nil  # roll back the reserved count
         raise
       end
@@ -224,26 +239,50 @@ module KafkaBatch
     # absolute time. Grows total_jobs by payloads.size with a single atomic store
     # write, produces all payloads to the scheduled topic in one round-trip, and
     # bulk-writes their pointers — the delayed equivalent of #push_many. The batch
-    # won't complete until every scheduled job has run. @return [Array<String>] job ids
-    def push_many_at(time, worker_class, payloads, tenant_id: nil)
+    # won't complete until every scheduled job has run. @return [Array<String, nil>] job ids
+    def push_many_at(time, worker_class, payloads, tenant_id: nil, valid_till: nil)
       validate_worker!(worker_class)
       payloads = payloads.to_a
       return [] if payloads.empty?
 
-      reserve!(payloads.size)
+      tid      = tenant_id || @tenant_id
+      run_at   = self.class.clamp_run_at(self.class.to_time(time))
+      entries  = []
+      job_ids  = []
+
+      payloads.each do |payload|
+        job_id = SecureRandom.uuid
+        if self.class.uniq_duplicate?(worker_class, payload, job_id: job_id, batch_id: @id)
+          job_ids << nil
+          next
+        end
+        entries << self.class.build_message(
+          worker_class: worker_class, payload: payload,
+          job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tid,
+          batch_seq: nil, valid_till: valid_till
+        )
+        job_ids << job_id
+      end
+      return job_ids if entries.empty?
+
+      reserve!(entries.size)
 
       begin
-        tid      = tenant_id || @tenant_id
-        run_at   = self.class.clamp_run_at(self.class.to_time(time))
-        messages = payloads.map do |payload|
-          self.class.build_message(worker_class: worker_class, payload: payload,
-                                   job_id: SecureRandom.uuid, batch_id: @id, attempt: 0, tenant_id: tid)
+        messages = entries.each_with_index.map do |message, _i|
+          message.merge("batch_seq" => next_batch_seq!)
         end
         self.class.schedule_messages(messages, run_at: run_at, batch_id: @id)
       rescue StandardError
-        KafkaBatch.store.add_jobs(@id, -payloads.size) rescue nil  # roll back the reservation
+        messages.each do |message|
+          self.class.release_uniq!(
+            worker_class, message["payload"] || {}, job_id: message["job_id"]
+          )
+        end
+        KafkaBatch.store.add_jobs(@id, -entries.size) rescue nil
         raise
       end
+
+      job_ids
     end
 
     # Push many delayed jobs to run after +interval+ seconds. @return [Array<String>]
@@ -261,32 +300,47 @@ module KafkaBatch
       KafkaBatch.store.update_batch_status(id, "cancelled")
     end
 
-    # Enqueue a single job outside of any batch context. @return [String] job_id
-    def self.enqueue(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
+    # Enqueue a single job outside of any batch context. @return [String, nil] job_id
+    def self.enqueue(worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
       ensure_worker!(worker_class)
+      return nil if uniq_duplicate?(worker_class, payload, job_id: job_id)
 
       message = build_message(
         worker_class: worker_class, payload: payload,
-        job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id
+        job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id,
+        valid_till: valid_till
       )
       route = route_for(worker_class, job_id: job_id, tenant_id: tenant_id)
-      KafkaBatch::Producer.produce_sync(
-        topic: route[:topic], payload: message, key: route[:key], partition: route[:partition]
-      )
+      begin
+        KafkaBatch::Producer.produce_sync(
+          topic: route[:topic], payload: message, key: route[:key], partition: route[:partition]
+        )
+      rescue StandardError
+        release_uniq!(worker_class, payload, job_id: job_id)
+        raise
+      end
       job_id
     end
 
     # Enqueue a single job to run at an absolute time (Sidekiq perform_at).
     # The payload is produced to the durable scheduled_topic and a compact pointer
     # is stored in the delayed-job index; the SchedulePoller re-produces it onto
-    # the worker's real topic when due. @return [String] job_id
-    def self.enqueue_at(time, worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil)
+    # the worker's real topic when due. @return [String, nil] job_id
+    def self.enqueue_at(time, worker_class, payload = {}, job_id: SecureRandom.uuid, tenant_id: nil, valid_till: nil)
       ensure_worker!(worker_class)
+      return nil if uniq_duplicate?(worker_class, payload, job_id: job_id)
+
       message = build_message(
         worker_class: worker_class, payload: payload,
-        job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id
+        job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id,
+        valid_till: valid_till
       )
-      schedule_message(message, run_at: clamp_run_at(to_time(time)), batch_id: nil)
+      begin
+        schedule_message(message, run_at: clamp_run_at(to_time(time)), batch_id: nil)
+      rescue StandardError
+        release_uniq!(worker_class, payload, job_id: job_id)
+        raise
+      end
       job_id
     end
 
@@ -298,18 +352,40 @@ module KafkaBatch
     # Bulk-enqueue many standalone jobs (same worker) to run at one absolute time.
     # Delayed push_bulk: one produce_many_sync + one bulk index write.
     # @param payloads [Array<Hash>] one payload per job
-    # @return [Array<String>] the job ids, in order
-    def self.enqueue_many_at(time, worker_class, payloads, tenant_id: nil)
+    # @return [Array<String, nil>] the job ids, in order (nil = uniq duplicate skipped)
+    def self.enqueue_many_at(time, worker_class, payloads, tenant_id: nil, valid_till: nil)
       ensure_worker!(worker_class)
       payloads = payloads.to_a
       return [] if payloads.empty?
 
       run_at   = clamp_run_at(to_time(time))
-      messages = payloads.map do |payload|
-        build_message(worker_class: worker_class, payload: payload,
-                      job_id: SecureRandom.uuid, batch_id: nil, attempt: 0, tenant_id: tenant_id)
+      messages = []
+      job_ids  = []
+
+      payloads.each do |payload|
+        job_id = SecureRandom.uuid
+        if uniq_duplicate?(worker_class, payload, job_id: job_id)
+          job_ids << nil
+          next
+        end
+        messages << build_message(
+          worker_class: worker_class, payload: payload,
+          job_id: job_id, batch_id: nil, attempt: 0, tenant_id: tenant_id,
+          valid_till: valid_till
+        )
+        job_ids << job_id
       end
-      schedule_messages(messages, run_at: run_at, batch_id: nil)
+      return job_ids if messages.empty?
+
+      begin
+        schedule_messages(messages, run_at: run_at, batch_id: nil)
+      rescue StandardError
+        messages.each do |message|
+          release_uniq!(worker_class, message["payload"] || {}, job_id: message["job_id"])
+        end
+        raise
+      end
+      job_ids
     end
 
     # Bulk-enqueue many standalone jobs to run after +interval+ seconds.
@@ -456,7 +532,30 @@ module KafkaBatch
       raise ArgumentError, "#{worker_class} must include KafkaBatch::Worker"
     end
 
-    def self.build_message(worker_class:, payload:, job_id:, batch_id:, attempt:, tenant_id: nil)
+    # @return [Boolean] true when the enqueue should be skipped as a duplicate
+    def self.uniq_duplicate?(worker_class, payload, job_id:, batch_id: nil)
+      return false unless worker_class.uniq? && KafkaBatch.config.uniq_enabled
+
+      if KafkaBatch::Uniqueness.claim(worker_class, payload, job_id: job_id)
+        false
+      else
+        KafkaBatch::Instrumentation.job_uniq_skipped(
+          worker_class: worker_class, payload: payload, job_id: job_id, batch_id: batch_id
+        )
+        case KafkaBatch.config.uniq_on_duplicate
+        when :raise
+          raise DuplicateJobError.new(worker_class: worker_class, payload: payload)
+        else
+          true
+        end
+      end
+    end
+
+    def self.release_uniq!(worker_class, payload, job_id:)
+      KafkaBatch::Uniqueness.release(worker_class, payload, job_id: job_id)
+    end
+
+    def self.build_message(worker_class:, payload:, job_id:, batch_id:, attempt:, tenant_id: nil, batch_seq: nil, valid_till: nil)
       msg = {
         "job_id"                 => job_id,
         "batch_id"               => batch_id,
@@ -467,8 +566,11 @@ module KafkaBatch
         "complete_after_retries" => worker_class.complete_after_retries,
         "enqueued_at"            => Time.now.utc.iso8601
       }
-      msg["tenant_id"]  = tenant_id            if tenant_id
-      msg["retry_tier"] = worker_class.retry_tier.to_s if worker_class.retry_tier
+      msg["tenant_id"]   = tenant_id            if tenant_id
+      msg["batch_seq"]   = batch_seq            if batch_seq && batch_id
+      msg["retry_tier"]  = worker_class.retry_tier.to_s if worker_class.retry_tier
+      normalized_till    = JobExpiry.normalize_valid_till(valid_till)
+      msg["valid_till"]  = normalized_till      if normalized_till
       msg
     end
 
@@ -479,8 +581,14 @@ module KafkaBatch
     end
 
     # Atomically grow total_jobs by +count+, raising if the batch can't accept jobs.
+    # Returns the reserved 1-based batch_seq for a single-job reservation, or
+    # sets @seq_cursor/@seq_end for bulk (#push_many) assignment.
+    # @return [Integer, nil] batch_seq when count == 1
     def reserve!(count)
-      case KafkaBatch.store.add_jobs(@id, count)
+      result = KafkaBatch.store.add_jobs(@id, count)
+      status, seq_start, seq_end = parse_add_jobs_result(result)
+
+      case status
       when :closed
         raise BatchClosedError, "Batch #{@id} has already completed – no new jobs may be pushed"
       when :cancelled
@@ -488,7 +596,37 @@ module KafkaBatch
       when :not_found
         raise BatchNotFoundError, "Batch #{@id} not found"
       end
+
+      if seq_start
+        @seq_cursor = seq_start
+        @seq_end    = seq_end
+        return @seq_cursor if count == 1
+      else
+        @seq_cursor = @seq_end = nil
+      end
+
+      nil
     end
+
+    def next_batch_seq!
+      raise BatchClosedError, "Batch #{@id} has no reserved batch_seq slots" unless @seq_cursor && @seq_end
+      raise BatchClosedError, "Batch #{@id} reserved too few batch_seq slots" if @seq_cursor > @seq_end
+
+      seq = @seq_cursor
+      @seq_cursor += 1
+      seq
+    end
+
+    def parse_add_jobs_result(result)
+      case result
+      when Hash
+        [result[:status], result[:seq_start], result[:seq_end]]
+      else
+        [result, nil, nil]
+      end
+    end
+
+    private :parse_add_jobs_result, :next_batch_seq!
 
     # Open the completion gate after block-form population finishes. If the batch
     # already drained while the block ran, this finalizes it and fires the
@@ -509,10 +647,11 @@ module KafkaBatch
       self
     end
 
-    def produce_job(worker_class, payload, job_id, tenant_id = nil)
+    def produce_job(worker_class, payload, job_id, tenant_id = nil, batch_seq: nil, valid_till: nil)
       message = self.class.build_message(
         worker_class: worker_class, payload: payload,
-        job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tenant_id
+        job_id: job_id, batch_id: @id, attempt: 0, tenant_id: tenant_id,
+        batch_seq: batch_seq, valid_till: valid_till
       )
       route = self.class.route_for(worker_class, job_id: job_id, tenant_id: tenant_id, batch_id: @id)
       KafkaBatch::Producer.produce_sync(

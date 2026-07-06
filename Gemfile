@@ -11,3 +11,5 @@ gem "database_cleaner-active_record"
 gem "timecop"
 gem "pry"
 gem "simplecov", require: false
+
+gem "xxhash", ">= 0.4"

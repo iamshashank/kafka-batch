@@ -81,6 +81,16 @@ class FanoutWorker
   end
 end
 
+class UniqWorker
+  include KafkaBatch::Worker
+  kafka_topic "test.uniq"
+  uniq true
+
+  def perform(payload)
+    KafkaBatchSpec::WorkerRuns.record(:uniq, payload)
+  end
+end
+
 # A plain class that is NOT a KafkaBatch::Worker (for negative validation).
 class NotAWorker
 end

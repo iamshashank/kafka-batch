@@ -49,9 +49,8 @@ module KafkaBatch
             KafkaBatch.logger.warn("[KafkaBatch] fairness partition check skipped: #{e.message}")
           end
 
-          # Start the delayed-job poller on consumer processes (gated on
-          # app.running so producer-only web/puma processes never poll — they only
-          # enqueue). Safe to run in every consumer process; claims are atomic.
+          # Start the delayed-job poller when schedule_poller_enabled is true
+          # (gated on app.running so producer-only web/puma processes never poll).
           begin
             KafkaBatch::SchedulePoller.ensure_running! if defined?(KafkaBatch::SchedulePoller)
           rescue => e

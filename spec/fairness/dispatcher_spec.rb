@@ -16,6 +16,13 @@ RSpec.describe KafkaBatch::Fairness::Dispatcher do
     FakeMessage.new(topic: KafkaBatch.config.fair_time_ingest_topic, offset: offset, payload: payload)
   end
 
+  def stamped_raw(message)
+    data = Oj.load(message.raw_payload)
+    Oj.dump(KafkaBatch::JobExpiry.stamp_source!(
+      data, topic: message.topic, partition: message.partition, offset: message.offset
+    ))
+  end
+
   it "starts the forwarder and enqueues each ingest job into the scheduler keyed by tenant" do
     m = [msg(offset: 1, tenant: "acme"), msg(offset: 2, tenant: "globex")]
     allow(consumer).to receive(:messages).and_return(m)
@@ -24,8 +31,8 @@ RSpec.describe KafkaBatch::Fairness::Dispatcher do
     consumer.consume
 
     expect(KafkaBatch::Fairness::Forwarder).to have_received(:ensure_running!)
-    expect(scheduler).to have_received(:enqueue).with("acme",   m[0].raw_payload)
-    expect(scheduler).to have_received(:enqueue).with("globex", m[1].raw_payload)
+    expect(scheduler).to have_received(:enqueue).with("acme",   stamped_raw(m[0]))
+    expect(scheduler).to have_received(:enqueue).with("globex", stamped_raw(m[1]))
     expect(consumer).to have_received(:mark_as_consumed!).with(m[1])  # last committed
   end
 
@@ -50,8 +57,8 @@ RSpec.describe KafkaBatch::Fairness::Dispatcher do
 
     consumer.consume
 
-    expect(scheduler).to have_received(:enqueue).with("batch-7", m[0].raw_payload)
-    expect(scheduler).to have_received(:enqueue).with("solo",    m[1].raw_payload)
+    expect(scheduler).to have_received(:enqueue).with("batch-7", stamped_raw(m[0]))
+    expect(scheduler).to have_received(:enqueue).with("solo",    stamped_raw(m[1]))
   end
 
   it "pauses without committing when the scheduler is unavailable" do

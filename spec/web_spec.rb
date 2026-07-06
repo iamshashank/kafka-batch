@@ -459,7 +459,7 @@ RSpec.describe KafkaBatch::Web do
       done    = seed(total: 1)
       KafkaBatch.store.record_completion_by_offset(
         batch_id: done, source_topic: "t", source_partition: 0,
-        job_id: "j1", source_offset: 1, status: "success"
+        job_id: "j1", batch_seq: 1, source_offset: 1, status: "success"
       )
       KafkaBatch.store.seal_batch(done)
 

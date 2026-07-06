@@ -15,6 +15,19 @@ module KafkaBatch
   # Raised when Kafka message production fails
   class ProducerError < Error; end
 
+  # Raised when enqueueing a job that opts into `uniq true` while an identical
+  # job (same worker + payload) is already queued or in progress. Only raised
+  # when config.uniq_on_duplicate is :raise.
+  class DuplicateJobError < Error
+    attr_reader :worker_class, :payload
+
+    def initialize(worker_class:, payload:)
+      @worker_class = worker_class
+      @payload      = payload
+      super("Duplicate job: #{worker_class.name} with same arguments already queued or in progress")
+    end
+  end
+
   # Raised on store read/write failures
   class StoreError < Error; end
 

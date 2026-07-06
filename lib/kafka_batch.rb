@@ -13,11 +13,14 @@ require_relative "kafka_batch/ui"    # config, store, lag, liveness, web, …
 # ── Backend-only requires ────────────────────────────────────────────────────
 require_relative "kafka_batch/producer"
 require_relative "kafka_batch/consumers/consumption_gate"
+require_relative "kafka_batch/consumers/expired_job_handler"
 require_relative "kafka_batch/topics"
 require_relative "kafka_batch/fairness/scheduler"
 require_relative "kafka_batch/fairness/forwarder"
 require_relative "kafka_batch/fairness/dispatcher"
 require_relative "kafka_batch/worker"
+require_relative "kafka_batch/uniqueness"
+require_relative "kafka_batch/job_expiry"
 require_relative "kafka_batch/batch"
 require_relative "kafka_batch/schedule_poller"
 require_relative "kafka_batch/reconciler"
@@ -264,6 +267,7 @@ module KafkaBatch
       Producer.reset!
       CancellationCache.reset!
       Liveness.reset!
+      Uniqueness.reset! if defined?(Uniqueness)
       ConsumptionControl.reset!
       Fairness::Forwarder.stop! if defined?(Fairness::Forwarder)
       SchedulePoller.stop! if defined?(SchedulePoller)

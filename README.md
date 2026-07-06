@@ -36,6 +36,7 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
 - [Rake tasks](#rake-tasks)
 - [Reliability guarantees](#reliability-guarantees)
 - [Known limitations](#known-limitations)
+- [Enterprise deployment](#enterprise-deployment)
 - [Migrating from Sidekiq Pro Batches](#migrating-from-sidekiq-pro-batches)
 - [Architecture deep-dive](#architecture-deep-dive)
 - [Topic reference](#topic-reference)
@@ -78,9 +79,9 @@ Built on the [Karafka](https://karafka.io) ecosystem: **WaterDrop** for producin
    │  Karafka: EventConsumer   │
    │                          │
    │  store.record_completion_ │
-   │  by_offset(...)           │   dedup: SADD job_id to
-   │   per-batch job_id set    │   kafka_batch:b:dedup:{id}
-   │    → O(jobs per batch)    │   (absorbs redelivered AND
+   │  batch(...)               │   dedup: SETBIT batch_seq on
+   │                           │   kafka_batch:b:bitmap:{id}
+   │    → ~1 bit per job       │   (absorbs redelivered AND
    │    ├─ running ──► skip   │    re-produced events;
    │    ├─ duplicate ► skip   │    out-of-order OK)
    │    └─ done ──────────────┼──► kafka_batch.callbacks
@@ -286,6 +287,8 @@ KafkaBatch.configure do |config|
   config.liveness_backend   = :redis
   config.liveness_ttl       = 30   # seconds a heartbeat/entry is "live"
   config.track_running_jobs = true # gate :redis per-job running-state writes
+  # Performance: at high throughput (50M+ jobs/day), set false — heartbeats still
+  # work; only per-job /live writes are skipped. Default true for dashboard visibility.
 
   # ── Multi-tenant fairness (Redis-backed WFQ; Redis REQUIRED) ─────────────
   # Two lanes run at once; a worker picks one with `fairness_type :time` (default)
@@ -362,7 +365,10 @@ Every option on `KafkaBatch.config`:
 | `max_failures_per_batch` | Integer | `1000` | Cap on tracked failing jobs per batch (`store: :redis`; `0` = unlimited) |
 | `liveness_backend` | Symbol | `:redis` | `/live` source: `:redis` or `:off` (Redis-backed) |
 | `liveness_ttl` | Integer (s) | `30` | How long a heartbeat/entry is considered live |
-| `track_running_jobs` | Boolean | `true` | Gate per-job running-state writes (`:redis` liveness) |
+| `track_running_jobs` | Boolean | `true` | Gate per-job running-state writes (`:redis` liveness). **Performance:** set `false` at high throughput — see [Enterprise deployment](#enterprise-deployment) |
+| `uniq_enabled` | Boolean | `true` | Master switch for per-worker `uniq true` dedup |
+| `uniq_lock_ttl` | Integer (s) | `604800` (7d) | TTL for uniqueness locks in Redis |
+| `uniq_on_duplicate` | Symbol | `:skip` | `:skip` (return `nil`) or `:raise` (`DuplicateJobError`) on duplicate enqueue |
 | `fair_time_ingest_topic` | String | `"kafka_batch.fair_time_ingest"` | Time-lane per-tenant intake topic |
 | `fair_time_ready_topic` | String | `"kafka_batch.fair_time_ready"` | Time-lane fairly-ordered execution topic |
 | `fair_throughput_ingest_topic` | String | `"kafka_batch.fair_throughput_ingest"` | Throughput-lane per-tenant intake topic |
@@ -393,7 +399,7 @@ Every option on `KafkaBatch.config`:
 | `validate_topics_on_boot` | Boolean | `false` | Raise at boot if required topics are missing |
 | `extra_job_topics` | Array&lt;String&gt; | `[]` | Custom plain-worker topics a **UI-only** dashboard should list on the `/lag` page. Used verbatim (not prefix-aware). Only affects the config-based `/lag` fallback — worker processes that call `draw_routes` resolve custom topics from the routes automatically |
 | `schedule_store` | Symbol | `:redis` | Delayed-job (`perform_in`/`perform_at`) pointer index: `:redis` (ZSET, RAM-resident, lowest latency) or `:mysql` (`kafka_batch_scheduled_jobs` table — run its migration). Independent of `store` |
-| `schedule_poller_enabled` | Boolean | `true` | Whether **this process** runs the delayed-job poller thread. Every consumer pod polls by default; set `false` on non-scheduler pods and dedicate a small set (see [Preferred deployment](#preferred-deployment-one-deployment-per-role-same-image)). Commonly wired to an env, e.g. `ENV.fetch("KB_SCHEDULE_POLLER","true") == "true"` or a `KB_ROLE` check |
+| `schedule_poller_enabled` | Boolean | `false` | Whether **this process** runs the delayed-job poller thread. Off by default — enable on `KB_ROLE=scheduler` or `all` pods (see [Preferred deployment](#preferred-deployment-one-deployment-per-role-same-image)). Override with `KB_SCHEDULE_POLLER=true` / `false` |
 | `schedule_poll_interval` | Float (s) | `5.0` | Base poll cadence when delayed jobs are flowing |
 | `schedule_poll_max_interval` | Float (s) | `60.0` | Idle-backoff ceiling — an idle poller backs off from `schedule_poll_interval` up to this, snapping back the instant work appears |
 | `schedule_poll_jitter` | Float | `0.1` | ± randomization on the poll sleep so pods don't poll in lockstep |
@@ -421,7 +427,7 @@ The **batch ledger** (counters, completion dedup, callback claims, reconciler in
 | Migrations | None | up to 4 tables — failures, pauses, weights (`--store mysql`) + scheduled-jobs (`--schedule-store mysql`) |
 | Best for | Simplest setup, lowest ops | SQL-queryable failure log, MySQL-backed weight admin |
 
-Both modes implement the **same guarantees** (exactly-once counting via `job_id` dedup, callbacks, reconciler, open batches).
+Both modes implement the **same guarantees** (exactly-once counting via `batch_seq` bitmap dedup, callbacks, reconciler, open batches).
 
 #### 2. Live-activity backend — `config.liveness_backend` (`:redis` | `:off`)
 
@@ -438,7 +444,7 @@ Powers **only** the `/live` dashboard page. It is Redis-backed (Redis is a requi
 
 ### Batch ledger (always Redis)
 
-No migrations. Batch state is a Redis hash at `kafka_batch:b:{batch_id}` (expires after `config.batch_ttl`, refreshed on each completion). Completion dedup uses a per-batch SET at `kafka_batch:b:dedup:{batch_id}` (member = `job_id`) so out-of-order job completions on the same partition are all counted.
+No migrations. Batch state is a Redis hash at `kafka_batch:b:{batch_id}` (expires after `config.batch_ttl`, refreshed on each completion). Completion dedup uses a per-batch **bitmap** at `kafka_batch:b:bitmap:{batch_id}` (~1 bit per `batch_seq`) so mega-batches stay memory-efficient and out-of-order completions are counted exactly once.
 
 The reconciler indexes (`kafka_batch:index:running`, `kafka_batch:index:done`) and O(1) status counters (`kafka_batch:counts`) are maintained automatically.
 
@@ -622,11 +628,11 @@ Partitions are fixed at the peak; **pod count is what you autoscale.** Drive a K
 
 #### Step 4 — don't let 150 pods hammer the schedule store
 
-If you use delayed jobs (`perform_in`/`perform_at`), **every** consumer pod runs a `SchedulePoller` thread by default. That's cheap on the Redis backend (one atomic Lua call per poll) but at 150 pods on the **MySQL** backend it means 150 pods issuing `SELECT … FOR UPDATE SKIP LOCKED` on a timer. Three protections:
+If you use delayed jobs (`perform_in`/`perform_at`), the `SchedulePoller` is **off by default** (`schedule_poller_enabled = false`). Enable it only on dedicated scheduler pods — never on every consumer in a large swarm. At 150 pods on the **MySQL** backend, fanning the poller out to all pods means 150 `SELECT … FOR UPDATE SKIP LOCKED` queries on a timer. Three protections:
 
 1. **`SKIP LOCKED` / atomic claims** mean pollers never block each other — the concern is query *volume*, not contention.
 2. **Adaptive idle backoff (automatic).** Idle pollers back off from `schedule_poll_interval` (5s) to `schedule_poll_max_interval` (60s), snapping back the instant work appears — an idle fleet drops to ~1 query/pod/60s (~12× fewer). `schedule_poll_jitter` de-syncs pods; staggering across many pods keeps due-job latency low even while backed off.
-3. **Dedicate poller pods at scale (recommended).** Turn the poller off on the big swarms and run it on a small fixed set, via env: `config.schedule_poller_enabled = ENV.fetch("KB_SCHEDULE_POLLER","true") == "true"` — set `false` on your 150-pod worker Deployment and `true` on a 2–3 pod "scheduler" Deployment. Atomic claims let those few share the load with no leader election.
+3. **Dedicate poller pods (default posture).** `schedule_poller_enabled` defaults to `false` — turn it on only on a small fixed scheduler set (`KB_ROLE=scheduler`, 2–3 pods). Atomic claims let those few share the load with no leader election.
 
 See [Controlling poller load with many pods](#controlling-poller-load-with-many-pods) for details.
 
@@ -766,23 +772,24 @@ So: co-running is correct and simplest — just size `config.concurrency` for th
 
 ## Completion counting & scalability
 
-Knowing when a batch is "done" requires idempotent counting over an at-least-once event stream. KafkaBatch deduplicates by **`job_id`**: each job counts at most once toward its batch, regardless of completion order on the source partition.
+Knowing when a batch is "done" requires idempotent counting over an at-least-once event stream. KafkaBatch deduplicates by **`batch_seq`**: each job slot counts at most once toward its batch, regardless of completion order on the source partition.
 
-Each completion event carries the job message's immutable source coordinates (`src_topic`, `src_partition`, `src_offset`) for provenance and is keyed by `src_topic/src_partition` so completion processing spreads across event-topic partitions. Dedup itself uses `SADD` on `kafka_batch:b:dedup:{batch_id}` with the event's `job_id` as the member — redelivered or re-produced events for the same job are rejected; a later job with a lower source offset on the same partition is still counted.
+Each job is assigned a 1-based `batch_seq` at enqueue (`push` / `push_many` / jobs-adding-jobs via `Batch.open`). Completion events carry `batch_seq` plus the job message's immutable source coordinates (`src_topic`, `src_partition`, `src_offset`) for provenance. Events are keyed by `src_topic/src_partition` so completion processing spreads across event-topic partitions. Dedup itself is a **`GETBIT`/`SETBIT`** on `kafka_batch:b:bitmap:{batch_id}` — redelivered events for the same `batch_seq` are rejected; a later job with a lower source offset on the same partition is still counted.
 
 **Guarantees**
 
 - ✅ Exact completion counting; out-of-order parallel completions are handled correctly.
 - ✅ Horizontally scalable completion processing (per-partition event keys, not per-batch row locks).
 - ✅ Relies on the **idempotent producer** (enabled by default) so the worker topic itself can't contain produce-retry duplicates.
+- ✅ Mega-batch friendly — dedup state is **~1 bit per job** (~1.25 MB per 10M jobs), not O(jobs) UUID storage.
 
 **Trade-offs / what is *not* guaranteed**
 
 - ❌ No per-job audit in the batch ledger — only aggregate counts (`completed_count` / `failed_count`). Failures are visible in the dead-letter topic and the failure log (`/failures`).
 - ❌ `perform` still runs **at-least-once** — workers must be idempotent (unchanged).
-- ⚠️ Dedup state is O(jobs per batch) in Redis while the batch is active (expires with `batch_ttl`).
+- ⚠️ Counter updates for a single mega-batch still hit one Redis hash (`kafka_batch:b:{batch_id}`) — see [Enterprise deployment](#enterprise-deployment).
 
-> **Why no Kafka transactions?** True exactly-once read-process-write with transactional offset commits is a Karafka **Pro** feature. `job_id` dedup plus the idempotent producer reaches the same *counting* guarantee on open-source Karafka — no broker transactions required.
+> **Why no Kafka transactions?** True exactly-once read-process-write with transactional offset commits is a Karafka **Pro** feature. `batch_seq` bitmap dedup plus the idempotent producer reaches the same *counting* guarantee on open-source Karafka — no broker transactions required.
 
 ---
 
@@ -825,6 +832,52 @@ end
 ```
 
 Declare an explicit `kafka_topic` when you want a worker isolated on its own topic/partitions (independent scaling, ordering, or lag). A worker that opts into **fairness** (`fairness true`) ignores its own topic — its jobs flow through the shared ingest → ready lane and are executed by the `-jobs-fair` consumer group instead of `-jobs`.
+
+### Job uniqueness (`uniq true`)
+
+Workers can reject duplicate enqueues while an identical job (same worker class + payload arguments) is already queued in Kafka or in progress:
+
+```ruby
+class ImportUserWorker
+  include KafkaBatch::Worker
+  uniq true   # one in-flight job per unique payload
+
+  def perform(payload)
+    User.import!(payload["user_id"])
+  end
+end
+```
+
+A 64-bit **XXHash64** digest of `worker_class + canonical JSON(payload)` is stored in Redis as an **8-byte binary key suffix** (not hex) to minimise RAM. The lock is claimed at enqueue and released when the job finishes (success, DLT, or cancelled skip); retries keep the lock.
+
+| Behaviour | Config |
+|---|---|
+| Duplicate skipped, `enqueue`/`push` returns `nil` | `config.uniq_on_duplicate = :skip` (default) |
+| Duplicate raises `KafkaBatch::DuplicateJobError` | `config.uniq_on_duplicate = :raise` |
+| Lock TTL (covers queue + retries + scheduled delay) | `config.uniq_lock_ttl` (default 7 days) |
+| Master switch | `config.uniq_enabled` (default `true`) |
+
+### Job expiration (`valid_till`)
+
+Sidekiq Enterprise-style **expiration** for immediately-produced jobs (distinct from delayed `perform_in` / `enqueue_at`, which use the schedule poller). The job is produced to its normal worker topic right away; if a consumer picks it up after `valid_till`, it is sent to the dead-letter topic instead of running `#perform`.
+
+```ruby
+# Must start processing before this time or it goes to the DLT
+MyWorker.perform_async({ "order_id" => 1 }, valid_till: 30.minutes.from_now)
+
+KafkaBatch::Batch.enqueue(ProcessOrderWorker, { "id" => 1 }, valid_till: deadline)
+batch.push(ImportWorker, { "id" => 2 }, valid_till: deadline)
+```
+
+The `valid_till` field (ISO8601 UTC) is embedded in the Kafka message. Expiration is checked at:
+
+| Stage | Consumer |
+|---|---|
+| Fair-lane ingest | `Fairness::Dispatcher` |
+| Fair-lane Redis window → ready | `Fairness::Forwarder` |
+| Job execution (plain + ready + retries) | `JobConsumer` / `RetryConsumer` |
+
+Expired batch jobs emit a `failed` completion event (so the batch can finish), release any `uniq` lock, and land on the DLT with `dlt_type: "expired"`.
 
 ---
 
@@ -1086,7 +1139,7 @@ config.schedule_store = :redis   # default — ZSET, RAM-resident, lowest latenc
 config.schedule_store = :mysql   # table, disk-resident, cheap at scale, native per-job cancel
 ```
 
-**At-least-once / crash recovery.** `claim_due` moves due pointers to a *leased* state; the poller re-produces them and only then `ack`s. If a poller (or the whole process) crashes between claim and ack, the lease expires and `reclaim` — run by *any* poller in *any* process — returns the pointer to pending, so nothing is lost. Claims are atomic per backend (Redis Lua / MySQL `SELECT … FOR UPDATE SKIP LOCKED`), so every consumer process can run a poller with no double-dispatch and no leader election. Duplicates are rare and safe (completions dedup by `job_id`; the producer is idempotent).
+**At-least-once / crash recovery.** `claim_due` moves due pointers to a *leased* state; the poller re-produces them and only then `ack`s. If a poller (or the whole process) crashes between claim and ack, the lease expires and `reclaim` — run by *any* poller in *any* process — returns the pointer to pending, so nothing is lost. Claims are atomic per backend (Redis Lua / MySQL `SELECT … FOR UPDATE SKIP LOCKED`), so every consumer process can run a poller with no double-dispatch and no leader election. Duplicates are rare and safe (completions dedup by `batch_seq`; the producer is idempotent).
 
 **Cancellation.** With `:mysql`, `rake kafka_batch:cancel_scheduled JOB_ID=…` deletes the pending row and decrements its batch. With `:redis`, cancel the batch — the poller drops cancelled jobs at dispatch via the `CancellationCache`.
 
@@ -1094,18 +1147,24 @@ config.schedule_store = :mysql   # table, disk-resident, cheap at scale, native 
 
 #### Controlling poller load with many pods
 
-Every consumer pod runs one `SchedulePoller` thread. That's fine for the Redis backend (each poll is one atomic Lua call), but with the **MySQL** backend and, say, 150 pods, you don't want 150 pods issuing `SELECT … FOR UPDATE SKIP LOCKED` every few seconds. Three layers keep that in check:
+`schedule_poller_enabled` defaults to `false` — only pods where you explicitly enable it run a `SchedulePoller` thread. That's the right posture at scale; with the **MySQL** backend you especially don't want 150 pods issuing `SELECT … FOR UPDATE SKIP LOCKED` every few seconds. Three layers keep load in check when pollers are enabled:
 
 1. **`SKIP LOCKED` already prevents contention** — pollers grab disjoint rows and never block each other; the concern is query *volume*, not lock waits.
 2. **Adaptive idle backoff (automatic).** When a poll finds nothing due, each poller backs off exponentially from `schedule_poll_interval` (5s) up to `schedule_poll_max_interval` (60s), snapping back to the base cadence the instant a poll returns work. So an idle fleet settles at ~1 query per pod per 60s instead of per 5s (~12× fewer), yet ramps straight back up under load. `schedule_poll_jitter` (±10%) de-syncs pods so they never poll in lockstep — and because polls are staggered across many pods, due-job latency stays low even while each pod is backed off.
-3. **Dedicate poller pods (recommended at scale).** Turn the poller *off* on most pods and run it on a small, fixed set. Wire `schedule_poller_enabled` to an env var and set it per deployment:
+3. **Dedicated scheduler pods.** Enable the poller only on a small fixed set via `KB_ROLE=scheduler` (or `KB_SCHEDULE_POLLER=true`):
 
    ```ruby
-   config.schedule_poller_enabled = ENV.fetch("KB_SCHEDULE_POLLER", "true") == "true"
+   roles = ENV.fetch("KB_ROLE", "all").split(",").map(&:strip)
+   config.schedule_poller_enabled =
+     case ENV["KB_SCHEDULE_POLLER"]
+     when "true"  then true
+     when "false" then false
+     else (roles & %w[all scheduler]).any?
+     end
    ```
    ```yaml
-   # workers Deployment (100+ pods): KB_SCHEDULE_POLLER=false  → no polling
-   # a small "scheduler" Deployment (2–3 pods): KB_SCHEDULE_POLLER=true → polls
+   # workers Deployment (100+ pods): KB_ROLE=jobs           → no polling
+   # scheduler Deployment (2–3 pods): KB_ROLE=scheduler     → polls
    ```
    `claim_due` is atomic, so 2–3 concurrent pollers safely share the load (SKIP LOCKED hands each a disjoint slice) and give you HA without a leader election. Scale that small pool up only if the due-rate outgrows it.
 
@@ -1851,7 +1910,7 @@ bundle exec rake kafka_batch:workers
 |---|---|
 | **Batch never prematurely completes** | Store record (with exact `total_jobs`) is written before the first message is produced |
 | **Partial produce is cleaned up** | Any `StandardError` in `flush!` calls `delete_batch` to roll back the store record |
-| **Job completion is idempotent** | Per-batch `job_id` dedup (`SADD` on `kafka_batch:b:dedup:{id}`) rejects redelivered and re-produced events |
+| **Job completion is idempotent** | Per-batch `batch_seq` bitmap (`GETBIT`/`SETBIT` on `kafka_batch:b:bitmap:{id}`) rejects redelivered and re-produced events |
 | **Counter increment is atomic** | Redis Lua script (`HINCRBY` + finalize in one eval); EventConsumer pipelines a whole poll in one round-trip |
 | **Redis `create_batch` is race-free** | Lua script uses `HSETNX` as existence sentinel — single atomic operation, no TOCTOU |
 | **Callback fires at least once** | Callback is invoked, then `callback_dispatched_at` is set; duplicates are suppressed and crashes lead to safe re-invocation (callbacks must be idempotent) |
@@ -1883,6 +1942,138 @@ bundle exec rake kafka_batch:workers
 **No automatic metrics sink.** Instrumentation events are emitted via `ActiveSupport::Notifications` (see [Instrumentation](#instrumentation)) but nothing is sent to Prometheus/StatsD by default. Subscribe to the events to forward them to your metrics backend.
 
 **Fair-lane in-flight slots after a hard crash.** A fair-lane slot is normally released when the `JobConsumer` finishes a job. If a consumer is hard-killed mid-job (SIGKILL / OOM / node loss), that release never runs — so each slot is instead a **lease** that expires after `fairness_lease_ttl` (default 30 min) and is reclaimed automatically on the next checkout (and by a periodic sweep). A lane therefore self-heals rather than staying wedged, **provided `fairness_lease_ttl` exceeds your longest job runtime** — set it too low and long-running jobs get their slots reclaimed early (soft concurrency overshoot, not data loss).
+
+---
+
+## Enterprise deployment
+
+This section is for teams running **24/7 at high volume** — on the order of tens of millions of jobs per day, hundreds of consumer pods, and multi-tenant fairness — who need to understand why kafka-batch is a stronger fit than Sidekiq Pro Batches and how the architecture deliberately avoids the hot paths that break Redis-backed queues at scale.
+
+### Why kafka-batch over Sidekiq Pro Batches
+
+| Concern | Sidekiq Pro Batches | kafka-batch |
+|---|---|---|
+| **Transport durability** | Jobs live in Redis memory; broker loss or eviction is catastrophic | Kafka is the durable log — jobs survive broker restarts and are replayable |
+| **Horizontal scale unit** | One Redis thread + one process thread pool; scale-out fights a shared queue | **Partitions** are the unit of parallelism — add pods until `pods ≤ partitions` with no shared hot queue |
+| **Retry backoff** | `sleep` in the worker thread blocks the queue | Per-tier **retry topics** + Karafka `pause()` — only the retry partition waits, not the job partition |
+| **Multi-tenant fairness** | No first-class WFQ; noisy neighbour is a constant ops problem | Two independent **WFQ lanes** (time + throughput) with live weights, bounded in-flight windows, and lease-based slots |
+| **Mega-batch dedup** | Per-job Redis state grows with batch size | **`batch_seq` bitmap** — ~1 bit per job (~1.25 MB per 10M jobs vs hundreds of MB for UUID sets) |
+| **Completion counting** | Tied to Redis batch state | Events keyed by `src_topic/src_partition` — completion processing **spreads across event partitions**, not one batch row lock |
+| **Callback delivery** | Same at-least-once semantics | Same semantics, plus a **reconciler** for stuck-running and lost-callback batches |
+| **Operational split** | Monolithic Sidekiq process does everything | **Role-based deployments** (`KB_ROLE`) — scale execution swarms independently from control plane and schedulers |
+| **Cost model** | Sidekiq Pro license + large Redis RAM footprint | Open-source Karafka + commodity Kafka storage |
+
+Sidekiq Pro Batches is an excellent fit for moderate volume inside a single Redis cluster. kafka-batch targets the point where Redis becomes the bottleneck — when job volume, tenant count, or batch size pushes one shared datastore past what a single-threaded core can absorb.
+
+### How hot paths are avoided
+
+A **hot path** is any shared resource that every job must touch synchronously. Sidekiq's Redis LIST/BATCH state is one such path. kafka-batch spreads work across Kafka partitions and confines shared state to narrowly scoped Redis operations.
+
+#### 1. Execution never blocks on shared Redis
+
+```
+App → Kafka (jobs / fair ingest / scheduled) → JobConsumer → worker
+```
+
+Job messages are produced to Kafka **before** workers run. Consumer pods pull from **their assigned partitions** — no central queue, no `BRPOP` on a shared key. Throughput scales with `execution_partitions × concurrency × pod_count`.
+
+#### 2. Completion counting is partition-sharded, not batch-sharded
+
+```
+JobConsumer → Kafka events (key = src_topic/src_partition)
+            → EventConsumer (pipelines whole poll → one Redis round-trip)
+            → bitmap dedup (batch_seq) + HINCRBY in one Lua script
+```
+
+- **Event topic keys** spread completions across many partitions — a 10M-job batch does not serialize through one Kafka partition.
+- **`batch_seq` bitmap** dedup is O(1) per event and ~1 bit per job in Redis — mega-batches do not blow up memory.
+- **Pipelined Lua** — one Redis round-trip per poll, not per event.
+
+The remaining per-batch touch is the counter hash (`kafka_batch:b:{batch_id}`). For a single mega-batch completing all jobs at once, that hash still sees high write rates. Mitigation: **cap batch size** in application policy (e.g. shard a 10M fan-out into 100 × 100k batches) or accept that one enormous batch is an intentional burst.
+
+#### 3. Retries never block job partitions
+
+Failed jobs go to **tiered retry topics** (`short` / `medium` / `large`). `RetryConsumer` pauses only its retry partition until `retry_after` — the original job partition keeps draining. A 20-minute backoff does not head-of-line-block unrelated work.
+
+#### 4. Fairness isolates tenants without a global queue
+
+```
+Batch.push → fair_*_ingest (keyed by tenant_id)
+           → Dispatcher (per lane) → WFQ Scheduler (Redis, per lane)
+           → Forwarder (per lane) → fair_*_ready
+           → JobConsumer (-jobs-fair)
+```
+
+- **Ingest keyed by `tenant_id`** — tenant traffic spreads across ingest partitions.
+- **Bounded in-flight window** (`fairness_global_concurrency`) — ready topic stays shallow; a new tenant never waits behind the entire backlog.
+- **TTL leases on in-flight slots** — a hard-killed consumer cannot permanently wedge the lane; slots self-heal after `fairness_lease_ttl`.
+- **Two independent lanes** — a hot tenant in `:throughput` does not distort `:time` fairness.
+
+#### 5. Control plane is separated from execution
+
+Events, callbacks, and retries ride the **`-control`** consumer group. Long-running jobs on `-jobs` / `-jobs-fair` swarms do not delay completion counting or callback dispatch when control runs on its own small Deployment.
+
+```
+KB_ROLE=control          → events + callbacks + retries  (few pods)
+KB_ROLE=jobs             → plain execution                 (autoscale on lag)
+KB_ROLE=fair-throughput → dispatch + fair execution       (autoscale on lag)
+KB_ROLE=scheduler        → schedule poller only            (2–3 fixed pods)
+```
+
+See [Preferred deployment](#preferred-deployment-one-deployment-per-role-same-image) for the full role map.
+
+#### 6. Schedule polling is opt-in per pod
+
+`schedule_poller_enabled` defaults to `false`. Enable it only on scheduler pods (`KB_ROLE=scheduler`) so execution swarms don't fan out claim queries. At 150 pods on the **MySQL** schedule store, three layers keep load in check:
+
+- **Off by default** — worker/fair/control pods never poll unless explicitly enabled.
+- **Adaptive idle backoff** — active pollers back off to 60s between polls when idle.
+- **Dedicated scheduler pods** — 2–3 pods with `KB_ROLE=scheduler` share atomic claims.
+
+#### 7. Open batches (jobs-adding-jobs) without dedup blow-up
+
+Sidekiq-style open batches (`Batch.open` → `push` while running) reserve a monotonic `batch_seq` at enqueue. Dedup keys off **sequence**, not UUID — a batch that grows to millions of jobs does not accumulate millions of SET members.
+
+### Reference sizing (50M jobs/day, ~150 pods)
+
+The install generator ships **enterprise-oriented defaults** (dev-sized values remain in `KafkaBatch::Configuration#initialize`):
+
+| Knob | Install template default | Purpose |
+|---|---|---|
+| `fairness_global_concurrency` | `1000` | Per-lane in-flight window — fits ~150 pods × concurrency ~7 |
+| `fairness_lease_ttl` | `7200` (2 h) | Slot self-heal after hard kill; must exceed longest job |
+| `fairness_weighted_concurrency` | `true` | Weights control throughput share, not just selection order |
+| `redis_pool_size` | `10` | Per-process pool for concurrent Redis work under load |
+
+Topic partition defaults (see `KafkaBatch::Topics::DEFAULT_PARTITIONS`):
+
+| Topic class | Partitions | Rationale |
+|---|---|---|
+| Jobs / priority / fair ready | **768** | `peak_pods × concurrency` headroom |
+| Events | **48** | One msg/job but batched Redis writes — far fewer than execution |
+| Fair ingest | **64** | Sized by tenant count, not pod count |
+| Scheduled | **48** | Poller random-reads; spread produce load |
+
+Full walkthrough: [Scaling & partition sizing](#scaling--partition-sizing).
+
+### Performance notes
+
+> **Liveness:** `track_running_jobs` defaults to `true` (full per-job visibility on `/live`). At high throughput — tens of millions of jobs/day across hundreds of pods — set `config.track_running_jobs = false`. Consumer heartbeats still register; only the per-job start/finish Redis writes are skipped (two writes per job eliminated). Keep the default for dev and moderate deployments where the dashboard's in-flight job list is worth the Redis cost.
+
+### What still needs ops attention
+
+kafka-batch removes most Redis hot paths but does not eliminate Redis entirely — the batch ledger, WFQ scheduler, and reconciler lock still live there.
+
+| Remaining pressure | Mitigation |
+|---|---|
+| **Redis SPOF / single-threaded core** | Redis Cluster or Sentinel; monitor memory and `SLOWLOG`; keep ledger keys TTL-bounded |
+| **Per-batch counter hash on mega-batches** | Application batch-size policy; shard large fan-outs |
+| **`produce_sync` on worker threads** | Size pods for expected produce latency; watch broker latency |
+| **Single-threaded `Fairness::Forwarder` per lane** | Raise `fairness_global_concurrency` to match target throughput; scale fair execution pods |
+| **`track_running_jobs`** | Per-job liveness writes (2× Redis per job) — set `false` at extreme scale; see [Performance notes](#performance-notes) |
+| **Callbacks are at-least-once** | Make callback classes idempotent (same as Sidekiq Pro) |
+
+With role-split deployments, tuned partitions, bitmap dedup, and batch-size policy, kafka-batch is designed to sustain **hundreds of millions of jobs per day** without the Redis queue becoming the ceiling — the constraint moves to Kafka broker capacity and your worker CPU, which is where it should be.
 
 ---
 
@@ -1918,7 +2109,7 @@ If only M of N messages reach Kafka, the store has `total_jobs: N` but only M jo
 
 ### Why Redis Lua for completion counting?
 
-Completion dedup (`SADD job_id`) and counter increment (`HINCRBY`) run in a single Lua script per event. This avoids lost updates and double-counting without hot-row contention. The EventConsumer pipelines a whole Kafka poll into one Redis round-trip for throughput.
+Completion dedup (`GETBIT`/`SETBIT` on `batch_seq`) and counter increment (`HINCRBY`) run in a single Lua script per event. This avoids lost updates and double-counting without hot-row contention. The EventConsumer pipelines a whole Kafka poll into one Redis round-trip for throughput.
 
 ### Why separate `perform` and event-emission rescue blocks?
 
@@ -1944,7 +2135,7 @@ Callbacks are **at-least-once**: the `CallbackConsumer` invokes the callback, th
                     → Kafka DLT         PRODUCE original message + error context
 5.  RetryConsumer   pauses partition    WAIT until retry_after via Karafka pause()
                     → Kafka jobs topic  PRODUCE message back to original topic
-6.  EventConsumer   → Redis             ATOMIC job_id dedup + increment + finalize check
+6.  EventConsumer   → Redis             ATOMIC batch_seq bitmap dedup + increment + finalize check
 7.  EventConsumer   → Kafka callbacks   PRODUCE callback message (if batch done)
 8.  CallbackConsumer → callback class   INVOKE on_success / on_complete, then CLAIM
 ```
@@ -1988,7 +2179,9 @@ All keys use the `kafka_batch:` namespace. The gem never writes outside it.
 | Key pattern | Type | TTL | Contents |
 |---|---|---|---|
 | `kafka_batch:b:<batch_id>` | HASH | `batch_ttl` (refreshed on each completion) | All batch state — see fields below |
-| `kafka_batch:b:dedup:<batch_id>` | SET | `batch_ttl` | Applied `job_id` members (completion dedup) |
+| `kafka_batch:b:seq:<batch_id>` | STRING | `batch_ttl` | Monotonic `batch_seq` counter (reserved at enqueue) |
+| `kafka_batch:b:bitmap:<batch_id>` | STRING (bitmap) | `batch_ttl` | Completion dedup — 1 bit per `batch_seq` |
+| `kafka_batch:uniq:<8-byte digest>` | STRING | `uniq_lock_ttl` | Job-uniqueness lock (value = owning `job_id`; key suffix is raw 64-bit XXHash64 bytes, not hex) |
 | `kafka_batch:b:<batch_id>:failures` | HASH | `failures_ttl` | field = `job_id`, value = JSON failure record (`store: :redis` only) |
 | `kafka_batch:index:all` | ZSET | none (pruned lazily) | All batch IDs; score = `created_at` epoch. Powers the UI batch list. Capped to `all_index_max_size` |
 | `kafka_batch:index:running` | ZSET | none | Running batch IDs; score = `created_at` epoch. Used by the reconciler to find stuck-running batches |

@@ -33,6 +33,7 @@ Gem::Specification.new do |spec|
   # ── Redis store (loaded only when store: :redis) ─────────────────────────
   spec.add_dependency "redis",           ">= 4.0"
   spec.add_dependency "connection_pool", ">= 2.2"
+  spec.add_dependency "xxhash",          ">= 0.4"
 
   # ── Development ───────────────────────────────────────────────────────────
   spec.add_development_dependency "activerecord", ">= 6.0"

@@ -24,22 +24,17 @@ KafkaBatch.configure do |config|
   #          `rails g kafka_batch:install --schedule-store mysql` then `rails db:migrate`.
   config.schedule_store = :<%= @schedule_store %>
 
-  # Delayed-job poller. Every consumer pod runs one poller thread by default, which
-  # is fine for the Redis backend (atomic Lua). For the :mysql backend at high pod
-  # counts, DEDICATE a few pods to polling and turn it OFF elsewhere so 150 pods
-  # don't all query MySQL — set KB_SCHEDULE_POLLER=false on non-scheduler pods:
-  # config.schedule_poller_enabled = ENV.fetch("KB_SCHEDULE_POLLER", "true") == "true"
-  #
-  # If you deploy one Deployment per role (see the README "Preferred deployment"
-  # section), drive the poller from the same comma-separated KB_ROLE so it runs
-  # only on the scheduler/all roles, with KB_SCHEDULE_POLLER as an optional override:
-  # roles = ENV.fetch("KB_ROLE", "all").split(",").map(&:strip)
-  # config.schedule_poller_enabled =
-  #   case ENV["KB_SCHEDULE_POLLER"]
-  #   when "true"  then true
-  #   when "false" then false
-  #   else (roles & %w[all scheduler]).any?
-  #   end
+  # Delayed-job poller. Disabled by default (config.schedule_poller_enabled = false).
+  # Enable on scheduler pods — or on every pod in dev when KB_ROLE=all. For high pod
+  # counts with schedule_store=:mysql, dedicate 2–3 scheduler pods and leave this
+  # false on execution swarms so they don't all query MySQL.
+  roles = ENV.fetch("KB_ROLE", "all").split(",").map(&:strip)
+  config.schedule_poller_enabled =
+    case ENV["KB_SCHEDULE_POLLER"]
+    when "true"  then true
+    when "false" then false
+    else (roles & %w[all scheduler]).any?
+    end
   #
   # Idle pods back off automatically (schedule_poll_interval → schedule_poll_max_interval)
   # so they don't hammer the store when nothing is due; jitter de-syncs them.
@@ -140,6 +135,8 @@ KafkaBatch.configure do |config|
   # ── Other settings (sensible defaults; uncomment to tune) ─────────────────────
   # config.consumer_group          = "kafka-batch"   # overrides the prefix-derived name
   # config.liveness_backend        = :redis          # or :off
+  # config.track_running_jobs      = true            # default; set false at high throughput
+  #                                                  # (heartbeats still work; skips per-job /live writes)
   # config.liveness_stats_interval = 15              # RSS/CPU sample period for /live (0 = off)
   # config.complete_after_retries  = 3               # count a job toward its batch after N retries
   # config.reconciliation_interval = 300             # seconds between stuck-batch sweeps

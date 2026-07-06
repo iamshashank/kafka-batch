@@ -105,14 +105,18 @@ module KafkaBatch
       # Convenience wrappers so a worker reads like a Sidekiq job:
       #
       #   MyWorker.perform_async("id" => 1)          # run now
-      #   MyWorker.perform_in(5.minutes, "id" => 1)  # run in 5 minutes
+      #   MyWorker.perform_async({ "id" => 1 }, valid_till: 1.hour.from_now)
+      #   MyWorker.perform_in(5.minutes, "id" => 1)  # run in 5 minutes (schedule poller)
       #   MyWorker.perform_at(time, "id" => 1)       # run at an absolute time
       #
       # perform_in/perform_at persist the job to the delayed-job index and are
       # dispatched by the SchedulePoller when due. @return [String] job_id
 
-      def perform_async(payload = {})
-        KafkaBatch::Batch.enqueue(self, payload)
+      def perform_async(payload = {}, valid_till: nil, job_id: nil, tenant_id: nil)
+        KafkaBatch::Batch.enqueue(
+          self, payload,
+          valid_till: valid_till, job_id: job_id, tenant_id: tenant_id
+        )
       end
 
       def perform_in(interval, payload = {})
@@ -133,6 +137,25 @@ module KafkaBatch
 
       def perform_bulk_at(time, payloads)
         KafkaBatch::Batch.enqueue_many_at(time, self, payloads)
+      end
+
+      # Reject duplicate enqueues while an identical job (same worker + payload)
+      # is queued in Kafka or in progress. Uses a compact Redis lock (64-bit
+      # XXHash64 digest stored as 8 raw bytes, not hex).
+      #
+      #   uniq true
+      #
+      # @return [Boolean]
+      def uniq(enabled = :__unset__)
+        if enabled == :__unset__
+          @uniq.nil? ? false : @uniq
+        else
+          @uniq = enabled ? true : false
+        end
+      end
+
+      def uniq?
+        uniq
       end
 
       # Pin every retry of this worker to a single delay tier (e.g. :short,

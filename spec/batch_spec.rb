@@ -15,6 +15,7 @@ RSpec.describe KafkaBatch::Batch do
       expect(produced.size).to eq(2)
       expect(produced.map { |m| m.payload["batch_id"] }.uniq).to eq([batch.id])
       expect(produced.first.payload["attempt"]).to eq(0)
+      expect(produced.map { |m| m.payload["batch_seq"] }).to eq([1, 2])
     end
 
     it "holds the completion gate shut DURING the block, then fires on seal" do
@@ -24,7 +25,7 @@ RSpec.describe KafkaBatch::Batch do
         # All jobs finish while we're still populating: must NOT finalize yet.
         observed = KafkaBatch.store.record_completion_by_offset(
           batch_id: b.id, source_topic: "test.success", source_partition: 0,
-          job_id: "j1", source_offset: 1, status: "success"
+          job_id: "j1", batch_seq: 1, source_offset: 1, status: "success"
         )
       end
 
@@ -81,7 +82,7 @@ RSpec.describe KafkaBatch::Batch do
 
       result = KafkaBatch.store.record_completion_by_offset(
         batch_id: batch.id, source_topic: "test.success", source_partition: 0,
-        job_id: "j1", source_offset: 1, status: "success"
+        job_id: "j1", batch_seq: 1, source_offset: 1, status: "success"
       )
       expect(result[:status]).to eq(:done)
       expect(KafkaBatch.store.find_batch(batch.id)[:status]).to eq("success")
@@ -99,6 +100,7 @@ RSpec.describe KafkaBatch::Batch do
         produced = FakeProducer.for_topic("test.success")
         expect(produced.size).to eq(3)
         expect(produced.map { |m| m.payload["batch_id"] }.uniq).to eq([batch.id])
+        expect(produced.map { |m| m.payload["batch_seq"] }).to eq([1, 2, 3])
       end
 
       it "is a no-op for an empty array" do
@@ -226,7 +228,7 @@ RSpec.describe KafkaBatch::Batch do
         b.push(SuccessfulWorker, {})
         KafkaBatch.store.record_completion_by_offset(
           batch_id: b.id, source_topic: "test.success",
-          source_partition: 0, job_id: "j1", source_offset: 1, status: "success"
+          source_partition: 0, job_id: "j1", batch_seq: 1, source_offset: 1, status: "success"
         )
       end
       # seal! fires now that the batch is drained; callback produced above.

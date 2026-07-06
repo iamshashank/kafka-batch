@@ -27,6 +27,7 @@ module KafkaBatch
     # Kafka fetch balance — so it is exact/weighted, not approximate.
     class Dispatcher < Karafka::BaseConsumer
       prepend KafkaBatch::Consumers::ConsumptionGate
+      include KafkaBatch::Consumers::ExpiredJobHandler
 
       # How long to pause an ingest partition when a tenant's Redis ready window
       # is full, before retrying the enqueue (backpressure).
@@ -56,8 +57,19 @@ module KafkaBatch
 
         last_committed = nil
         messages.each do |message|
-          tenant = tenant_key(message.raw_payload)
-          result = sched.enqueue(tenant, message.raw_payload)
+          data = decode_ingest(message.raw_payload)
+
+          if expired_job?(data)
+            handle_expired_job(message: message, data: data, log_tag: "Fairness::Dispatcher")
+            last_committed = message
+            next
+          end
+
+          stamped = Oj.dump(JobExpiry.stamp_source!(data, topic: message.topic,
+                                                    partition: message.partition,
+                                                    offset: message.offset))
+          tenant = tenant_key_from_data(data)
+          result = sched.enqueue(tenant, stamped)
 
           if result == :full
             # Tenant's Redis window is full. Commit everything enqueued so far,
@@ -87,19 +99,24 @@ module KafkaBatch
         :time
       end
 
-      # The fairness unit. Prefer tenant_id; fall back to batch_id then job_id so
-      # jobs without an explicit tenant still flow (grouped per batch/job) — but
-      # multi-tenant fairness only works when tenant_id is set on the job.
-      def tenant_key(raw)
-        data = Oj.load(raw)
+      def decode_ingest(raw)
+        Oj.load(raw)
+      rescue StandardError
+        {}
+      end
+
+      def tenant_key_from_data(data)
         t = data["tenant_id"]
         return t if t.is_a?(String) && !t.empty?
         b = data["batch_id"]
         return b if b.is_a?(String) && !b.empty?
-        data["job_id"].to_s
-      rescue StandardError
-        # Unparseable payload: use a stable bucket so it is not silently dropped.
-        "_unparsable"
+        key = data["job_id"].to_s
+        key.empty? ? "_unparsable" : key
+      end
+
+      # @deprecated use tenant_key_from_data — kept for tests referencing tenant_key
+      def tenant_key(raw)
+        tenant_key_from_data(decode_ingest(raw))
       end
     end
   end

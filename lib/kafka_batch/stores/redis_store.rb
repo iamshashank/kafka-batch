@@ -9,6 +9,8 @@ module KafkaBatch
     class RedisStore < Base
       # Redis key layout:
       #   kafka_batch:b:{id}         – Hash of all batch fields (expires after batch_ttl)
+      #   kafka_batch:b:seq:{id}     – Integer counter; reserves 1-based batch_seq at enqueue
+      #   kafka_batch:b:bitmap:{id}  – Completion dedup bitmap (~1 bit/job; pre-sized at seal)
       #   kafka_batch:offsets        – Hash of monotonic per-partition cursors;
       #                                field = "source_topic/source_partition"
       #                                → last applied source offset. O(num_partitions),
@@ -39,23 +41,30 @@ module KafkaBatch
       # can return in O(1) instead of O(N pipelined HGETs).
       COUNTS_KEY    = "kafka_batch:counts"
 
-      # Atomically apply a completion, deduplicating by job_id (each job counts at
-      # most once regardless of completion order on the source partition), then
-      # check for batch completion.
+      # Atomically apply a completion, deduplicating by batch_seq (1-based bitmap
+      # bit) so each job counts at most once regardless of completion order.
+      #
       #   KEYS[1] = batch hash
-      #   KEYS[2] = per-batch dedup set (kafka_batch:dedup:{batch_id})
+      #   KEYS[2] = per-batch bitmap (kafka_batch:b:bitmap:{batch_id})
       #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset
       #   KEYS[5] = COUNTS_KEY hash (Bug #2: O(1) status counters)
-      #   ARGV[1] = job_id, ARGV[2] = counter field ("completed_count"|"failed_count"),
+      #   ARGV[1] = batch_seq (1-based; must be > 0)
+      #   ARGV[2] = counter field ("completed_count"|"failed_count"),
       #   ARGV[3] = ttl, ARGV[4] = now (iso8601),
       #   ARGV[5] = finished_at score (unix float as string, for DONE_INDEX zadd)
       # Returns [code, payload]:
-      #   [0, "duplicate"]  – job_id already applied (dedup)
+      #   [0, "duplicate"]  – batch_seq already applied (dedup)
       #   [0, "not_found"]  – batch hash does not exist
+      #   [0, "invalid"]    – batch_seq missing or out of range
       #   [1, outcome]      – batch just completed; outcome = "success"|"complete"
       #   [2, "continue"]   – still jobs outstanding
       BATCH_DONE_JOB_LUA = <<~LUA.freeze
-        if redis.call('SADD', KEYS[2], ARGV[1]) == 0 then return {0, 'duplicate'} end
+        local seq = tonumber(ARGV[1])
+        if not seq or seq < 1 then return {0, 'invalid'} end
+
+        local bit = seq - 1
+        if redis.call('GETBIT', KEYS[2], bit) == 1 then return {0, 'duplicate'} end
+        redis.call('SETBIT', KEYS[2], bit, 1)
         redis.call('EXPIRE', KEYS[2], tonumber(ARGV[3]))
 
         if redis.call('EXISTS', KEYS[1]) == 0 then return {0, 'not_found'} end
@@ -141,9 +150,12 @@ module KafkaBatch
         return 1
       LUA
 
-      # Grow an open batch's total_jobs. An open batch accepts jobs regardless of
-      # whether it is sealed – only completed/cancelled batches are closed.
-      # Returns: 0 not_found | 1 ok | 2 cancelled | 3 closed (finalized)
+      # Grow an open batch's total_jobs and (for positive counts) reserve a
+      # contiguous run of 1-based batch_seq values via KEYS[2] (seq counter).
+      # Returns:
+      #   0 not_found | 2 cancelled | 3 closed (finalized)
+      #   {1, seq_start, seq_end} on success when count > 0
+      #   {1} on success when count <= 0 (rollback — seq counter unchanged)
       ADD_JOBS_LUA = <<~LUA.freeze
         if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
         local status = redis.call('HGET', KEYS[1], 'status')
@@ -151,14 +163,24 @@ module KafkaBatch
         if status == 'success' or status == 'complete' then return 3 end
         local dispatched = redis.call('HGET', KEYS[1], 'callback_dispatched_at')
         if dispatched and dispatched ~= '' then return 3 end
-        redis.call('HINCRBY', KEYS[1], 'total_jobs', tonumber(ARGV[1]))
-        redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-        return 1
+        local n = tonumber(ARGV[1])
+        local ttl = tonumber(ARGV[2])
+        redis.call('HINCRBY', KEYS[1], 'total_jobs', n)
+        redis.call('EXPIRE', KEYS[1], ttl)
+        if n > 0 then
+          local seq_end = redis.call('INCRBY', KEYS[2], n)
+          redis.call('EXPIRE', KEYS[2], ttl)
+          return {1, seq_end - n + 1, seq_end}
+        end
+        return {1}
       LUA
 
       # Seal a batch (open its completion gate) and finalize if already drained.
+      # Pre-allocates the completion bitmap (KEYS[5]) to total_jobs-1 so the
+      # completion storm does not grow the string incrementally.
       #   KEYS[1] = batch hash, KEYS[2] = COUNTS_KEY (Bug #2: O(1) status counters)
       #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset (#7 fix: atomic move)
+      #   KEYS[5] = per-batch bitmap
       #   ARGV[1] = now (iso8601), ARGV[2] = ttl, ARGV[3] = now (unix float for DONE_INDEX score)
       # Returns [0,'not_found'] | [1,outcome] (just finalized) | [2,'sealed']
       SEAL_BATCH_LUA = <<~LUA.freeze
@@ -169,6 +191,12 @@ module KafkaBatch
           redis.call('HSET', KEYS[1], 'locked_at', ARGV[1])
         end
         redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+
+        local total = tonumber(redis.call('HGET', KEYS[1], 'total_jobs')) or 0
+        if total > 0 then
+          redis.call('SETBIT', KEYS[5], total - 1, 0)
+          redis.call('EXPIRE', KEYS[5], tonumber(ARGV[2]))
+        end
 
         if status == 'running' then
           local total     = tonumber(redis.call('HGET', KEYS[1], 'total_jobs'))      or 0
@@ -283,22 +311,22 @@ module KafkaBatch
         end
       end
 
-      def record_completion_by_offset(batch_id:, job_id:, source_topic:, source_partition:, source_offset:, status:)
+      def record_completion_by_offset(batch_id:, job_id:, source_topic:, source_partition:, source_offset:, status:, batch_seq:)
+        return { status: :invalid } if batch_seq.nil? || batch_seq.to_i <= 0
+
         field = status == "success" ? "completed_count" : "failed_count"
-        bkey  = batch_key(batch_id)
-        dkey  = dedup_key(batch_id)
         now   = Time.now.iso8601
 
         result = with_redis do |r|
           r.eval(BATCH_DONE_JOB_LUA,
-            keys: [bkey, dkey, RUNNING_INDEX, DONE_INDEX, COUNTS_KEY],
-            argv: [job_id.to_s, field, @ttl.to_s, now, Time.now.to_f.to_s]
+            keys: completion_lua_keys(batch_id),
+            argv: completion_lua_argv(batch_seq: batch_seq, field: field, now: now)
           )
         end
 
         code, payload = result
         case code
-        when 0 then { status: payload.to_sym }
+        when 0 then { status: payload.to_sym } # :duplicate, :not_found, :invalid
         when 1
           { status: :done, outcome: payload, batch: find_batch(batch_id) }
         when 2 then { status: :continue }
@@ -308,7 +336,7 @@ module KafkaBatch
       # Batched counter application for a whole Kafka poll. Reuses the proven
       # per-event Lua (atomic dedup + increment + finalize) but pipelines all the
       # events in one network round-trip. Each event is still exactly-once via
-      # the per-partition offset cursor, so nothing is double-counted or missed.
+      # batch_seq bitmap (O(1) per event), so nothing is double-counted.
       # @return [Array<Hash>] { batch:, outcome: } for batches that just finished
       def record_completions_batch(events)
         return [] if events.empty?
@@ -320,9 +348,11 @@ module KafkaBatch
             events.each do |e|
               field = e[:status] == "success" ? "completed_count" : "failed_count"
               pipe.eval(BATCH_DONE_JOB_LUA,
-                keys: [batch_key(e[:batch_id]), dedup_key(e[:batch_id]),
-                       RUNNING_INDEX, DONE_INDEX, COUNTS_KEY],
-                argv: [e[:job_id].to_s, field, @ttl.to_s, now, now_float])
+                keys: completion_lua_keys(e[:batch_id]),
+                argv: completion_lua_argv(
+                  batch_seq: e[:batch_seq], field: field,
+                  now: now, now_float: now_float
+                ))
             end
           end
         end
@@ -350,14 +380,20 @@ module KafkaBatch
       end
 
       def add_jobs(id, count)
-        code = with_redis do |r|
-          r.eval(ADD_JOBS_LUA, keys: [batch_key(id)], argv: [count.to_i.to_s, @ttl.to_s])
+        result = with_redis do |r|
+          r.eval(ADD_JOBS_LUA,
+            keys: [batch_key(id), seq_key(id)],
+            argv: [count.to_i.to_s, @ttl.to_s])
         end
-        case code
-        when 0 then :not_found
-        when 1 then :ok
-        when 2 then :cancelled
-        when 3 then :closed
+        case result
+        when Integer
+          add_jobs_status(result)
+        when Array
+          code = result[0]
+          status = add_jobs_status(code)
+          return status unless status == :ok && count.to_i.positive? && result[1]
+
+          { status: :ok, seq_start: result[1].to_i, seq_end: result[2].to_i }
         end
       end
 
@@ -371,7 +407,7 @@ module KafkaBatch
           # happens atomically inside Lua — no split-brain if the process crashes
           # between the Lua return and the former Ruby-side ZREM/ZADD.
           r.eval(SEAL_BATCH_LUA,
-            keys: [batch_key(id), COUNTS_KEY, RUNNING_INDEX, DONE_INDEX],
+            keys: [batch_key(id), COUNTS_KEY, RUNNING_INDEX, DONE_INDEX, bitmap_key(id)],
             argv: [now_iso, @ttl.to_s, now_f]
           )
         end
@@ -684,7 +720,7 @@ module KafkaBatch
         with_redis do |r|
           # Bug #2: decrement COUNTS_KEY before erasing the batch hash.
           st = r.hget(batch_key(id), "status")
-          r.del(batch_key(id), failures_key(id), dedup_key(id))
+          r.del(batch_key(id), failures_key(id), bitmap_key(id), seq_key(id))
           r.zrem(RUNNING_INDEX, id)
           r.zrem(DONE_INDEX, id)
           r.zrem(ALL_INDEX, id)
@@ -734,12 +770,33 @@ module KafkaBatch
         "#{batch_key(id)}:failures"
       end
 
-      def dedup_key(batch_id)
-        "#{KEY_PREFIX}:dedup:#{batch_id}"
+      def bitmap_key(batch_id)
+        "#{KEY_PREFIX}:bitmap:#{batch_id}"
       end
 
-      # Legacy per-topic offset keys (pre job_id dedup). Retained for reference;
-      # completion dedup now uses per-batch job_id sets via #dedup_key.
+      def seq_key(batch_id)
+        "#{KEY_PREFIX}:seq:#{batch_id}"
+      end
+
+      def add_jobs_status(code)
+        case code
+        when 0 then :not_found
+        when 1 then :ok
+        when 2 then :cancelled
+        when 3 then :closed
+        end
+      end
+
+      def completion_lua_keys(batch_id)
+        [batch_key(batch_id), bitmap_key(batch_id),
+         RUNNING_INDEX, DONE_INDEX, COUNTS_KEY]
+      end
+
+      def completion_lua_argv(batch_seq:, field:, now:, now_float: nil)
+        [batch_seq.to_i.to_s, field, @ttl.to_s, now, (now_float || Time.now.to_f.to_s)]
+      end
+
+      # Legacy per-topic offset keys (pre-bitmap). Retained for reference only.
       def offsets_key(source_topic)
         "kafka_batch:offsets:#{source_topic}"
       end
