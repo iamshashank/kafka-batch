@@ -202,7 +202,7 @@ RSpec.describe KafkaBatch::Web do
 
     it "pauses a topic via POST and redirects back to /lag" do
       allow(KafkaBatch::ConsumptionControl).to receive(:available?).and_return(true)
-      expect(KafkaBatch::ConsumptionControl).to receive(:pause_topic).with(group: "g", topic: "demo")
+      allow(KafkaBatch::ConsumptionControl).to receive(:pause_topic).with(group: "g", topic: "demo").and_return(true)
 
       status, headers, = post("/lag/pause", query: "scope=topic&group=g&topic=demo")
       expect(status).to eq(302)

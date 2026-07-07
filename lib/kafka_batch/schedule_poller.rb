@@ -256,7 +256,8 @@ module KafkaBatch
       KafkaBatch::Uniqueness.release_by_name(
         data["worker_class"],
         data["payload"] || {},
-        job_id: job_id
+        job_id: job_id,
+        fp:     data["_uniq_fp"]
       )
     rescue StandardError => e
       KafkaBatch.logger.warn(

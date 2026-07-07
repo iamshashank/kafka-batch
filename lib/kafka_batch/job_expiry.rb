@@ -78,7 +78,7 @@ module KafkaBatch
         "(valid_till=#{data['valid_till']}) – forwarding to DLT"
       )
 
-      if batch_id && data["batch_seq"]
+      if batch_id && data["batch_seq"] && !data["batch_counted"]
         emit_failed_event(
           data: data, batch_id: batch_id, job_id: job_id,
           worker_name: worker_name, topic: topic, partition: partition, offset: offset
@@ -87,7 +87,7 @@ module KafkaBatch
       end
 
       KafkaBatch::Uniqueness.release_by_name(
-        data["worker_class"], data["payload"] || {}, job_id: job_id
+        data["worker_class"], data["payload"] || {}, job_id: job_id, fp: data["_uniq_fp"]
       )
 
       KafkaBatch::Instrumentation.job_expired(

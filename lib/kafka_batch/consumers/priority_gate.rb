@@ -2,7 +2,8 @@ module KafkaBatch
   module Consumers
     # Mixin for lower-ranked priority consumers.  Lag checks call the Karafka
     # Admin API at most once per +priority_lag_check_interval+ seconds per
-    # consumer instance.  On error the check FAILS OPEN.
+    # consumer instance.  On error the last successful result is retained so a
+    # transient Admin failure does not silently disable prioritization.
     module PriorityGate
       # Returns true when any of the given higher-ranked topics have lag in the
       # consumer group.  Result is cached for priority_lag_check_interval
@@ -40,11 +41,11 @@ module KafkaBatch
               partitions.values.any? { |info| info[:lag].to_i.positive? }
             end
           rescue StandardError => e
-            KafkaBatch.logger.debug(
+            KafkaBatch.logger.warn(
               "[KafkaBatch][PriorityGate] lag check for #{topics.join(', ')} failed – " \
-              "failing open: #{e.message}"
+              "using last result: #{e.message}"
             )
-            false
+            @priority_last_result.nil? ? false : @priority_last_result
           end
       end
 

@@ -112,7 +112,8 @@ module KafkaBatch
         local weighted = tonumber(ARGV[6])
         local ahint    = tonumber(ARGV[7]) or 0   -- smoothed active-tenant count (cached in Ruby)
         local shint    = tonumber(ARGV[8]) or 0   -- smoothed sum of active weights (cached in Ruby)
-        local now      = tonumber(ARGV[9])  or 0
+        local t        = redis.call('TIME')
+        local now      = tonumber(t[1]) + tonumber(t[2]) / 1000000.0
         local ttl      = tonumber(ARGV[10]) or 0
         local slot_id  = ARGV[11]
         local lprefix  = ARGV[12]
@@ -245,7 +246,8 @@ module KafkaBatch
         local weighted = tonumber(ARGV[6])
         local ahint    = tonumber(ARGV[7]) or 0   -- smoothed active-tenant count (cached in Ruby)
         local shint    = tonumber(ARGV[8]) or 0   -- smoothed sum of active weights (cached in Ruby)
-        local now      = tonumber(ARGV[9])  or 0
+        local t        = redis.call('TIME')
+        local now      = tonumber(t[1]) + tonumber(t[2]) / 1000000.0
         local ttl      = tonumber(ARGV[10]) or 0
         local slot_id  = ARGV[11]
         local lprefix  = ARGV[12]

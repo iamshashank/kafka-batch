@@ -1,6 +1,11 @@
 # frozen_string_literal: true
 
 module KafkaBatch
+  # Process-lifetime mutexes for singleton initialization (avoid lazy ||= races).
+  STORE_MUTEX            = Mutex.new
+  SCHEDULER_MUTEX        = Mutex.new
+  SCHEDULE_STORE_MUTEX   = Mutex.new
+
   # Core module — configuration, store singleton, logger, and consumer-group
   # name helpers derived purely from config. No dependency on workers, consumers,
   # producers, or Karafka routing. Safe to load in a web-only process.
@@ -265,12 +270,9 @@ module KafkaBatch
     def reset!
       @configuration    = nil
       @store            = nil
-      @store_mutex      = nil
       @schedulers       = nil
-      @scheduler_mutex  = nil
       @ingest_partition_count_cache = nil
       @schedule_store_instance = nil
-      @schedule_store_mutex    = nil
       @node_id          = nil
       CancellationCache.reset! if defined?(CancellationCache)
       Liveness.reset!          if defined?(Liveness)
@@ -281,15 +283,15 @@ module KafkaBatch
     private
 
     def store_mutex
-      @store_mutex ||= Mutex.new
+      STORE_MUTEX
     end
 
     def scheduler_mutex
-      @scheduler_mutex ||= Mutex.new
+      SCHEDULER_MUTEX
     end
 
     def schedule_store_mutex
-      @schedule_store_mutex ||= Mutex.new
+      SCHEDULE_STORE_MUTEX
     end
   end
 end

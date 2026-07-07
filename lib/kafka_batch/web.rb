@@ -21,6 +21,8 @@ module KafkaBatch
   class Web
     PER_PAGE = 25
     BULK_MAX = 100  # safety cap on batch_ids per bulk request
+    BULK_ALL_MAX = 1000  # max batches per cancel_all / delete_all request
+    MAX_BODY_BYTES = 1_048_576  # 1 MiB cap on POST body reads
 
     # ── CSRF (double-submit cookie pattern) ───────────────────────────────────
     # A per-session token is set as a SameSite=Strict cookie on every response and
@@ -150,9 +152,11 @@ module KafkaBatch
       # Stamp the CSRF cookie on every response so it is always fresh.
       inject_csrf_cookie(response)
     rescue StandardError => e
-      KafkaBatch.logger.error("[KafkaBatch::Web] #{e.class}: #{e.message}")
+      KafkaBatch.logger.error(
+        "[KafkaBatch][Web] #{e.class}: #{e.message}\n#{e.backtrace&.first(8)&.join("\n")}"
+      )
       [500, html_headers,
-       [layout("Error", "<div class='card'><h2>500</h2><pre>#{h(e.message)}</pre></div>")]]
+       [layout("Error", "<div class='card'><h2>500</h2><p>An internal error occurred. Check server logs.</p></div>")]]
     end
 
     private
@@ -209,9 +213,12 @@ module KafkaBatch
       [404, html_headers, [layout("Not found", "<div class='card'><h2>404</h2><p>Not found.</p></div>")]]
     end
 
-    def redirect_to_lag(tenant_id = nil)
-      qs = tenant_id && !tenant_id.empty? ? "?tenant_id=#{url_encode(tenant_id)}" : ""
-      [302, { "location" => "#{lag_path}#{qs}", "cache-control" => "no-store", "content-type" => "text/html" }, []]
+    def redirect_to_lag(tenant_id = nil, error: nil)
+      qs = []
+      qs << "tenant_id=#{url_encode(tenant_id)}" if tenant_id && !tenant_id.to_s.empty?
+      qs << "error=#{url_encode(error)}" if error && !error.to_s.empty?
+      suffix = qs.empty? ? "" : "?#{qs.join("&")}"
+      [302, { "location" => "#{lag_path}#{suffix}", "cache-control" => "no-store", "content-type" => "text/html" }, []]
     end
 
     def redirect_to_index(params = {})
@@ -222,6 +229,9 @@ module KafkaBatch
       end
       if (q = form_param(flat, "return_q") || form_param(flat, "q"))
         qs << "q=#{url_encode(q)}"
+      end
+      if (note = form_param(flat, "bulk_note"))
+        qs << "bulk_note=#{url_encode(note)}"
       end
       page = (flat["return_page"] || flat["page"]).to_i
       qs << "page=#{page}" if page > 1
@@ -244,15 +254,17 @@ module KafkaBatch
       when "delete"
         ids.each { |id| KafkaBatch.store.delete_batch(id) }
       when "cancel_all"
-        bulk_cancel_all(
+        note = bulk_cancel_all(
           status: form_param(body, "scope_status"),
           search: form_param(body, "scope_search")
         )
+        body["bulk_note"] = note if note
       when "delete_all"
-        bulk_delete_all(
+        note = bulk_delete_all(
           status: form_param(body, "scope_status"),
           search: form_param(body, "scope_search")
         )
+        body["bulk_note"] = note if note
       end
 
       redirect_to_index(query_params.merge(body))
@@ -270,14 +282,18 @@ module KafkaBatch
 
       case [action, scope]
       when [:pause, "topic"]
-        KafkaBatch::ConsumptionControl.pause_topic(group: group, topic: topic)
+        ok = KafkaBatch::ConsumptionControl.pause_topic(group: group, topic: topic)
       when [:resume, "topic"]
-        KafkaBatch::ConsumptionControl.resume_topic(group: group, topic: topic)
+        ok = KafkaBatch::ConsumptionControl.resume_topic(group: group, topic: topic)
       when [:pause, "partition"]
-        KafkaBatch::ConsumptionControl.pause_partition(group: group, topic: topic, partition: part.to_i)
+        ok = KafkaBatch::ConsumptionControl.pause_partition(group: group, topic: topic, partition: part.to_i)
       when [:resume, "partition"]
-        KafkaBatch::ConsumptionControl.resume_partition(group: group, topic: topic, partition: part.to_i)
+        ok = KafkaBatch::ConsumptionControl.resume_partition(group: group, topic: topic, partition: part.to_i)
+      else
+        ok = true
       end
+
+      return redirect_to_lag(non_empty(params["tenant_id"]), error: "control_write_failed") unless ok
 
       redirect_to_lag(non_empty(params["tenant_id"]))
     end
@@ -1603,18 +1619,30 @@ module KafkaBatch
     end
 
     def bulk_cancel_all(status:, search:)
-      filtered_batch_ids(status: status, search: search).each do |id|
+      ids, note = limited_batch_ids(status: status, search: search)
+      ids.each do |id|
         batch = KafkaBatch.store.find_batch(id)
         next unless batch && batch[:status] == "running"
 
         KafkaBatch.store.update_batch_status(id, "cancelled")
         KafkaBatch::CancellationCache.add(id) if defined?(KafkaBatch::CancellationCache)
       end
+      note
     end
 
     def bulk_delete_all(status:, search:)
-      filtered_batch_ids(status: status, search: search).each do |id|
-        KafkaBatch.store.delete_batch(id)
+      ids, note = limited_batch_ids(status: status, search: search)
+      ids.each { |id| KafkaBatch.store.delete_batch(id) }
+      note
+    end
+
+    def limited_batch_ids(status:, search:)
+      all = filtered_batch_ids(status: status, search: search)
+      if all.size > BULK_ALL_MAX
+        note = "Processed first #{BULK_ALL_MAX} of #{all.size} matching batches; run again for the rest."
+        [all.first(BULK_ALL_MAX), note]
+      else
+        [all, nil]
       end
     end
 
@@ -1996,7 +2024,10 @@ module KafkaBatch
       return {} unless input
 
       input.rewind
-      CGI.parse(input.read)
+      raw = input.read(MAX_BODY_BYTES + 1)
+      return {} if raw.bytesize > MAX_BODY_BYTES
+
+      CGI.parse(raw)
     rescue StandardError
       {}
     end

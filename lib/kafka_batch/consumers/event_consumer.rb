@@ -1,6 +1,7 @@
 require "karafka"
 require "oj"
 require "securerandom"
+require "set"
 require "time"
 
 module KafkaBatch
@@ -129,26 +130,54 @@ module KafkaBatch
       end
 
       # Apply the deduped, aggregated counter updates and fire callbacks for any
-      # batch that just finished.
-      #
-      # Bug #18 fix: log a clear error when trigger_callbacks fails (e.g. broker
-      # outage) before re-raising. Without this the failure was silent in the logs;
-      # the reconciler covers recovery but operators need visibility immediately.
+      # batch that just finished. On offset redelivery (e.g. callback produce
+      # failed after the batch was finalized), events dedup but undispatched
+      # callbacks are retried here without waiting for the reconciler.
       def apply(events)
         return if events.empty?
 
-        KafkaBatch.store.record_completions_batch(events).each do |f|
-          begin
-            trigger_callbacks(batch: f[:batch], outcome: f[:outcome])
-          rescue KafkaBatch::ProducerError => e
-            KafkaBatch.logger.error(
-              "[KafkaBatch][EventConsumer] Failed to produce callback for " \
-              "batch_id=#{f[:batch][:id]}: #{e.message} – offset uncommitted, " \
-              "reconciler will retry."
-            )
-            raise  # leave offset uncommitted so Karafka redelivers
-          end
+        freshly_finished = KafkaBatch.store.record_completions_batch(events)
+        finished_ids     = Set.new
+
+        freshly_finished.each do |f|
+          batch = f[:batch]
+          next unless batch
+
+          finished_ids << batch[:id]
+          produce_callback_for_batch!(batch, f[:outcome])
         end
+
+        events.map { |e| e[:batch_id] }.uniq.each do |batch_id|
+          next if finished_ids.include?(batch_id)
+
+          retry_undispatched_callback(batch_id)
+        end
+      end
+
+      def produce_callback_for_batch!(batch, outcome)
+        trigger_callbacks(batch: batch, outcome: outcome)
+      rescue KafkaBatch::ProducerError => e
+        KafkaBatch.logger.error(
+          "[KafkaBatch][EventConsumer] Failed to produce callback for " \
+          "batch_id=#{batch[:id]}: #{e.message} – offset uncommitted, " \
+          "will retry on redelivery or reconciler."
+        )
+        raise
+      end
+
+      def retry_undispatched_callback(batch_id)
+        batch = KafkaBatch.store.find_batch(batch_id)
+        return unless batch
+
+        status = batch[:status].to_s
+        return unless %w[success complete].include?(status)
+        return if KafkaBatch.store.callback_dispatched?(batch_id)
+
+        KafkaBatch.logger.info(
+          "[KafkaBatch][EventConsumer] Retrying undispatched callback for " \
+          "batch_id=#{batch_id} (terminal batch, events deduped on replay)"
+        )
+        produce_callback_for_batch!(batch, status)
       end
 
       # Decode + validate one event message. Returns a normalized event Hash, or

@@ -10,11 +10,11 @@ RSpec.describe KafkaBatch::Uniqueness do
   end
 
   describe ".digest" do
-    it "returns 8 raw bytes (64-bit XXHash64, not hex)" do
+    it "returns 16 raw bytes (128-bit dual XXHash64, not hex)" do
       d = described_class.digest(UniqWorker, { "id" => 1 })
       expect(d).to be_a(String)
       expect(d.encoding).to eq(Encoding::ASCII_8BIT)
-      expect(d.bytesize).to eq(8)
+      expect(d.bytesize).to eq(16)
       expect(d).to eq(described_class.digest(UniqWorker, { "id" => 1 }))
     end
 
@@ -60,7 +60,15 @@ RSpec.describe KafkaBatch::Uniqueness do
 
       r = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
       expect(r.get(key)).to eq("jid-9")
-      expect(key.bytesize).to eq(described_class::KEY_PREFIX.bytesize + 8)
+      expect(key.bytesize).to eq(described_class::KEY_PREFIX.bytesize + 16)
+    end
+
+    it "releases using _uniq_fp from the wire message" do
+      fp = described_class.digest_hex(UniqWorker, { "id" => 42 })
+      expect(described_class.claim(UniqWorker, { "id" => 42 }, job_id: "owner")).to eq(true)
+      # Simulate JSON round-trip changing key types — fp still matches claim.
+      described_class.release_by_name(UniqWorker.name, { id: 42 }, job_id: "owner", fp: fp)
+      expect(described_class.claim(UniqWorker, { "id" => 42 }, job_id: "next")).to eq(true)
     end
   end
 end

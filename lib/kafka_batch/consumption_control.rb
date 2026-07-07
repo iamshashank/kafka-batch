@@ -42,36 +42,29 @@ module KafkaBatch
         end
       end
 
+      # @return [Boolean] false when the backend write could not be confirmed
       def pause_topic(group:, topic:)
-        case backend
-        when :redis then redis_pause_topic(group, topic)
-        when :mysql then mysql_store.pause_consumption_topic(group: group, topic: topic)
-        end
+        ok = write_pause { pause_topic_impl(group: group, topic: topic) }
         invalidate_snapshot_cache!
+        ok
       end
 
       def resume_topic(group:, topic:)
-        case backend
-        when :redis then redis_resume_topic(group, topic)
-        when :mysql then mysql_store.resume_consumption_topic(group: group, topic: topic)
-        end
+        ok = write_pause { resume_topic_impl(group: group, topic: topic) }
         invalidate_snapshot_cache!
+        ok
       end
 
       def pause_partition(group:, topic:, partition:)
-        case backend
-        when :redis then redis_pause_partition(group, topic, partition)
-        when :mysql then mysql_store.pause_consumption_partition(group: group, topic: topic, partition: partition)
-        end
+        ok = write_pause { pause_partition_impl(group: group, topic: topic, partition: partition) }
         invalidate_snapshot_cache!
+        ok
       end
 
       def resume_partition(group:, topic:, partition:)
-        case backend
-        when :redis then redis_resume_partition(group, topic, partition)
-        when :mysql then mysql_store.resume_consumption_partition(group: group, topic: topic, partition: partition)
-        end
+        ok = write_pause { resume_partition_impl(group: group, topic: topic, partition: partition) }
         invalidate_snapshot_cache!
+        ok
       end
 
       def topic_level_paused?(group:, topic:)
@@ -114,6 +107,7 @@ module KafkaBatch
 
       def reset!
         @pool = nil
+        @last_good_snapshot = nil
         cache_mutex.synchronize do
           @snapshot_cache = { at: -Float::INFINITY, snap: empty_snapshot }
         end
@@ -123,6 +117,50 @@ module KafkaBatch
       end
 
       private
+
+      def pause_topic_impl(group:, topic:)
+        case backend
+        when :redis then redis_pause_topic(group, topic)
+        when :mysql then mysql_store.pause_consumption_topic(group: group, topic: topic)
+        else false
+        end
+      end
+
+      def resume_topic_impl(group:, topic:)
+        case backend
+        when :redis then redis_resume_topic(group, topic)
+        when :mysql then mysql_store.resume_consumption_topic(group: group, topic: topic)
+        else false
+        end
+      end
+
+      def pause_partition_impl(group:, topic:, partition:)
+        case backend
+        when :redis then redis_pause_partition(group, topic, partition)
+        when :mysql then mysql_store.pause_consumption_partition(group: group, topic: topic, partition: partition)
+        else false
+        end
+      end
+
+      def resume_partition_impl(group:, topic:, partition:)
+        case backend
+        when :redis then redis_resume_partition(group, topic, partition)
+        when :mysql then mysql_store.resume_consumption_partition(group: group, topic: topic, partition: partition)
+        else false
+        end
+      end
+
+      def write_pause
+        case backend
+        when :redis, :mysql
+          !!yield
+        else
+          false
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch::ConsumptionControl] write failed: #{e.message}")
+        false
+      end
 
       def backend_mutex
         @backend_mutex ||= Mutex.new
@@ -136,6 +174,13 @@ module KafkaBatch
 
       def empty_snapshot
         { topics: Set.new, partitions: Set.new }
+      end
+
+      def remember_snapshot!(snap)
+        return unless snap
+
+        @last_good_snapshot = snap
+        snap
       end
 
       def cached_snapshot
@@ -159,16 +204,22 @@ module KafkaBatch
 
       def invalidate_snapshot_cache!
         cache_mutex.synchronize do
-          @snapshot_cache = { at: -Float::INFINITY, snap: empty_snapshot }
+          @snapshot_cache = { at: -Float::INFINITY, snap: @last_good_snapshot || empty_snapshot }
         end
       end
 
       def load_snapshot
-        case backend
-        when :redis then redis_snapshot
-        when :mysql then mysql_store.consumption_pause_snapshot
-        else empty_snapshot
-        end
+        snap = case backend
+               when :redis then redis_snapshot
+               when :mysql then mysql_store.consumption_pause_snapshot
+               else nil
+               end
+        return remember_snapshot!(snap) if snap
+
+        @last_good_snapshot || empty_snapshot
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch::ConsumptionControl] snapshot load failed: #{e.message}")
+        @last_good_snapshot || empty_snapshot
       end
 
       def redis_available?
@@ -191,19 +242,19 @@ module KafkaBatch
       end
 
       def redis_pause_topic(group, topic)
-        redis_with { |r| r.sadd(TOPICS_KEY, topic_key(group, topic)) }
+        redis_with { |r| r.sadd(TOPICS_KEY, topic_key(group, topic)) } != nil
       end
 
       def redis_resume_topic(group, topic)
-        redis_with { |r| r.srem(TOPICS_KEY, topic_key(group, topic)) }
+        redis_with { |r| r.srem(TOPICS_KEY, topic_key(group, topic)) } != nil
       end
 
       def redis_pause_partition(group, topic, partition)
-        redis_with { |r| r.sadd(PARTITIONS_KEY, partition_key(group, topic, partition)) }
+        redis_with { |r| r.sadd(PARTITIONS_KEY, partition_key(group, topic, partition)) } != nil
       end
 
       def redis_resume_partition(group, topic, partition)
-        redis_with { |r| r.srem(PARTITIONS_KEY, partition_key(group, topic, partition)) }
+        redis_with { |r| r.srem(PARTITIONS_KEY, partition_key(group, topic, partition)) } != nil
       end
 
       def redis_snapshot
@@ -212,7 +263,7 @@ module KafkaBatch
             topics:     r.smembers(TOPICS_KEY).to_set,
             partitions: r.smembers(PARTITIONS_KEY).to_set
           }
-        end || empty_snapshot
+        end
       end
 
       def redis_with
@@ -220,7 +271,7 @@ module KafkaBatch
 
         redis_pool.with { |r| yield r }
       rescue StandardError => e
-        KafkaBatch.logger.debug("[KafkaBatch::ConsumptionControl] Redis error: #{e.message}")
+        KafkaBatch.logger.warn("[KafkaBatch::ConsumptionControl] Redis error: #{e.message}")
         nil
       end
 

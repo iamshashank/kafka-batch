@@ -8,14 +8,13 @@ require "oj"
 module KafkaBatch
   # Per-worker job uniqueness backed by Redis.
   #
-  # Workers opt in with `uniq true`. A 64-bit XXHash64 digest of
-  # worker_class + canonical payload is stored as an 8-byte *binary* Redis key
+  # Workers opt in with `uniq true`. A 128-bit digest (dual XXHash64) of
+  # worker_class + canonical payload is stored as a 16-byte *binary* Redis key
   # suffix (not hex) to minimise RAM. The value is the owning job_id so release
   # is compare-and-delete safe after TTL races.
   #
-  # A lock is claimed at enqueue (immediate or scheduled) and released when the
-  # job reaches a terminal state (success, DLT, cancelled skip, scheduled drop).
-  # Retries keep the lock — the logical job is still in flight.
+  # Jobs carry `_uniq_fp` (hex) on the wire so release uses the same material
+  # as claim even after JSON round-trip.
   module Uniqueness
     KEY_PREFIX = "kafka_batch:uniq:"
 
@@ -48,14 +47,16 @@ module KafkaBatch
       end
 
       # Release by worker class name (consumer paths that may not resolve the Class).
-      def release_by_name(worker_class_name, payload, job_id:)
+      # Pass +fp+ (_uniq_fp from the job message) when available.
+      def release_by_name(worker_class_name, payload, job_id:, fp: nil)
         return unless KafkaBatch.config.uniq_enabled
         return if worker_class_name.nil? || worker_class_name.to_s.empty?
 
-        safe_release(redis_key_for_name(worker_class_name.to_s, payload), job_id)
+        key = redis_key_from_fp(fp) || redis_key_for_name(worker_class_name.to_s, payload)
+        safe_release(key, job_id)
       end
 
-      # @return [String] 8-byte binary digest (for tests / debugging)
+      # @return [String] 16 raw bytes (128-bit digest, not hex)
       def digest(worker_class, payload)
         fingerprint(worker_class.name, payload)
       end
@@ -65,9 +66,9 @@ module KafkaBatch
         @pool = nil
       end
 
-      # @return [String] 16-char hex digest (for tests / debugging / worker #uniq_hex)
+      # @return [String] 32-char hex digest (for _uniq_fp on job messages)
       def digest_hex(worker_class, payload)
-        digest(worker_class, payload).unpack1("H*")
+        fingerprint(worker_class.name, payload).unpack1("H*")
       end
 
       def digest_hex_for_name(worker_class_name, payload)
@@ -95,10 +96,24 @@ module KafkaBatch
         "#{KEY_PREFIX}#{fingerprint(name, payload)}"
       end
 
-      # Canonical material → 64-bit XXHash64 → 8-byte little-endian binary.
+      def redis_key_from_fp(fp_hex)
+        hex = fp_hex.to_s.strip
+        return nil if hex.empty?
+
+        bin = [hex].pack("H*")
+        return nil unless bin.bytesize == 16
+
+        "#{KEY_PREFIX}#{bin}"
+      rescue ArgumentError
+        nil
+      end
+
+      # Canonical material → dual XXHash64 → 16-byte little-endian binary (128-bit).
       def fingerprint(worker_class_name, payload)
         material = "#{worker_class_name}\0#{canonical_payload(payload)}"
-        [XXhash.xxh64(material) & 0xFFFF_FFFF_FFFF_FFFF].pack("Q")
+        h1 = XXhash.xxh64(material) & 0xFFFF_FFFF_FFFF_FFFF
+        h2 = XXhash.xxh64("#{material}\0uniq_salt_v1") & 0xFFFF_FFFF_FFFF_FFFF
+        [h1, h2].pack("QQ")
       end
 
       def canonical_payload(payload)

@@ -23,12 +23,15 @@ module KafkaBatch
         spec = self.class.priority_spec
         rank = spec[:rank].to_i
 
-        if rank.positive? && should_yield_to_higher?(spec)
-          yield_for_priority(spec)
-          return
+        # Per-message yield checks so weighted interleave is per job, not per
+        # poll batch (Karafka may deliver many messages per consume call).
+        messages.each do |message|
+          if rank.positive? && should_yield_to_higher?(spec)
+            yield_for_priority(spec)
+            return
+          end
+          process_message(message)
         end
-
-        super
       end
 
       private

@@ -97,6 +97,28 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
     expect(KafkaBatch.store.find_batch(id)[:completed_count]).to eq(1)
   end
 
+  it "retries an undispatched callback on redelivery after events dedup" do
+    id = SecureRandom.uuid
+    KafkaBatch.store.create_batch(id: id, total_jobs: 1, on_complete: "RecordingCallback")
+    ev = event(id: id, status: "success", src_offset: 10, batch_seq: 1)
+
+    allow(KafkaBatch::Producer).to receive(:produce_sync).and_raise(
+      KafkaBatch::ProducerError, "broker down"
+    )
+    expect { consumer.send(:apply, [consumer.send(:extract_event, ev)]) }.to raise_error(KafkaBatch::ProducerError)
+    expect(FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)).to be_empty
+    expect(KafkaBatch.store.find_batch(id)[:status]).to eq("success")
+
+    allow(KafkaBatch::Producer).to receive(:produce_sync) do |topic:, payload:, key: nil, partition: nil, headers: {}|
+      FakeProducer.record(topic: topic, payload: payload, key: key, partition: partition, headers: headers)
+    end
+    consumer.send(:apply, [consumer.send(:extract_event, ev)])
+
+    cb = FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)
+    expect(cb.size).to eq(1)
+    expect(cb.first.payload["outcome"]).to eq("success")
+  end
+
   it "skips events missing batch_seq" do
     id = SecureRandom.uuid
     KafkaBatch.store.create_batch(id: id, total_jobs: 1)

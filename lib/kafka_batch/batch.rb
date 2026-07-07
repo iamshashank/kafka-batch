@@ -588,6 +588,9 @@ module KafkaBatch
       msg["retry_tier"]  = worker_class.retry_tier.to_s if worker_class.retry_tier
       normalized_till    = JobExpiry.normalize_valid_till(valid_till)
       msg["valid_till"]  = normalized_till      if normalized_till
+      if worker_class.uniq? && KafkaBatch.config.uniq_enabled
+        msg["_uniq_fp"] = KafkaBatch::Uniqueness.digest_hex(worker_class, payload)
+      end
       msg
     end
 
