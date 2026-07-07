@@ -123,6 +123,22 @@ RSpec.describe KafkaBatch::Batch do
         expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(0)
       end
 
+      it "rolls back only the unproduced remainder on partial produce failure" do
+        batch = described_class.create
+        calls = 0
+        allow(KafkaBatch::Producer).to receive(:produce_sync) do |**args|
+          calls += 1
+          raise KafkaBatch::ProducerError, "boom" if calls >= 2
+          FakeProducer.record(
+            topic: args[:topic], payload: args[:payload],
+            key: args[:key], partition: args[:partition]
+          )
+        end
+        expect { batch.push_many(SuccessfulWorker, [{}, {}, {}]) }.to raise_error(KafkaBatch::ProducerError)
+        expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(1)
+        expect(FakeProducer.for_topic("test.success").size).to eq(1)
+      end
+
       it "rolls back the unproduced remainder on produce failure" do
         batch = described_class.create
         FakeProducer.raise_for { |topic| topic == "test.success" }

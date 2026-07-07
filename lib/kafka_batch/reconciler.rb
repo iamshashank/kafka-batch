@@ -25,7 +25,7 @@ module KafkaBatch
       start_time = Time.now
       collector  = Collector.new(triggered_by: triggered_by)
 
-      lock_result = KafkaBatch.store.with_reconciler_lock(ttl: KafkaBatch.config.reconciler_lock_ttl) do
+      lock_ok = KafkaBatch.store.with_reconciler_lock(ttl: KafkaBatch.config.reconciler_lock_ttl) do
         threshold = Time.now - older_than
         max       = [KafkaBatch.config.max_reconcile_per_run.to_i, 1].max
 
@@ -54,21 +54,25 @@ module KafkaBatch
         )
 
         collector.identify(stale_all.size, stale, lost_all.size, lost)
-        { stale: stale, lost: lost }
+
+        stale.each do |batch|
+          outcome = reconcile_running(batch)
+          collector.record_stale(batch[:id], outcome, batch: batch)
+        end
+        lost.each do |batch|
+          outcome = refire_callback(batch)
+          collector.record_lost(batch[:id], outcome, batch: batch)
+        end
+
+        KafkaBatch.store.reconcile_batch_counts! if KafkaBatch.store.respond_to?(:reconcile_batch_counts!)
+        KafkaBatch.store.purge_stale_failures! if KafkaBatch.store.respond_to?(:purge_stale_failures!)
+
+        true
       end
 
-      unless lock_result
+      unless lock_ok
         RunSummary.save_skip!
         return :lock_skipped
-      end
-
-      lock_result[:stale].each do |batch|
-        outcome = reconcile_running(batch)
-        collector.record_stale(batch[:id], outcome, batch: batch)
-      end
-      lock_result[:lost].each do |batch|
-        outcome = refire_callback(batch)
-        collector.record_lost(batch[:id], outcome, batch: batch)
       end
 
       duration = Time.now - start_time
@@ -96,6 +100,19 @@ module KafkaBatch
         "total=#{total} done=#{done}"
       )
 
+      fresh = KafkaBatch.store.find_batch(id)
+      unless fresh
+        KafkaBatch.logger.info("[KafkaBatch][Reconciler] batch_id=#{id} no longer exists – skipping")
+        return :skipped_gone
+      end
+      unless fresh[:status] == "running"
+        KafkaBatch.logger.info(
+          "[KafkaBatch][Reconciler] batch_id=#{id} is #{fresh[:status]} – skipping"
+        )
+        return :skipped_not_running
+      end
+      batch = fresh
+
       if batch[:locked_at].nil?
         KafkaBatch.logger.info(
           "[KafkaBatch][Reconciler] batch_id=#{id} is still open (unlocked) – skipping"
@@ -107,7 +124,9 @@ module KafkaBatch
         KafkaBatch.logger.info(
           "[KafkaBatch][Reconciler] batch_id=#{id} is a sealed empty batch – completing as success"
         )
-        KafkaBatch.store.mark_finished(id, "success")
+        unless KafkaBatch.store.mark_finished(id, "success")
+          return :skipped_not_running
+        end
         return :produce_failed unless produce_callback(batch.merge("outcome" => "success"))
 
         return :recovered_empty
@@ -121,7 +140,9 @@ module KafkaBatch
       end
 
       outcome = batch[:failed_count].to_i.positive? ? "complete" : "success"
-      KafkaBatch.store.mark_finished(id, outcome)
+      unless KafkaBatch.store.mark_finished(id, outcome)
+        return :skipped_not_running
+      end
 
       KafkaBatch.logger.warn(
         "[KafkaBatch][Reconciler] batch_id=#{id} transitioned to #{outcome} – producing callback"
@@ -134,13 +155,22 @@ module KafkaBatch
 
     # @return [Symbol]
     def self.refire_callback(batch)
+      id = batch[:id]
+      fresh = KafkaBatch.store.find_batch(id)
+      unless fresh && %w[success complete].include?(fresh[:status])
+        KafkaBatch.logger.info(
+          "[KafkaBatch][Reconciler] batch_id=#{id} no longer needs callback – skipping"
+        )
+        return :skipped_not_done
+      end
+
       KafkaBatch.logger.warn(
-        "[KafkaBatch][Reconciler] lost-callback batch_id=#{batch[:id]} " \
-        "status=#{batch[:status]} – re-producing callback message"
+        "[KafkaBatch][Reconciler] lost-callback batch_id=#{id} " \
+        "status=#{fresh[:status]} – re-producing callback message"
       )
 
-      ok = produce_callback(batch.merge(
-        "outcome"    => batch[:status],
+      ok = produce_callback(fresh.merge(
+        "outcome"    => fresh[:status],
         "reconciled" => true
       ))
       ok ? :refired_lost : :produce_failed

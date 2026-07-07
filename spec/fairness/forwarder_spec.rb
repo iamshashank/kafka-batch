@@ -4,6 +4,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
   before do
     KafkaBatch.config.fair_time_ready_topic = "test.ready"
     allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
+    allow(scheduler).to receive(:confirm_forward)
   end
 
   after { described_class.reset! }
@@ -13,7 +14,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
 
     it "checks out a fair job and forwards it to the ready topic with the fair-slot marker" do
       raw = Oj.dump({ "job_id" => "j1", "tenant_id" => "acme", "payload" => {} }, mode: :compat)
-      allow(scheduler).to receive(:checkout).and_return({ tenant_id: "acme", payload: raw })
+      allow(scheduler).to receive(:checkout).and_return({ tenant_id: "acme", payload: raw, slot_id: "slot-1" })
 
       expect(forwarder.forward_once).to be(true)
 
@@ -27,7 +28,7 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
 
     it "backfills tenant_id from the checkout result when the payload lacks it" do
       raw = Oj.dump({ "job_id" => "j2", "payload" => {} }, mode: :compat)
-      allow(scheduler).to receive(:checkout).and_return({ tenant_id: "globex", payload: raw })
+      allow(scheduler).to receive(:checkout).and_return({ tenant_id: "globex", payload: raw, slot_id: "slot-2" })
 
       forwarder.forward_once
 
@@ -46,16 +47,24 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
       raw = Oj.dump({ "job_id" => "j1", "tenant_id" => "acme", "payload" => {} }, mode: :compat)
       job = { tenant_id: "acme", payload: raw, slot_id: "slot-1" }
       allow(scheduler).to receive(:checkout).and_return(job)
-      allow(scheduler).to receive(:complete)
-      allow(scheduler).to receive(:enqueue).and_return(:ok)
+      allow(scheduler).to receive(:abort_forward).and_return(true)
       allow(KafkaBatch::Producer).to receive(:produce_sync).and_raise(
         KafkaBatch::ProducerError, "broker down"
       )
 
       expect(forwarder.forward_once).to be(false)
       expect(FakeProducer.for_topic("test.ready")).to be_empty
-      expect(scheduler).to have_received(:complete).with("acme", hash_including(slot_id: "slot-1", duration: 0))
-      expect(scheduler).to have_received(:enqueue).with("acme", raw)
+      expect(scheduler).to have_received(:abort_forward).with("slot-1", "acme")
+    end
+
+    it "confirms the forward after a successful produce" do
+      raw = Oj.dump({ "job_id" => "j1", "tenant_id" => "acme", "payload" => {} }, mode: :compat)
+      job = { tenant_id: "acme", payload: raw, slot_id: "slot-1" }
+      allow(scheduler).to receive(:checkout).and_return(job)
+      allow(scheduler).to receive(:confirm_forward)
+
+      expect(forwarder.forward_once).to be(true)
+      expect(scheduler).to have_received(:confirm_forward).with("slot-1")
     end
   end
 

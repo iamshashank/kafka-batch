@@ -81,7 +81,7 @@ module KafkaBatch
 
         desc "Create all KafkaBatch Kafka topics (idempotent). " \
              "Env: PARTITIONS=N forces every topic to N partitions; " \
-             "REPLICATION_FACTOR=N (default 1); " \
+             "REPLICATION_FACTOR=N (default config.topics_replication_factor, currently 3); " \
              "INCLUDE_FAIRNESS=false skips ingest/ready topics."
         task create_topics: :environment do
           # Topics is part of the full backend — not loaded when only
@@ -99,7 +99,7 @@ module KafkaBatch
           end
 
           partitions = ENV["PARTITIONS"] && !ENV["PARTITIONS"].empty? ? ENV["PARTITIONS"].to_i : nil
-          rf         = (ENV["REPLICATION_FACTOR"] || 1).to_i
+          rf         = (ENV["REPLICATION_FACTOR"] || KafkaBatch.config.topics_replication_factor).to_i
           cfg        = KafkaBatch.config
 
           puts ""

@@ -120,6 +120,18 @@ module KafkaBatch
       def size
         raise NotImplementedError, "#{self.class}#size"
       end
+
+      def record_read_miss(_member)
+        0
+      end
+
+      def read_misses(_member)
+        0
+      end
+
+      def clear_read_miss(_member)
+        nil
+      end
     end
   end
 end

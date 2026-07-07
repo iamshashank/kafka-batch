@@ -23,14 +23,13 @@ module KafkaBatch
     BULK_MAX = 100  # safety cap on batch_ids per bulk request
 
     # ── CSRF (double-submit cookie pattern) ───────────────────────────────────
-    # A random token is generated once per process. It is set as a SameSite=Strict
-    # cookie on every response and embedded in every destructive form (cancel,
-    # delete, lag/pause, lag/resume). On POST requests the submitted token (from
-    # the form field or action query string) must match the cookie value.
-    # Cross-origin requests are blocked because browsers will not send the
-    # SameSite=Strict cookie, so the attacker cannot obtain a valid token.
-    # Non-browser clients (curl, scripts) that omit the cookie bypass the check,
-    # which is intentional — those clients are not subject to CSRF.
+    # A per-session token is set as a SameSite=Strict cookie on every response and
+    # embedded in every mutating form (cancel, delete, lag/pause, lag/resume).
+    # On POST requests the cookie must be present and the submitted token (from
+    # the action query string) must match it. Cross-origin forged POSTs omit the
+    # cookie (SameSite=Strict), so they are rejected even when the attacker
+    # guesses a token in the URL. API clients must GET a page first to obtain
+    # the cookie, then replay the token on mutating POSTs.
     CSRF_COOKIE = "_kb_csrf"
     CSRF_FIELD  = "_csrf"
 
@@ -76,20 +75,21 @@ module KafkaBatch
       request_cookies = parse_cookies(env)
       @csrf_token     = request_cookies[CSRF_COOKIE] || SecureRandom.hex(16)
 
-      # Validate CSRF on mutating POSTs: submitted token must match the cookie.
-      # Non-browser clients that send no cookie value bypass the check (no cookie
-      # means no session, no cross-site vector).
+      # Validate CSRF on every mutating POST: cookie and submitted token must
+      # both be present and equal. Absent cookie rejects cross-site forgeries.
       #
       # IMPORTANT: ALL destructive forms embed _csrf in the action URL's query
       # string (not the POST body). This avoids reading rack.input, which may be
       # already consumed and non-rewindable by upstream middleware (e.g.
       # ActionDispatch::Request in Rails). params is always parsed from
       # QUERY_STRING, which middleware never consumes.
-      if method == "POST" && request_cookies.key?(CSRF_COOKIE)
-        submitted = params[CSRF_FIELD]
-        unless submitted && submitted == @csrf_token
+      if method == "POST"
+        cookie_token = request_cookies[CSRF_COOKIE]
+        submitted    = params[CSRF_FIELD]
+        unless cookie_token && submitted && submitted == cookie_token
           return inject_csrf_cookie(csrf_forbidden)
         end
+        @csrf_token = cookie_token
       end
 
       response =
@@ -1596,8 +1596,8 @@ module KafkaBatch
 
     def bulk_scope_label(status:, search:)
       parts = []
-      parts << " #{status}" if status
-      parts << " matching “#{search}”" if search
+      parts << " #{h(status)}" if status
+      parts << " matching \"#{h(search)}\"" if search
       parts << " batches" if parts.any?
       parts.empty? ? " batches" : parts.join
     end

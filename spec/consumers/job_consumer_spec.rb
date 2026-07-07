@@ -385,9 +385,12 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
     before do
       allow(KafkaBatch).to receive(:scheduler).and_return(scheduler)
       allow(scheduler).to receive(:complete)
+      allow(scheduler).to receive(:claim_slot_execution!).and_return(true)
+      allow(scheduler).to receive(:lease_ttl).and_return(1800.0)
+      allow(scheduler).to receive(:renew_lease)
     end
 
-    def fair_message(worker:, tenant:, batch_id: nil, attempt: 0, job_id: "j1")
+    def fair_message(worker:, tenant:, batch_id: nil, attempt: 0, job_id: "j1", slot_id: "lease-1")
       FakeMessage.new(
         topic:   KafkaBatch.config.fairness_ready_topic(:time),
         offset:  1,
@@ -399,7 +402,8 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
           "attempt"      => attempt,
           "max_retries"  => worker.max_retries,
           "tenant_id"    => tenant,
-          "_fair_slot"   => true
+          "_fair_slot"   => true,
+          "_fair_slot_id"=> slot_id
         }
       )
     end
@@ -423,6 +427,13 @@ RSpec.describe KafkaBatch::Consumers::JobConsumer do
 
     it "does NOT call complete for a plain (non-fair) message" do
       consumer.send(:process_message, job_message(worker: SuccessfulWorker, batch_id: "b1"))
+      expect(scheduler).not_to have_received(:complete)
+    end
+
+    it "skips duplicate fair-slot deliveries without running perform" do
+      allow(scheduler).to receive(:claim_slot_execution!).and_return(false)
+      consumer.send(:process_message, fair_message(worker: SuccessfulWorker, tenant: "acme", slot_id: "dup-slot"))
+      expect(KafkaBatchSpec::WorkerRuns.runs).to be_empty
       expect(scheduler).not_to have_received(:complete)
     end
 

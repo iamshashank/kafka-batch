@@ -6,11 +6,17 @@ RSpec.describe KafkaBatch::Web do
     )
   end
 
-  def post(path, query: "", body: nil)
+  def post(path, query: "", body: nil, csrf: true)
+    token = SecureRandom.hex(16)
+    qs = query.to_s
+    if csrf
+      qs = qs.empty? ? "_csrf=#{token}" : "#{qs}&_csrf=#{token}" unless qs.include?("_csrf=")
+    end
     env = {
       "REQUEST_METHOD" => "POST", "PATH_INFO" => path,
-      "SCRIPT_NAME" => "/kafka_batch", "QUERY_STRING" => query
+      "SCRIPT_NAME" => "/kafka_batch", "QUERY_STRING" => qs
     }
+    env["HTTP_COOKIE"] = "#{KafkaBatch::Web::CSRF_COOKIE}=#{token}" if csrf
     if body
       env["rack.input"] = StringIO.new(body)
       env["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
@@ -428,6 +434,44 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("Job failures")
       expect(html).to include("RuntimeError")
       expect(html).to include("kaboom")
+    end
+  end
+
+  describe "CSRF protection" do
+    it "rejects a forged POST without the CSRF cookie" do
+      id = seed
+      status, = post("/batches/#{id}/delete", csrf: false)
+      expect(status).to eq(403)
+      expect(KafkaBatch.store.find_batch(id)).not_to be_nil
+    end
+
+    it "rejects a POST when the submitted token does not match the cookie" do
+      id = seed
+      token = SecureRandom.hex(16)
+      env = {
+        "REQUEST_METHOD" => "POST", "PATH_INFO" => "/batches/#{id}/delete",
+        "SCRIPT_NAME" => "/kafka_batch",
+        "QUERY_STRING" => "_csrf=wrong",
+        "HTTP_COOKIE" => "#{KafkaBatch::Web::CSRF_COOKIE}=#{token}"
+      }
+      status, = KafkaBatch::Web.call(env)
+      expect(status).to eq(403)
+      expect(KafkaBatch.store.find_batch(id)).not_to be_nil
+    end
+
+    it "rejects delete_all without a CSRF cookie (cross-site forgery vector)" do
+      a = seed
+      b = seed
+      status, = post("/batches/bulk", body: "bulk_action=delete_all", csrf: false)
+      expect(status).to eq(403)
+      expect(KafkaBatch.store.find_batch(a)).not_to be_nil
+      expect(KafkaBatch.store.find_batch(b)).not_to be_nil
+    end
+
+    it "does not execute XSS in bulk confirm labels from the search param" do
+      html = get("/", query: "q=%22%3E%3Cimg%20src=x%20onerror=alert(1)%3E").last.join
+      expect(html).not_to match(/onsubmit="return confirm\('[^']*"><img/)
+      expect(html).to include("&quot;&gt;&lt;img")
     end
   end
 

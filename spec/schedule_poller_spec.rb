@@ -27,6 +27,19 @@ RSpec.describe KafkaBatch::SchedulePoller do
       @reclaim_calls += 1
       0
     end
+
+    def record_read_miss(member)
+      @misses ||= Hash.new(0)
+      @misses[member] += 1
+    end
+
+    def read_misses(member)
+      (@misses || {})[member].to_i
+    end
+
+    def clear_read_miss(member)
+      (@misses || {}).delete(member)
+    end
   end
 
   # Reader double: maps "partition:offset" -> payload string; anything listed in
@@ -158,7 +171,7 @@ RSpec.describe KafkaBatch::SchedulePoller do
     end
 
     it "snaps back to the base cadence the moment a poll returns work" do
-      store = instance_double("store", reclaim: 0, ack: nil)
+      store = instance_double("store", reclaim: 0, ack: nil, record_read_miss: 0, clear_read_miss: nil)
       # idle, idle, work, idle
       allow(store).to receive(:claim_due).and_return([], [], ["jw:0:5"], [])
       reader = FakeReader.new(found: { "0:5" => payload_for(job_id: "jw") })

@@ -101,6 +101,7 @@ module KafkaBatch
             forwarded = 0
             forwarded += 1 while forwarded < burst && running? && forward_once
             maybe_reclaim_leases
+            maybe_reclaim_stale_forwards
             sleep(idle) if forwarded.zero?
           rescue StandardError => e
             KafkaBatch.logger.error(
@@ -132,6 +133,7 @@ module KafkaBatch
           data = Oj.load(job[:payload])
           if KafkaBatch::JobExpiry.expired?(data)
             drop_expired_forwarded!(sched, job, data)
+            sched.confirm_forward(job[:slot_id])
             return true
           end
 
@@ -141,9 +143,10 @@ module KafkaBatch
             payload: payload,
             key:     job_key(payload)
           )
+          sched.confirm_forward(job[:slot_id])
           true
         rescue StandardError => e
-          recover_checkout_failure!(sched, job, e)
+          abort_forward_failure!(sched, job, e)
           false
         end
       end
@@ -161,6 +164,47 @@ module KafkaBatch
         sched = KafkaBatch.scheduler(@type)
         n = sched&.reclaim_expired_leases!.to_i
         KafkaBatch.logger.info("[KafkaBatch][Fairness::Forwarder] lane=#{@type} reclaimed #{n} expired lease(s)") if n.positive?
+      end
+
+      # Re-deliver jobs orphaned in the forwarding buffer (crash between checkout
+      # and produce/confirm). Runs on the same interval as lease reclaim.
+      def maybe_reclaim_stale_forwards
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        @last_forward_reclaim_at ||= 0.0
+        return unless (now - @last_forward_reclaim_at) >= RECLAIM_INTERVAL
+
+        @last_forward_reclaim_at = now
+        sched = KafkaBatch.scheduler(@type)
+        return unless sched
+
+        sched.list_stale_forwards.each { |entry| reclaim_stale_forward!(sched, entry) }
+      end
+
+      def reclaim_stale_forward!(sched, entry)
+        payload = mark_slot!(entry[:payload], entry[:tenant_id], entry[:slot_id])
+        KafkaBatch::Producer.produce_sync(
+          topic:   KafkaBatch.config.fairness_ready_topic(@type),
+          payload: payload,
+          key:     job_key(payload)
+        )
+        sched.confirm_forward(entry[:slot_id])
+        sched.rearm_lease(entry[:tenant_id], slot_id: entry[:slot_id])
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][Fairness::Forwarder] lane=#{@type} reclaimed stale forward " \
+          "slot=#{entry[:slot_id]} tenant=#{entry[:tenant_id]}"
+        )
+      rescue StandardError => e
+        if sched.abort_forward(entry[:slot_id], entry[:tenant_id])
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} re-enqueued stale forward " \
+            "slot=#{entry[:slot_id]} after produce failure: #{e.class}: #{e.message}"
+          )
+        else
+          KafkaBatch.logger.error(
+            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} could not recover stale forward " \
+            "slot=#{entry[:slot_id]}: #{e.class}: #{e.message}"
+          )
+        end
       end
 
       def idle_sleep
@@ -181,26 +225,22 @@ module KafkaBatch
         Oj.dump(data, mode: :compat)
       end
 
-      # Checkout is destructive (LPOP + lease). On any post-checkout failure,
-      # release the lease and push the raw payload back into the tenant window.
-      def recover_checkout_failure!(sched, job, error)
-        sched.complete(job[:tenant_id], slot_id: job[:slot_id], duration: 0)
-        case sched.enqueue(job[:tenant_id], job[:payload])
-        when :ok
+      # Checkout wrote a forwarding copy + lease. On produce failure, roll back.
+      def abort_forward_failure!(sched, job, error)
+        if sched.abort_forward(job[:slot_id], job[:tenant_id])
           KafkaBatch.logger.warn(
-            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} recovered checkout failure " \
+            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} aborted forward " \
             "for tenant=#{job[:tenant_id]}: #{error.class}: #{error.message}"
           )
-        when :full
+        else
           KafkaBatch.logger.error(
-            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} checkout failure AND tenant " \
-            "ready window full – job may be lost for tenant=#{job[:tenant_id]}: " \
-            "#{error.class}: #{error.message}"
+            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} forward failed and abort " \
+            "did not find forwarding copy tenant=#{job[:tenant_id]}: #{error.class}: #{error.message}"
           )
         end
       rescue StandardError => e
         KafkaBatch.logger.error(
-          "[KafkaBatch][Fairness::Forwarder] lane=#{@type} failed to recover checkout " \
+          "[KafkaBatch][Fairness::Forwarder] lane=#{@type} failed to abort forward " \
           "for tenant=#{job[:tenant_id]}: #{e.class}: #{e.message}"
         )
       end
@@ -215,6 +255,7 @@ module KafkaBatch
       # Checkout already claimed an in-flight lease — release it and drop the job.
       def drop_expired_forwarded!(sched, job, data)
         sched.complete(job[:tenant_id], slot_id: job[:slot_id], duration: 0)
+        sched.confirm_forward(job[:slot_id])
         topic, partition, offset = KafkaBatch::JobExpiry.source_coords(data)
         KafkaBatch::JobExpiry.drop!(
           data: data, topic: topic, partition: partition, offset: offset,

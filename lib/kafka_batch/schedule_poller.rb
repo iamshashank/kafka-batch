@@ -30,6 +30,8 @@ module KafkaBatch
     DEFAULT_LEASE         = 60
     DEFAULT_RECLAIM_EVERY = 30
     DEFAULT_BATCH_SIZE    = 100
+    # Drop a scheduled pointer after this many failed Kafka reads (poison offset).
+    MAX_READ_MISSES       = 10
 
     @mutex   = Mutex.new
     @running = false
@@ -171,7 +173,20 @@ module KafkaBatch
         end
 
         payload = found[loc]
-        next unless payload  # not fetched this pass → leave leased, reclaim retries
+        unless payload
+          misses = st.record_read_miss(p[:member])
+          if misses >= MAX_READ_MISSES
+            KafkaBatch.logger.error(
+              "[KafkaBatch][SchedulePoller] job_id=#{p[:job_id]} payload never found at " \
+              "#{KafkaBatch.config.scheduled_topic}/#{loc} after #{misses} attempts — dropping."
+            )
+            st.clear_read_miss(p[:member])
+            done << p[:member]
+          end
+          next
+        end
+
+        st.clear_read_miss(p[:member])
 
         if produce_due(payload, p[:job_id])
           acked += 1

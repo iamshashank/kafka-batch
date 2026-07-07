@@ -152,6 +152,32 @@ RSpec.describe "Fairness end-to-end (Dispatcher → Forwarder → JobConsumer)",
     expect(scheduler.stats[:inflight_total]).to eq(0) # slot released — no leak
   end
 
+  it "reclaims a stale forwarding entry after lease expiry (crash between checkout and produce)" do
+    KafkaBatch.config.fairness_forwarding_recovery_grace = 0
+    dispatch([ingest_message(tenant: "acme", job_id: "j-stale", offset: 1)])
+    expect(scheduler.ready_depth("acme")).to eq(1)
+
+    job = scheduler.checkout
+    expect(job[:payload]).to include("j-stale")
+    expect(scheduler.stats[:forwarding_depth]).to eq(1)
+    expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(:time))).to be_empty
+
+    redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+    redis.zadd(scheduler.leases, 0, job[:slot_id])
+
+    fwd = KafkaBatch::Fairness::Forwarder.new(:time)
+    fwd.send(:reclaim_stale_forward!, scheduler, {
+      slot_id: job[:slot_id], tenant_id: "acme", payload: job[:payload]
+    })
+
+    expect(scheduler.stats[:forwarding_depth]).to eq(0)
+    expect(FakeProducer.for_topic(KafkaBatch.config.fairness_ready_topic(:time)).size).to eq(1)
+    expect(scheduler.stats[:inflight_total]).to eq(1)
+
+    run_ready(ready_messages.last)
+    expect(scheduler.stats[:inflight_total]).to eq(0)
+  end
+
   it "interleaves two equally-weighted tenants fairly and leaks no slots" do
     6.times { |i| dispatch([ingest_message(tenant: "A", job_id: "a#{i}", offset: i)]) }
     6.times { |i| dispatch([ingest_message(tenant: "B", job_id: "b#{i}", offset: 100 + i)]) }

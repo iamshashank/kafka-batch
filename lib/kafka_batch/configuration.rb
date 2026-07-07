@@ -143,6 +143,9 @@ module KafkaBatch
     # job could point at an offset already removed by log cleanup. Schedules beyond
     # this are clamped down to it. Default 7 days.
     attr_accessor :max_schedule_horizon      # Integer – seconds; default 7 days
+    # Replication factor passed to KafkaBatch::Topics.create_all! when the caller
+    # does not override it. Use 1 for single-broker dev; 3+ for production.
+    attr_accessor :topics_replication_factor # Integer – default 3
 
     # ── Completion-event emission retries ────────────────────────────────────
     # After a job succeeds, the consumer produces a completion event. If that
@@ -336,14 +339,17 @@ module KafkaBatch
     attr_accessor :fairness_dispatcher_concurrency  # Integer – default 5
 
     # TTL (seconds) on a fair-lane in-flight slot. Each checkout writes a lease
-    # scored by (now + this); it is removed on completion. If a consumer dies
-    # mid-job (SIGKILL / OOM / node loss) the ensure-block release never runs, so
-    # the lease instead EXPIRES and the slot is reclaimed automatically on the
-    # next checkout that examines the tenant (and by the periodic sweep). MUST
-    # exceed your longest expected job runtime + forwarding latency — a job that
-    # runs longer than this has its slot reclaimed early (harmless soft
-    # concurrency overshoot; completion just finds no lease to remove).
+    # scored by (now + this); JobConsumer renews it while perform runs. If a
+    # consumer dies mid-job the lease expires and the slot is reclaimed. MUST
+    # exceed your longest expected job runtime — otherwise the lane admits extra
+    # jobs past the concurrency budget (see fairness_slot_dedup_ttl for duplicates).
     attr_accessor :fairness_lease_ttl               # Integer – seconds; default 1800
+    # Seconds to wait after a forwarding lease expires before reclaiming an
+    # orphaned checkout (crash between LPOP and produce/confirm). Avoids racing a
+    # slow produce on a live pod.
+    attr_accessor :fairness_forwarding_recovery_grace # Float – seconds; default 5.0
+    # TTL for per-slot execution dedup (ready-topic redelivery after reclaim).
+    attr_accessor :fairness_slot_dedup_ttl          # Integer – seconds; default 0 (= lease_ttl)
 
     # Tenants spread across the ingest topic's partitions by key hash. With too
     # few partitions tenants collide and fairness degrades. The boot check warns
@@ -418,6 +424,7 @@ module KafkaBatch
       @schedule_lease_seconds   = 60
       @schedule_reclaim_interval = 30
       @max_schedule_horizon     = 7 * 24 * 3600  # 7 days (match scheduled_topic retention)
+      @topics_replication_factor = 3
       @event_emit_retries       = 3
       @event_emit_backoff       = 1
       @redis_url                = "redis://localhost:6379/0"
@@ -442,6 +449,8 @@ module KafkaBatch
       @fairness_dispatcher_concurrency  = 5
       @fairness_min_ingest_partitions   = 2
       @fairness_lease_ttl               = 1800  # 30 min; must exceed max job runtime
+      @fairness_forwarding_recovery_grace = 5.0
+      @fairness_slot_dedup_ttl          = 0     # 0 → use fairness_lease_ttl
       @priority_lag_check_interval = 2
       @priority_config_paths         = []
       @priority_weighted_interleave  = 4

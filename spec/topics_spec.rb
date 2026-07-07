@@ -86,6 +86,25 @@ RSpec.describe KafkaBatch::Topics do
       specs = described_class.specs(replication_factor: 3)
       expect(specs.map { |s| s[:replication_factor] }).to all(eq(3))
     end
+
+    it "defaults replication factor from config" do
+      KafkaBatch.config.topics_replication_factor = 3
+      specs = described_class.specs
+      expect(specs.map { |s| s[:replication_factor] }).to all(eq(3))
+    end
+
+    it "sets scheduled topic retention above max_schedule_horizon" do
+      KafkaBatch.config.max_schedule_horizon = 7 * 24 * 3600
+      scheduled = described_class.specs.find { |s| s[:name] == KafkaBatch.config.scheduled_topic }
+      retention = scheduled[:config]["retention.ms"].to_i
+      expect(retention).to be > KafkaBatch.config.max_schedule_horizon * 1000
+    end
+
+    it "sets dead_letter topic retention and cleanup policy" do
+      dlt = described_class.specs.find { |s| s[:name] == KafkaBatch.config.dead_letter_topic }
+      expect(dlt[:config]["cleanup.policy"]).to eq("delete")
+      expect(dlt[:config]["retention.ms"].to_i).to be >= 30 * 24 * 3600 * 1000
+    end
   end
 
   describe ".create_all!" do
@@ -103,14 +122,24 @@ RSpec.describe KafkaBatch::Topics do
       expect(result[:failed]).to be_empty
     end
 
-    it "passes partition + replication factor through to Karafka::Admin" do
+    it "passes partition, replication factor, and topic config through to Karafka::Admin" do
       stub_existing([])
       allow(Karafka::Admin).to receive(:create_topic)
 
       described_class.create_all!(partitions: 4, replication_factor: 2)
 
       expect(Karafka::Admin).to have_received(:create_topic)
-        .with(KafkaBatch.config.retry_topic_for(:short), 4, 2)
+        .with(KafkaBatch.config.retry_topic_for(:short), 4, 2, {})
+      expect(Karafka::Admin).to have_received(:create_topic)
+        .with(
+          KafkaBatch.config.scheduled_topic, 4, 2,
+          hash_including("retention.ms", "cleanup.policy" => "delete")
+        )
+      expect(Karafka::Admin).to have_received(:create_topic)
+        .with(
+          KafkaBatch.config.dead_letter_topic, 4, 2,
+          hash_including("retention.ms", "cleanup.policy" => "delete")
+        )
     end
 
     it "treats an 'already exists' error as skipped, not failed" do

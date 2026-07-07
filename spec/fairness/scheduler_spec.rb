@@ -258,6 +258,10 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       expect(job[:slot_id]).to be_a(String)
       expect(scheduler.stats[:inflight_total]).to eq(1)
       expect(redis.zcard("#{scheduler.lease_prefix}A")).to eq(1)
+      expect(redis.hlen(scheduler.forwarding)).to eq(1)
+
+      scheduler.confirm_forward(job[:slot_id])
+      expect(redis.hlen(scheduler.forwarding)).to eq(0)
 
       scheduler.complete("A", slot_id: job[:slot_id])
       expect(scheduler.stats[:inflight_total]).to eq(0)
@@ -327,10 +331,64 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
     it "treats a legacy completion (no slot_id) as a harmless no-op" do
       scheduler.enqueue("A", "a0")
       job = scheduler.checkout
+      scheduler.confirm_forward(job[:slot_id])
       expect { scheduler.complete("A") }.not_to raise_error  # pre-upgrade message
       expect(scheduler.stats[:inflight_total]).to eq(1)      # real lease untouched
       scheduler.complete("A", slot_id: job[:slot_id])        # correct, id-matched release
       expect(scheduler.stats[:inflight_total]).to eq(0)
+    end
+  end
+
+  describe "reliable forward (forwarding buffer)" do
+    let(:redis) { Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL) }
+
+    it "stores payload in forwarding on checkout until confirm_forward" do
+      scheduler.enqueue("A", "a0")
+      job = scheduler.checkout
+      expect(redis.hget(scheduler.forwarding, job[:slot_id])).to eq("a0")
+      scheduler.confirm_forward(job[:slot_id])
+      expect(redis.hget(scheduler.forwarding, job[:slot_id])).to be_nil
+      scheduler.complete("A", slot_id: job[:slot_id])
+    end
+
+    it "abort_forward restores the ready queue and releases the lease" do
+      scheduler.enqueue("A", "a0")
+      job = scheduler.checkout
+      expect(scheduler.abort_forward(job[:slot_id], "A")).to be(true)
+      expect(scheduler.ready_depth("A")).to eq(1)
+      expect(scheduler.stats[:inflight_total]).to eq(0)
+      expect(redis.hget(scheduler.forwarding, job[:slot_id])).to be_nil
+    end
+
+    it "rolls back throughput vtime on abort_forward" do
+      sched = described_class.new(type: :throughput)
+      sched.enqueue("A", "a0")
+      sched.enqueue("B", "b0")
+      job = sched.checkout
+      vt_after_checkout = redis.hget(sched.vtime, "A").to_f
+      expect(vt_after_checkout).to be > 0
+
+      expect(sched.abort_forward(job[:slot_id], "A")).to be(true)
+      vt_after_abort = redis.hget(sched.vtime, "A").to_f
+      expect(vt_after_abort).to be < vt_after_checkout
+    end
+
+    it "lists stale forwards after lease expiry" do
+      KafkaBatch.config.fairness_forwarding_recovery_grace = 0
+      scheduler.enqueue("A", "a0")
+      job = scheduler.checkout
+      redis.zadd(scheduler.leases, 0, job[:slot_id])
+
+      stale = scheduler.list_stale_forwards
+      expect(stale.size).to eq(1)
+      expect(stale.first[:slot_id]).to eq(job[:slot_id])
+      expect(stale.first[:payload]).to eq("a0")
+      scheduler.abort_forward(job[:slot_id], "A")
+    end
+
+    it "claim_slot_execution! deduplicates the same slot_id" do
+      expect(scheduler.claim_slot_execution!("slot-x")).to be(true)
+      expect(scheduler.claim_slot_execution!("slot-x")).to be(false)
     end
   end
 

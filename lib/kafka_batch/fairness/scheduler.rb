@@ -1,6 +1,7 @@
 require "redis"
 require "connection_pool"
 require "securerandom"
+require "oj"
 
 module KafkaBatch
   module Fairness
@@ -11,7 +12,9 @@ module KafkaBatch
     #   * the durable backlog stays in Kafka (the lane's ingest topic);
     #   * a dispatcher copies jobs into a BOUNDED per-tenant "ready" window here;
     #   * a forwarder pulls the next job via #checkout (fair across tenants,
-    #     global concurrency budget) onto the lane's ready topic.
+    #     global concurrency budget) onto the lane's ready topic. Checkout
+    #     stages into a forwarding buffer until produce is confirmed (reliable
+    #     forward — survives crash between LPOP and produce_sync).
     #
     # ── Lane / fairness type ───────────────────────────────────────────────────
     #
@@ -92,11 +95,15 @@ module KafkaBatch
       # ARGV[5] = fetch_n (bounded scan depth; avoids full ZRANGE on large rings)
       # ARGV[6] = weighted (1 = weight-proportional per-tenant cap, 0 = equal share)
       # ARGV[9]=now  ARGV[10]=lease_ttl  ARGV[11]=slot_id  ARGV[12]=lease_prefix
+      # KEYS[5] = forwarding HASH — durable copy until produce is confirmed
+      # KEYS[6] = forwarding_meta HASH — slot_id => tenant_id for reclaim
       CHECKOUT_LUA_COUNT = <<~LUA.freeze
         local ring     = KEYS[1]
         local vth      = KEYS[2]
         local gl       = KEYS[3]   -- global leases ZSET (authoritative budget)
         local wh       = KEYS[4]
+        local fwd      = KEYS[5]   -- forwarding HASH (durable until produce confirmed)
+        local fwd_meta = KEYS[6]   -- slot_id => tenant_id
         local budget   = tonumber(ARGV[1])
         local cap      = tonumber(ARGV[2])
         local rprefix  = ARGV[3]
@@ -203,6 +210,8 @@ module KafkaBatch
                 local exp = now + ttl
                 redis.call('ZADD', gl, exp, slot_id)
                 redis.call('ZADD', lk, exp, slot_id)
+                redis.call('HSET', fwd, slot_id, job)
+                redis.call('HSET', fwd_meta, slot_id, t)
                 return {1, t, job}
               else
                 redis.call('ZREM', ring, t)  -- stale entry: self-heal
@@ -220,10 +229,14 @@ module KafkaBatch
       # WEIGHT hash (KEYS[4]) + dw (ARGV[5]) are used only for the weighted cap.
       # ARGV[6] = weighted (1 = weight-proportional per-tenant cap, 0 = equal share)
       # ARGV[9]=now  ARGV[10]=lease_ttl  ARGV[11]=slot_id  ARGV[12]=lease_prefix
+      # KEYS[4] = forwarding HASH — durable copy until produce is confirmed
+      # KEYS[5] = forwarding_meta HASH — slot_id => tenant_id for reclaim
       CHECKOUT_LUA_TIME = <<~LUA.freeze
         local ring     = KEYS[1]
         local gl       = KEYS[2]   -- global leases ZSET (authoritative budget)
         local wh       = KEYS[3]
+        local fwd      = KEYS[4]   -- forwarding HASH (durable until produce confirmed)
+        local fwd_meta = KEYS[5]   -- slot_id => tenant_id
         local budget   = tonumber(ARGV[1])
         local cap      = tonumber(ARGV[2])
         local rprefix  = ARGV[3]
@@ -317,6 +330,8 @@ module KafkaBatch
                 local exp = now + ttl
                 redis.call('ZADD', gl, exp, slot_id)
                 redis.call('ZADD', lk, exp, slot_id)
+                redis.call('HSET', fwd, slot_id, job)
+                redis.call('HSET', fwd_meta, slot_id, t)
                 return {1, t, job}
               else
                 redis.call('ZREM', ring, t)  -- stale entry: self-heal
@@ -386,6 +401,67 @@ module KafkaBatch
         return 1
       LUA
 
+      # Remove a job from the forwarding buffer after a successful produce to the
+      # ready topic. The in-flight lease remains until JobConsumer#complete.
+      #   KEYS[1]=forwarding HASH KEYS[2]=forwarding_meta HASH   ARGV[1]=slot_id
+      CONFIRM_FORWARD_LUA = <<~LUA.freeze
+        if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 1 then
+          redis.call('HDEL', KEYS[1], ARGV[1])
+          redis.call('HDEL', KEYS[2], ARGV[1])
+          return 1
+        end
+        return 0
+      LUA
+
+      # Roll back a failed forward: restore payload to the ready window, drop
+      # leases, and (throughput lane) undo the vtime advance from checkout.
+      #   KEYS[1]=forwarding KEYS[2]=forwarding_meta KEYS[3]=global leases
+      #   KEYS[4]=tenant lease KEYS[5]=ring KEYS[6]=vtime KEYS[7]=weight
+      #   ARGV[1]=slot_id ARGV[2]=tenant ARGV[3]=ready_prefix ARGV[4]=default_weight
+      ABORT_FORWARD_LUA_COUNT = <<~LUA.freeze
+        local job = redis.call('HGET', KEYS[1], ARGV[1])
+        if not job then return 0 end
+        redis.call('HDEL', KEYS[1], ARGV[1])
+        redis.call('HDEL', KEYS[2], ARGV[1])
+        redis.call('RPUSH', ARGV[3] .. ARGV[2], job)
+        redis.call('ZREM', KEYS[3], ARGV[1])
+        redis.call('ZREM', KEYS[4], ARGV[1])
+        local w = tonumber(redis.call('HGET', KEYS[7], ARGV[2]) or ARGV[4])
+        if w == nil or w <= 0 then w = tonumber(ARGV[4]) end
+        local vt = tonumber(redis.call('HGET', KEYS[6], ARGV[2]) or '0') - (1.0 / w)
+        redis.call('HSET', KEYS[6], ARGV[2], vt)
+        local rk = ARGV[3] .. ARGV[2]
+        if redis.call('LLEN', rk) > 0 then
+          redis.call('ZADD', KEYS[5], vt, ARGV[2])
+        end
+        return 1
+      LUA
+
+      # Time-lane abort: no vtime was advanced at checkout, so only restore payload
+      # and drop leases.
+      #   KEYS[1]=forwarding KEYS[2]=forwarding_meta KEYS[3]=global leases
+      #   KEYS[4]=tenant lease
+      #   ARGV[1]=slot_id ARGV[2]=tenant ARGV[3]=ready_prefix
+      ABORT_FORWARD_LUA_TIME = <<~LUA.freeze
+        local job = redis.call('HGET', KEYS[1], ARGV[1])
+        if not job then return 0 end
+        redis.call('HDEL', KEYS[1], ARGV[1])
+        redis.call('HDEL', KEYS[2], ARGV[1])
+        redis.call('RPUSH', ARGV[3] .. ARGV[2], job)
+        redis.call('ZREM', KEYS[3], ARGV[1])
+        redis.call('ZREM', KEYS[4], ARGV[1])
+        return 1
+      LUA
+
+      # Re-arm a lease after reclaiming a stale forward (produce succeeded).
+      #   KEYS[1]=global leases KEYS[2]=tenant lease
+      #   ARGV[1]=slot_id ARGV[2]=expiry_score
+      REARM_LEASE_LUA = <<~LUA.freeze
+        redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+        redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
+        return 1
+      LUA
+
       # @param type [Symbol] :time | :throughput — the fairness lane this
       #   scheduler instance drives. Determines the Redis namespace, the vtime
       #   accounting mode, and which tenant-weight set is used.
@@ -405,6 +481,9 @@ module KafkaBatch
         # from these ZSETs (ZCARD of live members), so it can never drift or pin.
         @leases           = "#{@ns}:leases"          # ZSET slot_id => expiry (authoritative GLOBAL in-flight)
         @lease_prefix     = "#{@ns}:lease:"          # ZSET per tenant: slot_id => expiry (authoritative per-tenant in-flight)
+        @forwarding       = "#{@ns}:forwarding"      # HASH slot_id => payload (until produce confirmed)
+        @forwarding_meta  = "#{@ns}:forwarding_meta" # HASH slot_id => tenant_id (for reclaim)
+        @slot_dedup_prefix = "#{@ns}:slot_dedup:"   # SETNX keys for ready-topic duplicate suppression
         @reclaim_lock     = "#{@ns}:reclaim_lock"    # single-flight lock for the periodic sweep
 
         @pool             = pool || ConnectionPool.new(size: cfg.redis_pool_size, timeout: 5) do
@@ -443,7 +522,7 @@ module KafkaBatch
       attr_reader :type
 
       # Per-lane Redis key names (exposed for tooling / tests).
-      attr_reader :ns, :ring, :vtime, :weight, :ready_prefix, :leases, :lease_prefix
+      attr_reader :ns, :ring, :vtime, :weight, :ready_prefix, :leases, :lease_prefix, :lease_ttl, :forwarding
 
       # Smoothed active-tenant view used as the cap denominator in #checkout.
       def active_view
@@ -487,18 +566,111 @@ module KafkaBatch
         res = with do |r|
           if @time_mode
             r.eval(CHECKOUT_LUA_TIME,
-              keys: [@ring, @leases, @weight],
+              keys: [@ring, @leases, @weight, @forwarding, @forwarding_meta],
               argv: [@budget.to_s, @cap.to_s, @ready_prefix, @fetch_n.to_s, @default_weight.to_s, @weighted.to_s, ahint, shint,
                      now, @lease_ttl.to_s, slot_id, @lease_prefix])
           else
             r.eval(CHECKOUT_LUA_COUNT,
-              keys: [@ring, @vtime, @leases, @weight],
+              keys: [@ring, @vtime, @leases, @weight, @forwarding, @forwarding_meta],
               argv: [@budget.to_s, @cap.to_s, @ready_prefix, @default_weight.to_s, @fetch_n.to_s, @weighted.to_s, ahint, shint,
                      now, @lease_ttl.to_s, slot_id, @lease_prefix])
           end
         end
         code, a, b = res
         code == 1 ? { tenant_id: a, payload: b, slot_id: slot_id } : nil
+      end
+
+      # Acknowledge a successful produce to the ready topic — drops the durable
+      # forwarding copy. The in-flight lease stays until JobConsumer#complete.
+      # @return [Boolean]
+      def confirm_forward(slot_id)
+        lease = slot_id.to_s
+        return false if lease.empty?
+
+        with do |r|
+          r.eval(CONFIRM_FORWARD_LUA, keys: [@forwarding, @forwarding_meta], argv: [lease]) == 1
+        end
+      end
+
+      # Roll back a checkout when produce fails or reclaim cannot forward.
+      # Restores the payload to the tenant ready window and releases the lease.
+      # @return [Boolean]
+      def abort_forward(slot_id, tenant_id)
+        lease = slot_id.to_s
+        t     = tenant_id.to_s
+        return false if lease.empty? || t.empty?
+
+        with do |r|
+          if @time_mode
+            r.eval(ABORT_FORWARD_LUA_TIME,
+              keys: [@forwarding, @forwarding_meta, @leases, "#{@lease_prefix}#{t}"],
+              argv: [lease, t, @ready_prefix])
+          else
+            r.eval(ABORT_FORWARD_LUA_COUNT,
+              keys: [@forwarding, @forwarding_meta, @leases, "#{@lease_prefix}#{t}", @ring, @vtime, @weight],
+              argv: [lease, t, @ready_prefix, @default_weight.to_s])
+          end == 1
+        end
+      end
+
+      # Orphaned forwards whose lease has expired (forwarder died mid-flight).
+      # @return [Array<Hash>] { slot_id:, tenant_id:, payload: }
+      def list_stale_forwards(now: Time.now.to_f)
+        grace = KafkaBatch.config.fairness_forwarding_recovery_grace.to_f
+        with do |r|
+          entries = r.hgetall(@forwarding)
+          return [] if entries.empty?
+
+          entries.filter_map do |slot_id, payload|
+            exp = r.zscore(@leases, slot_id)
+            unless exp.nil?
+              exp_f = exp.to_f
+              next nil if exp_f > now
+              next nil if (now - exp_f) < grace
+            end
+            tenant = r.hget(@forwarding_meta, slot_id)
+            tenant = tenant_from_payload(payload) if tenant.nil? || tenant.empty?
+            next nil if tenant.nil? || tenant.empty?
+
+            { slot_id: slot_id, tenant_id: tenant, payload: payload }
+          end
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch][Scheduler] list_stale_forwards failed: #{e.message}")
+        []
+      end
+
+      # Refresh a lease after reclaim produced to the ready topic.
+      def rearm_lease(tenant_id, slot_id:)
+        lease = slot_id.to_s
+        return if lease.empty?
+
+        expiry = Time.now.to_f + @lease_ttl
+        t      = tenant_id.to_s
+        with do |r|
+          r.eval(REARM_LEASE_LUA,
+            keys: [@leases, "#{@lease_prefix}#{t}"],
+            argv: [lease, expiry.to_s])
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][Scheduler] rearm_lease failed tenant=#{tenant_id} slot=#{slot_id}: #{e.message}"
+        )
+      end
+
+      # Claim exactly-once execution for a ready message (_fair_slot_id).
+      # @return [Boolean] true when this delivery should run perform
+      def claim_slot_execution!(slot_id)
+        lease = slot_id.to_s
+        return true if lease.empty?
+
+        ttl = slot_dedup_ttl
+        with { |r| r.set("#{@slot_dedup_prefix}#{lease}", "1", nx: true, ex: ttl) }
+      rescue StandardError => e
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][Scheduler] claim_slot_execution! failed slot=#{slot_id}: #{e.message}"
+        )
+        true
       end
 
       # Release the in-flight slot held by a tenant's finished job.
@@ -542,6 +714,24 @@ module KafkaBatch
         # Throughput-lane legacy (no lease): nothing to do — vtime advanced at
         # checkout and there is no lease to release. Skip the Redis round-trip.
         nil
+      end
+
+      # Extend an in-flight lease while a long job is still running. Prevents
+      # premature expiry from admitting extra jobs past the concurrency budget.
+      def renew_lease(tenant_id, slot_id:)
+        lease = slot_id.to_s
+        return if lease.empty?
+
+        expiry = Time.now.to_f + @lease_ttl
+        t      = tenant_id.to_s
+        with do |r|
+          r.zadd(@leases, expiry, lease, xx: true)
+          r.zadd("#{@lease_prefix}#{t}", expiry, lease, xx: true)
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.warn(
+          "[KafkaBatch][Scheduler] renew_lease failed tenant=#{tenant_id} slot=#{slot_id}: #{e.message}"
+        )
       end
 
       # Drop expired leases from the global set and every per-tenant set, freeing
@@ -637,13 +827,20 @@ module KafkaBatch
       # stale counter. Read-only: it does not prune (checkout/sweep do that).
       def stats
         now = Time.now.to_f
-        active, live = with { |r| r.multi { |m| m.zcard(@ring); m.zcount(@leases, "(#{now}", "+inf") } }
+        active, live, fwd = with do |r|
+          r.multi do |m|
+            m.zcard(@ring)
+            m.zcount(@leases, "(#{now}", "+inf")
+            m.hlen(@forwarding)
+          end
+        end
         {
-          type:           @type,
-          active_tenants: active.to_i,
-          inflight_total: live.to_i,
-          budget:         @budget,
-          window:         @window
+          type:             @type,
+          active_tenants:   active.to_i,
+          inflight_total:   live.to_i,
+          forwarding_depth: fwd.to_i,
+          budget:           @budget,
+          window:           @window
         }
       end
 
@@ -680,6 +877,26 @@ module KafkaBatch
       end
 
       private
+
+      def slot_dedup_ttl
+        ttl = KafkaBatch.config.fairness_slot_dedup_ttl.to_i
+        ttl = @lease_ttl.to_i if ttl <= 0
+        [ttl, 60].max
+      end
+
+      def tenant_from_payload(raw)
+        data = Oj.load(raw)
+        t = data["tenant_id"]
+        return t if t.is_a?(String) && !t.empty?
+
+        b = data["batch_id"]
+        return b if b.is_a?(String) && !b.empty?
+
+        key = data["job_id"].to_s
+        key.empty? ? nil : key
+      rescue StandardError
+        nil
+      end
 
       # ── Weight cache ─────────────────────────────────────────────────────────
       def cached_weights

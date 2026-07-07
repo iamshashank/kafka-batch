@@ -189,20 +189,28 @@ module KafkaBatch
         msg
       end
 
+      produced = 0
       begin
-        KafkaBatch::Producer.produce_many_sync(messages)
+        messages.each do |msg|
+          KafkaBatch::Producer.produce_sync(**msg)
+          produced += 1
+        end
       rescue StandardError
-        entries.each do |payload, job_id|
+        # produce_sync is per-message; only roll back slots that never reached Kafka.
+        entries.drop(produced).each do |payload, job_id|
           self.class.release_uniq!(worker_class, payload, job_id: job_id)
         end
-        begin
-          KafkaBatch.store.add_jobs(@id, -entries.size)
-        rescue StandardError => rollback_err
-          KafkaBatch.logger.error(
-            "[KafkaBatch][Batch] push_many rollback failed for batch_id=#{@id}: " \
-            "#{rollback_err.message}. Cancelling batch to prevent it from hanging."
-          )
-          KafkaBatch.store.update_batch_status(@id, "cancelled") rescue nil
+        unproduced = entries.size - produced
+        if unproduced.positive?
+          begin
+            KafkaBatch.store.add_jobs(@id, -unproduced)
+          rescue StandardError => rollback_err
+            KafkaBatch.logger.error(
+              "[KafkaBatch][Batch] push_many rollback failed for batch_id=#{@id}: " \
+              "#{rollback_err.message}. Leaving total_jobs unchanged — jobs already " \
+              "on Kafka will still complete."
+            )
+          end
         end
         raise
       end

@@ -14,7 +14,7 @@
 #   KAFKA_PREFIX            Topic name prefix, e.g. "myapp" → "myapp.kafka_batch.jobs"
 #                           Leave empty for no prefix (default: empty).
 #   PARTITIONS              Override partition count for EVERY topic (default: per-topic)
-#   REPLICATION_FACTOR      Replication factor for every topic   (default: 1)
+#   REPLICATION_FACTOR      Replication factor for every topic   (default: 3)
 #   KAFKA_TOPICS_CMD        Path to kafka-topics.sh or 'rpk topic'
 #                           (default: kafka-topics.sh, falls back to rpk)
 #   INCLUDE_FAIRNESS        Set to "true" to create fairness ingest/ready topics
@@ -30,7 +30,7 @@ set -euo pipefail
 BROKERS="${KAFKA_BROKERS:-localhost:9092}"
 RAW_PREFIX="${KAFKA_PREFIX:-}"
 PREFIX="${RAW_PREFIX:+${RAW_PREFIX}.}"     # "myapp" → "myapp."; empty → ""
-RF="${REPLICATION_FACTOR:-1}"
+RF="${REPLICATION_FACTOR:-3}"
 INCLUDE_FAIRNESS="${INCLUDE_FAIRNESS:-true}"
 EXTRA="${BOOTSTRAP_EXTRA_ARGS:-}"
 

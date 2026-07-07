@@ -33,14 +33,46 @@ module KafkaBatch
       ready:       768  # fairness ready (per lane): pods × concurrency
     }.freeze
 
+    # Kafka topic configs applied at creation time. Scheduled retention must
+    # exceed max_schedule_horizon so a delayed pointer never references a
+    # log-cleaned offset; dead_letter gets a long audit retention.
+    SCHEDULE_RETENTION_BUFFER_SEC = 86_400 # 1 day slack beyond max_schedule_horizon
+
+    def scheduled_retention_ms(cfg = KafkaBatch.config)
+      horizon = cfg.max_schedule_horizon.to_i
+      [(horizon + SCHEDULE_RETENTION_BUFFER_SEC) * 1000, 7 * 24 * 3600 * 1000].max
+    end
+
+    def topic_config_for(category, cfg = KafkaBatch.config)
+      case category
+      when :scheduled
+        {
+          "retention.ms"   => scheduled_retention_ms(cfg).to_s,
+          "cleanup.policy" => "delete"
+        }
+      when :dead_letter
+        {
+          "retention.ms"   => (30 * 24 * 3600 * 1000).to_s,
+          "cleanup.policy" => "delete"
+        }
+      else
+        {}
+      end
+    end
+
+    def resolved_replication_factor(replication_factor)
+      (replication_factor || KafkaBatch.config.topics_replication_factor).to_i
+    end
+
     # The full set of topics implied by the current config.
     #
     # @param partitions [Integer, nil] force this count for every topic; when nil
     #   each topic uses its DEFAULT_PARTITIONS entry.
-    # @param replication_factor [Integer]
-    # @return [Array<Hash>] specs: { name:, partitions:, replication_factor: }
-    def specs(partitions: nil, replication_factor: 1)
+    # @param replication_factor [Integer, nil] when nil uses config.topics_replication_factor
+    # @return [Array<Hash>] specs: { name:, partitions:, replication_factor:, category:, config: }
+    def specs(partitions: nil, replication_factor: nil)
       cfg   = KafkaBatch.config
+      rf    = resolved_replication_factor(replication_factor)
       specs = []
       add   = lambda do |name, category|
         return if name.nil? || name.to_s.empty?
@@ -48,7 +80,9 @@ module KafkaBatch
         specs << {
           name:               name,
           partitions:         (partitions || DEFAULT_PARTITIONS.fetch(category)).to_i,
-          replication_factor: replication_factor.to_i
+          replication_factor: rf,
+          category:           category,
+          config:             topic_config_for(category, cfg)
         }
       end
 
@@ -102,7 +136,7 @@ module KafkaBatch
     # never silently mutate them — log and skip instead).
     #
     # @return [Hash] { created: [names], skipped: [names], failed: [{name:, error:}] }
-    def create_all!(partitions: nil, replication_factor: 1, logger: KafkaBatch.logger)
+    def create_all!(partitions: nil, replication_factor: nil, logger: KafkaBatch.logger)
       unless defined?(Karafka) && defined?(Karafka::Admin)
         raise KafkaBatch::ConfigurationError,
               "Karafka::Admin is required to create topics (load Karafka first)"
@@ -119,10 +153,13 @@ module KafkaBatch
         end
 
         begin
-          Karafka::Admin.create_topic(spec[:name], spec[:partitions], spec[:replication_factor])
+          Karafka::Admin.create_topic(
+            spec[:name], spec[:partitions], spec[:replication_factor], spec[:config] || {}
+          )
           logger&.info(
             "[KafkaBatch::Topics] created #{spec[:name]} " \
-            "(partitions=#{spec[:partitions]} rf=#{spec[:replication_factor]})"
+            "(partitions=#{spec[:partitions]} rf=#{spec[:replication_factor]} " \
+            "config=#{spec[:config]})"
           )
           result[:created] << spec[:name]
         rescue StandardError => e

@@ -145,6 +145,15 @@ module KafkaBatch
         failures_scope(scope, limit, offset, include_batch_id: true)
       end
 
+      # Delete failure rows older than failures_ttl (MySQL has no per-row TTL).
+      def purge_stale_failures!(older_than: KafkaBatch.config.failures_ttl)
+        ttl = older_than.to_i
+        return 0 if ttl <= 0
+
+        cutoff = Time.now - ttl
+        failure_class.where("failed_at < ?", cutoff).delete_all
+      end
+
       # ── Consumption pause/resume (/lag dashboard) ─────────────────────────────
 
       TOPIC_PAUSE_PARTITION = -1

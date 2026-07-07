@@ -176,8 +176,9 @@ module KafkaBatch
       LUA
 
       # Seal a batch (open its completion gate) and finalize if already drained.
-      # Pre-allocates the completion bitmap (KEYS[5]) to total_jobs-1 so the
-      # completion storm does not grow the string incrementally.
+      # Pre-allocates the completion bitmap (KEYS[5]) via SETBIT at index
+      # total_jobs (one past the last live bit total_jobs-1) so the completion
+      # storm does not grow the string incrementally without touching dedup bits.
       #   KEYS[1] = batch hash, KEYS[2] = COUNTS_KEY (Bug #2: O(1) status counters)
       #   KEYS[3] = RUNNING_INDEX zset, KEYS[4] = DONE_INDEX zset (#7 fix: atomic move)
       #   KEYS[5] = per-batch bitmap
@@ -194,7 +195,7 @@ module KafkaBatch
 
         local total = tonumber(redis.call('HGET', KEYS[1], 'total_jobs')) or 0
         if total > 0 then
-          redis.call('SETBIT', KEYS[5], total - 1, 0)
+          redis.call('SETBIT', KEYS[5], total, 0)
           redis.call('EXPIRE', KEYS[5], tonumber(ARGV[2]))
         end
 
@@ -252,6 +253,21 @@ module KafkaBatch
         end
         redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
         redis.call('EXPIRE', KEYS[1], tonumber(ARGV[3]))
+        return 1
+      LUA
+
+      # Transition a batch to a terminal outcome only when it is still running.
+      #   KEYS[1]=batch hash  KEYS[2]=COUNTS_KEY  KEYS[3]=RUNNING_INDEX  KEYS[4]=DONE_INDEX
+      #   ARGV[1]=outcome  ARGV[2]=finished_at  ARGV[3]=done_score  ARGV[4]=batch_id
+      MARK_FINISHED_IF_RUNNING_LUA = <<~LUA.freeze
+        if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+        if redis.call('HGET', KEYS[1], 'status') ~= 'running' then return 0 end
+        redis.call('HSET', KEYS[1], 'status', ARGV[1])
+        redis.call('HSET', KEYS[1], 'finished_at', ARGV[2])
+        redis.call('ZREM', KEYS[3], ARGV[4])
+        redis.call('ZADD', KEYS[4], tonumber(ARGV[3]), ARGV[4])
+        redis.call('HINCRBY', KEYS[2], 'running', -1)
+        redis.call('HINCRBY', KEYS[2], ARGV[1], 1)
         return 1
       LUA
 
@@ -573,8 +589,8 @@ module KafkaBatch
           break if result.size >= limit
         end
 
-        # Lazily prune expired entries from the index.
-        with_redis { |r| expired.each { |id| r.zrem(ALL_INDEX, id) } } unless expired.empty?
+        # Lazily prune expired entries from the index and fix COUNTS_KEY drift.
+        with_redis { |r| expired.each { |id| drop_expired_batch_from_indexes(r, id) } } unless expired.empty?
 
         result
       end
@@ -621,25 +637,47 @@ module KafkaBatch
             end
           end
 
-          expired.each { |id| r.zrem(ALL_INDEX, id) } unless expired.empty?
+          expired.each { |id| drop_expired_batch_from_indexes(r, id) } unless expired.empty?
+          counts
+        end
+      end
+
+      # Rebuild COUNTS_KEY from live batch hashes (reconciler / drift heal).
+      def reconcile_batch_counts!
+        with_redis do |r|
+          ids = r.zrange(ALL_INDEX, 0, -1)
+          counts = Hash.new(0)
+          expired = []
+
+          unless ids.empty?
+            statuses = r.pipelined { |pipe| ids.each { |id| pipe.hget(batch_key(id), "status") } }
+            ids.zip(statuses).each do |id, st|
+              if st.nil? || st.empty?
+                expired << id
+              else
+                counts[st] += 1
+              end
+            end
+          end
+
+          expired.each { |id| drop_expired_batch_from_indexes(r, id) }
+
+          r.del(COUNTS_KEY)
+          counts.each { |k, v| r.hset(COUNTS_KEY, k, v) if v.positive? }
           counts
         end
       end
 
       def mark_finished(id, outcome)
         now = Time.now
-        with_redis do |r|
-          old_status = r.hget(batch_key(id), "status")
-          r.hset(batch_key(id), "status", outcome)
-          r.hset(batch_key(id), "finished_at", now.iso8601)
-          # Move from running → done so a (re-)lost callback stays recoverable.
-          r.zrem(RUNNING_INDEX, id)
-          r.zadd(DONE_INDEX, now.to_f, id)
-          if old_status == "running"
-            r.hincrby(COUNTS_KEY, "running", -1)
-            r.hincrby(COUNTS_KEY, outcome, 1)
-          end
+        result = with_redis do |r|
+          r.eval(
+            MARK_FINISHED_IF_RUNNING_LUA,
+            keys: [batch_key(id), COUNTS_KEY, RUNNING_INDEX, DONE_INDEX],
+            argv: [outcome, now.iso8601, now.to_f.to_s, id]
+          )
         end
+        result == 1
       end
 
       # Batches still in the running index that were created before +older_than+.
@@ -887,6 +925,19 @@ module KafkaBatch
 
       def presence(str)
         (str.nil? || str.empty?) ? nil : str
+      end
+
+      # Batch hash expired (TTL) but index entries linger — prune and fix COUNTS_KEY.
+      def drop_expired_batch_from_indexes(r, id)
+        if r.zscore(RUNNING_INDEX, id)
+          r.hincrby(COUNTS_KEY, "running", -1)
+        else
+          st = r.hget(batch_key(id), "status")
+          r.hincrby(COUNTS_KEY, st, -1) if st && !st.empty?
+        end
+        r.zrem(ALL_INDEX, id)
+        r.zrem(RUNNING_INDEX, id)
+        r.zrem(DONE_INDEX, id)
       end
     end
   end

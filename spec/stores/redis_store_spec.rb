@@ -65,6 +65,19 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
       expect(store.add_jobs(id, 1)).to eq(:closed)  # completed → no more jobs
     end
 
+    it "does not clear the last job dedup bit when sealing after an early completion" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 0, sealed: false)
+      store.add_jobs(id, 3)
+      complete(batch_id: id, seq: 3, status: "success")
+      expect(store.find_batch(id)[:completed_count]).to eq(1)
+
+      store.seal_batch(id)
+
+      expect(complete(batch_id: id, seq: 3, status: "success")[:status]).to eq(:duplicate)
+      expect(store.find_batch(id)[:completed_count]).to eq(1)
+    end
+
     it "a sealed but still-running batch keeps accepting jobs (jobs adding jobs)" do
       id = SecureRandom.uuid
       store.create_batch(id: id, total_jobs: 1, sealed: true)  # bare create

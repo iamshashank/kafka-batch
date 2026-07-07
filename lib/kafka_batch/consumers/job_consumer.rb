@@ -82,6 +82,13 @@ module KafkaBatch
         # or is skipped (cancelled). In :time_fairness mode complete also advances
         # the tenant's virtual time by (duration / weight). Retried messages have
         # the marker stripped (see schedule_retry), so they never double-release.
+        if fair_slot && fair_slot_id && !claim_fair_slot_execution!(fair_type, fair_slot_id)
+          KafkaBatch.logger.info(
+            "[KafkaBatch][JobConsumer] duplicate fair-slot delivery – skipping job_id=#{job_id}"
+          )
+          mark_as_consumed!(message)
+          return
+        end
 
         # Everything below runs inside begin/ensure so the fair-lane in-flight
         # slot is released exactly once on every exit path (success, retry, DLT,
@@ -151,6 +158,7 @@ module KafkaBatch
 
         started_at = Time.now
         fair_started = started_at
+        fair_renewer = start_fair_lease_renewal(fair_tenant, fair_type, fair_slot_id) if fair_slot && fair_slot_id
 
         begin
           # ── Step 1: execute the job ────────────────────────────────────
@@ -210,6 +218,7 @@ module KafkaBatch
           release_uniq_lock(data)
           mark_as_consumed!(message)
         ensure
+          stop_fair_lease_renewal(fair_renewer)
           KafkaBatch::Liveness.job_finished(job_id)
         end
         ensure
@@ -237,6 +246,41 @@ module KafkaBatch
         KafkaBatch.logger.warn(
           "[KafkaBatch][JobConsumer] fair slot release failed for tenant=#{tenant_id} lane=#{type}: #{e.message}"
         )
+      end
+
+      # Background thread extends the fairness lease while perform runs so jobs
+      # longer than fairness_lease_ttl do not admit extra work past the budget.
+      # @return [Array(Thread, Array<Boolean>)] thread + stop flag container
+      def start_fair_lease_renewal(tenant_id, type, slot_id)
+        sched = KafkaBatch.scheduler(type)
+        return nil unless sched && slot_id
+
+        stop     = [false]
+        interval = [sched.lease_ttl / 3.0, 10.0].max
+        thread   = Thread.new do
+          loop do
+            sleep(interval)
+            break if stop[0]
+            sched.renew_lease(tenant_id, slot_id: slot_id)
+          end
+        end
+        [thread, stop]
+      end
+
+      def stop_fair_lease_renewal(pair)
+        return unless pair
+
+        thread, stop = pair
+        stop[0] = true
+        thread.join(0.5) rescue nil
+      end
+
+      # Dedup ready-topic redelivery of the same _fair_slot_id (reclaim path).
+      def claim_fair_slot_execution!(type, slot_id)
+        sched = KafkaBatch.scheduler(type)
+        return true unless sched
+
+        sched.claim_slot_execution!(slot_id)
       end
 
       # ── Failure handling ─────────────────────────────────────────────────

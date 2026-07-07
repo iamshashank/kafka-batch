@@ -14,6 +14,7 @@ module KafkaBatch
     class RedisStore < Base
       PENDING  = "kafka_batch:sched:pending".freeze
       INFLIGHT = "kafka_batch:sched:inflight".freeze
+      READ_MISS = "kafka_batch:sched:read_miss".freeze
 
       # Atomically claim due members: take up to ARGV[2] members with score <= now
       # from PENDING, remove them, and add them to INFLIGHT scored at the lease
@@ -114,6 +115,19 @@ module KafkaBatch
 
       def size
         with { |r| r.zcard(PENDING) }.to_i
+      end
+
+      # Track repeated failed reads for a leased scheduled pointer (poison offset).
+      def record_read_miss(member)
+        with { |r| r.hincrby(READ_MISS, member, 1) }.to_i
+      end
+
+      def read_misses(member)
+        with { |r| r.hget(READ_MISS, member).to_i }
+      end
+
+      def clear_read_miss(member)
+        with { |r| r.hdel(READ_MISS, member) }
       end
 
       # Search by job_id. The member embeds partition:offset, so we can't ZSCORE
