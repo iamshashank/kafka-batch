@@ -42,6 +42,11 @@ type Daemon struct {
 	FairnessTimeIngest    string
 	FairnessTimeReady     string
 	FairnessReadyWindow   int
+	FairnessGlobalConcurrency int
+	FairnessMaxInflightPerTenant int
+	FairnessLeaseTTL          float64
+	FairnessDefaultWeight     float64
+	FairnessWeightedConcurrency bool
 }
 
 func DefaultDaemon() Daemon {
@@ -72,6 +77,10 @@ func DefaultDaemon() Daemon {
 		FairnessTimeIngest:   "kafka_batch.fair_time_ingest",
 		FairnessTimeReady:    "kafka_batch.fair_time_ready",
 		FairnessReadyWindow:  100,
+		FairnessGlobalConcurrency: 50,
+		FairnessLeaseTTL:          1800,
+		FairnessDefaultWeight:     1.0,
+		FairnessWeightedConcurrency: true,
 	}
 }
 
@@ -107,6 +116,11 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairnessTimeIngest    string        `yaml:"fairness_time_ingest"`
 		FairnessTimeReady     string        `yaml:"fairness_time_ready"`
 		FairnessReadyWindow   int           `yaml:"fairness_ready_window"`
+		FairnessGlobalConcurrency int       `yaml:"fairness_global_concurrency"`
+		FairnessMaxInflightPerTenant int    `yaml:"fairness_max_inflight_per_tenant"`
+		FairnessLeaseTTL          float64    `yaml:"fairness_lease_ttl"`
+		FairnessDefaultWeight     float64    `yaml:"fairness_default_weight"`
+		FairnessWeightedConcurrency bool     `yaml:"fairness_weighted_concurrency"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return cfg, err
@@ -173,6 +187,21 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.FairnessReadyWindow > 0 {
 		cfg.FairnessReadyWindow = doc.FairnessReadyWindow
+	}
+	if doc.FairnessGlobalConcurrency > 0 {
+		cfg.FairnessGlobalConcurrency = doc.FairnessGlobalConcurrency
+	}
+	if doc.FairnessMaxInflightPerTenant > 0 {
+		cfg.FairnessMaxInflightPerTenant = doc.FairnessMaxInflightPerTenant
+	}
+	if doc.FairnessLeaseTTL > 0 {
+		cfg.FairnessLeaseTTL = doc.FairnessLeaseTTL
+	}
+	if doc.FairnessDefaultWeight > 0 {
+		cfg.FairnessDefaultWeight = doc.FairnessDefaultWeight
+	}
+	if doc.FairnessWeightedConcurrency {
+		cfg.FairnessWeightedConcurrency = true
 	}
 	applyEnv(&cfg)
 	cfg.prefixTopics()

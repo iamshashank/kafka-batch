@@ -41,6 +41,14 @@ func init() {
 		}
 		return nil
 	})
+
+	kbatch.Register("integration.go_fair", func(ctx *kbatch.Context) error {
+		if marker := os.Getenv("KBATCH_DAEMON_ITEST_MARKER"); marker != "" {
+			tenant, _ := ctx.Payload["tenant"].(string)
+			return os.WriteFile(marker, []byte(ctx.JobID+":"+tenant), 0o644)
+		}
+		return nil
+	})
 }
 
 func main() {

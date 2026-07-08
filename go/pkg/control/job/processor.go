@@ -3,10 +3,12 @@ package job
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
+	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
@@ -22,6 +24,7 @@ type Processor struct {
 	Cfg      config.Daemon
 	Store    *store.RedisStore
 	Producer Producer
+	FairTime *fairness.Scheduler
 	Now      func() time.Time
 }
 
@@ -79,7 +82,12 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		hctx.BatchID = *job.BatchID
 	}
 
-	if err := handler(hctx); err != nil {
+	if err := p.withFairSlot(ctx, raw, func() error {
+		return handler(hctx)
+	}); err != nil {
+		if errors.Is(err, errFairSkipped) {
+			return out, nil
+		}
 		return p.handleFailure(ctx, job, raw, src, err)
 	}
 

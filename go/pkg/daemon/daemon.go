@@ -68,15 +68,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	defer prod.Close()
 
 	jobProc := &job.Processor{Cfg: cfg, Store: st, Producer: prod}
-	eventProc := &event.Processor{Cfg: cfg, Store: st, Producer: prod}
-	retryProc := &retry.Processor{Producer: prod, MaxPause: cfg.RetryMaxPause}
-	cbProc := &callback.Processor{Store: st, Invoker: callback.LogInvoker{}, NodeID: cfg.NodeID}
-
-	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	errCh := make(chan error, 4)
-	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-jobs", jobTopics, func(rec *kgo.Record) error {
+	handleJob := func(rec *kgo.Record) error {
 		src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 		out, err := jobProc.Process(ctx, rec.Value, src)
 		if err != nil {
@@ -103,7 +95,16 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			return fmt.Errorf("job not committed")
 		}
 		return nil
-	}, errCh)
+	}
+	eventProc := &event.Processor{Cfg: cfg, Store: st, Producer: prod}
+	retryProc := &retry.Processor{Producer: prod, MaxPause: cfg.RetryMaxPause}
+	cbProc := &callback.Processor{Store: st, Invoker: callback.LogInvoker{}, NodeID: cfg.NodeID}
+
+	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	errCh := make(chan error, 4)
+	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-jobs", jobTopics, handleJob, errCh)
 
 	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
 		_, err := eventProc.ProcessBatch(ctx, [][]byte{rec.Value})
@@ -175,11 +176,21 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	if cfg.FairnessEnabled {
-		fairSched := &fairness.Scheduler{
-			Lane: fairness.LaneTime, Client: rdb, Window: cfg.FairnessReadyWindow,
-		}
+		fairSched := fairness.NewScheduler(rdb, cfg.FairnessTimeSettings())
+		jobProc.FairTime = fairSched
+		coord := fairness.NewCoordinator(func(lane fairness.Lane) {
+			if lane != fairness.LaneTime {
+				return
+			}
+			fwd := &fairness.Forwarder{
+				Lane: lane, Scheduler: fairSched,
+				ReadyTopic: cfg.FairnessTimeReady, Producer: prod,
+			}
+			go fwd.Run(ctx)
+		})
 		fairDisp := &fairness.Dispatcher{
-			Lane: fairness.LaneTime, Scheduler: fairSched, Window: cfg.FairnessReadyWindow,
+			Lane: fairness.LaneTime, Scheduler: fairSched,
+			OnStartFwd: coord.OnStart(fairness.LaneTime),
 		}
 		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-dispatch-time",
 			[]string{cfg.FairnessTimeIngest}, func(rec *kgo.Record) error {
@@ -192,7 +203,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 				}
 				return nil
 			}, errCh)
-		log.Printf("kbatch fairness dispatcher enabled lane=time ingest=%s", cfg.FairnessTimeIngest)
+		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-ready-time",
+			[]string{cfg.FairnessTimeReady}, handleJob, errCh)
+		log.Printf("kbatch fairness enabled ingest=%s ready=%s", cfg.FairnessTimeIngest, cfg.FairnessTimeReady)
 	}
 
 	log.Printf("kbatch daemon running group=%s topics=%v", cfg.ConsumerGroup, jobTopics)
