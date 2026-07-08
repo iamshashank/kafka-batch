@@ -149,9 +149,10 @@ module KafkaBatch
           not_found
         end
 
-      # Stamp the CSRF cookie on every response so it is always fresh.
+      audit_web_action!(env, path, params, response) if method == "POST"
       inject_csrf_cookie(response)
     rescue StandardError => e
+      audit_web_action!(env, path, params, nil, error: e.message) if method == "POST"
       KafkaBatch.logger.error(
         "[KafkaBatch][Web] #{e.class}: #{e.message}\n#{e.backtrace&.first(8)&.join("\n")}"
       )
@@ -193,6 +194,27 @@ module KafkaBatch
         k, v = pair.strip.split("=", 2)
         h[k.strip] = v.to_s if k && !k.strip.empty?
       end
+    end
+
+    def audit_web_action!(env, path, params, response, error: nil)
+      return unless defined?(KafkaBatch::AuditLog) && KafkaBatch::AuditLog.enabled?
+
+      status =
+        if error
+          "error"
+        elsif response && response[0].to_i >= 400
+          "error"
+        else
+          "ok"
+        end
+
+      KafkaBatch::AuditLog.record_web_action(
+        env:    env,
+        path:   path,
+        params: params,
+        status: status,
+        error:  error
+      )
     end
 
     # ── Responses ──────────────────────────────────────────────────────────

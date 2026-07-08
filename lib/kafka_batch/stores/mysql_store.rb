@@ -1,6 +1,7 @@
 require "active_record"
 require_relative "base"
 require_relative "redis_store"
+require_relative "../database_connection"
 
 module KafkaBatch
   module Stores
@@ -222,21 +223,31 @@ module KafkaBatch
       private
 
       def failure_class
-        @failure_class ||= begin
-          klass = Class.new(ActiveRecord::Base)
-          klass.table_name        = "kafka_batch_failures"
-          klass.inheritance_column = nil
-          klass
-        end
+        @failure_class ||= DatabaseConnection.bind(
+          failure_model_class,
+          connection: KafkaBatch.config.store_database_connection
+        )
       end
 
       def consumption_pause_class
-        @consumption_pause_class ||= begin
-          klass = Class.new(ActiveRecord::Base)
-          klass.table_name        = "kafka_batch_consumption_pauses"
-          klass.inheritance_column = nil
-          klass
-        end
+        @consumption_pause_class ||= DatabaseConnection.bind(
+          consumption_pause_model_class,
+          connection: KafkaBatch.config.store_database_connection
+        )
+      end
+
+      def failure_model_class
+        klass = Class.new(ActiveRecord::Base)
+        klass.table_name         = "kafka_batch_failures"
+        klass.inheritance_column = nil
+        klass
+      end
+
+      def consumption_pause_model_class
+        klass = Class.new(ActiveRecord::Base)
+        klass.table_name         = "kafka_batch_consumption_pauses"
+        klass.inheritance_column = nil
+        klass
       end
 
       def failures_scope(scope, limit, offset, include_batch_id: false)

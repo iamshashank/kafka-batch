@@ -6,6 +6,9 @@ module KafkaBatch
     # :redis  – (default) all batch ledger state in Redis
     # :mysql  – batch ledger in Redis + failures/pauses in MySQL
     attr_accessor :store
+    # When store is :mysql, optional dedicated DB connection. nil = ActiveRecord::Base default.
+    # Accepts: AR model class, database.yml name (:symbol), or connection Hash.
+    attr_accessor :store_database_connection
 
     # ── Kafka connection ─────────────────────────────────────────────────────
     attr_accessor :brokers          # Array<String>  e.g. ["localhost:9092"]
@@ -126,6 +129,11 @@ module KafkaBatch
     #   :mysql – kafka_batch_scheduled_jobs table; disk-resident, cheap at scale,
     #            native per-job cancel/lookup by primary key.
     attr_accessor :schedule_store            # Symbol – :redis (default) | :mysql
+    # When schedule_store is :mysql, optional dedicated DB connection (see store_database_connection).
+    attr_accessor :schedule_store_database_connection
+    # Retries when Kafka produce succeeded but the schedule index write fails.
+    attr_accessor :schedule_index_write_retries  # Integer – default 3
+    attr_accessor :schedule_index_write_backoff  # Float – seconds; linear: attempt * backoff; default 0.05
     attr_accessor :schedule_poller_enabled   # Boolean – default false (opt in on scheduler pods)
     attr_accessor :schedule_poll_interval    # Float   – base seconds between polls when work is flowing; default 5.0
     # When a poll finds nothing due, the poller backs off (doubling the sleep up to
@@ -387,6 +395,21 @@ module KafkaBatch
     # gap-free batch_seq semantics while pipelining via produce_many_sync.
     attr_accessor :push_many_chunk_size  # Integer – default 500
 
+    # ── Web audit log (optional) ─────────────────────────────────────────────
+    # Persist mutating /kafka_batch UI actions to kafka_batch_audit_logs.
+    attr_accessor :audit_enabled                 # Boolean – default false
+    attr_accessor :audit_database_connection     # nil | Class | Symbol | Hash
+    # Optional Proc(env) → actor string, or static string. Falls back to HTTP headers.
+    attr_accessor :audit_actor
+
+    # ── Metrics export (optional) ────────────────────────────────────────────
+    # Bridges ActiveSupport::Notifications → StatsD/Datadog or a custom proc.
+    attr_accessor :metrics_enabled   # Boolean – default false
+    attr_accessor :metrics_adapter   # :statsd | :datadog | :proc
+    attr_accessor :metrics_client    # StatsD/Datadog client, or callable for :proc
+    attr_accessor :metrics_proc      # alias hook for :proc adapter
+    attr_accessor :metrics_prefix    # metric name prefix; default "kafka_batch"
+
     # ── Passthrough rdkafka config ───────────────────────────────────────────
     attr_accessor :producer_config  # Hash – merged on top of producer defaults
     attr_accessor :consumer_config  # Hash – merged on top of consumer defaults
@@ -464,6 +487,18 @@ module KafkaBatch
       @all_index_max_size       = 200_000
       @max_message_bytes        = 1_048_576  # 1 MiB; set to 0 to disable
       @push_many_chunk_size     = 500
+      @store_database_connection            = nil
+      @schedule_store_database_connection   = nil
+      @schedule_index_write_retries         = 3
+      @schedule_index_write_backoff         = 0.05
+      @audit_enabled                        = false
+      @audit_database_connection            = nil
+      @audit_actor                          = nil
+      @metrics_enabled                      = false
+      @metrics_adapter                      = :statsd
+      @metrics_client                       = nil
+      @metrics_proc                         = nil
+      @metrics_prefix                       = "kafka_batch"
       @producer_config          = {}
       @consumer_config          = {}
       @validate_topics_on_boot  = false
@@ -535,10 +570,23 @@ module KafkaBatch
       # hard per-tenant cap is set, a single tenant could monopolise the time lane.
       if @fairness_global_concurrency.to_i <= 0 && @fairness_max_inflight_per_tenant.to_i <= 0
         raise ConfigurationError,
-          "The time-fairness lane requires either fairness_global_concurrency > 0 " \
-          "(recommended — enables the dynamic fair-share cap) or " \
-          "fairness_max_inflight_per_tenant > 0. Otherwise a single tenant can " \
-          "monopolise the in-flight window (vtime only advances at completion)."
+              "The time-fairness lane requires either fairness_global_concurrency > 0 " \
+              "(recommended — enables the dynamic fair-share cap) or " \
+              "fairness_max_inflight_per_tenant > 0. Otherwise a single tenant can " \
+              "monopolise the in-flight window (vtime only advances at completion)."
+      end
+
+      if @metrics_enabled
+        adapter = @metrics_adapter
+        unless %i[statsd datadog proc].include?(adapter)
+          raise ConfigurationError, "metrics_adapter must be :statsd, :datadog, or :proc"
+        end
+        client = @metrics_proc || @metrics_client
+        if adapter == :proc
+          raise ConfigurationError, "metrics_proc or metrics_client callable required for :proc adapter" unless client.respond_to?(:call)
+        elsif client.nil?
+          raise ConfigurationError, "metrics_client required when metrics_enabled is true"
+        end
       end
     end
 

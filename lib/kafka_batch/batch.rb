@@ -442,12 +442,17 @@ module KafkaBatch
       )
       partition, offset = delivery_coords(report)
 
-      store.schedule(
-        job_id:    message["job_id"],
-        run_at:    run_at,
-        partition: partition,
-        offset:    offset,
-        batch_id:  batch_id
+      write_schedule_index!(
+        store,
+        [{
+          job_id:    message["job_id"],
+          run_at:    run_at,
+          partition: partition,
+          offset:    offset,
+          batch_id:  batch_id
+        }],
+        batch_id: batch_id,
+        job_id:   message["job_id"]
       )
 
       KafkaBatch::Instrumentation.scheduled_enqueued(
@@ -487,23 +492,18 @@ module KafkaBatch
         end
 
         entries = build_schedule_entries(chunk, reports, run_at: run_at, batch_id: batch_id)
-        begin
-          store.schedule_many(entries)
-        rescue StandardError => e
-          raise KafkaBatch::PartialProduceError.new(
-            "schedule index write failed: #{e.message}",
-            dispatched:     [],
-            produced_count: produced_total
-          )
-        end
+        write_schedule_index!(store, entries, batch_id: batch_id, count: entries.size)
         produced_total += chunk.size
       rescue KafkaBatch::PartialProduceError => e
         delivered = KafkaBatch::Producer.prefix_delivered_count(e.dispatched)
         if delivered.positive?
           prefix_chunk   = chunk.first(delivered)
           prefix_reports = e.dispatched.first(delivered)
-          store.schedule_many(
-            build_schedule_entries(prefix_chunk, prefix_reports, run_at: run_at, batch_id: batch_id)
+          write_schedule_index!(
+            store,
+            build_schedule_entries(prefix_chunk, prefix_reports, run_at: run_at, batch_id: batch_id),
+            batch_id: batch_id,
+            count:    delivered
           )
           produced_total += delivered
         end
@@ -565,6 +565,55 @@ module KafkaBatch
           offset:    offset,
           batch_id:  batch_id
         }
+      end
+    end
+
+    # Persist schedule index rows with retries. Kafka produce must have succeeded
+    # before calling this — a failed index write after produce is the orphan bug.
+    def self.write_schedule_index!(store, entries, batch_id: nil, job_id: nil, count: nil)
+      return if entries.nil? || entries.empty?
+
+      retries = KafkaBatch.config.schedule_index_write_retries.to_i
+      retries = 3 if retries < 1
+      backoff = KafkaBatch.config.schedule_index_write_backoff.to_f
+
+      attempt = 0
+      begin
+        if entries.size == 1
+          e = entries.first
+          store.schedule(
+            job_id:    e[:job_id],
+            run_at:    e[:run_at],
+            partition: e[:partition],
+            offset:    e[:offset],
+            batch_id:  e[:batch_id]
+          )
+        else
+          store.schedule_many(entries)
+        end
+      rescue StandardError => e
+        attempt += 1
+        if attempt < retries
+          KafkaBatch.logger.warn(
+            "[KafkaBatch][Batch] schedule index write failed (attempt #{attempt}/#{retries}) " \
+            "batch_id=#{batch_id} count=#{entries.size}: #{e.message} — retrying"
+          )
+          sleep(backoff * attempt) if backoff.positive?
+          retry
+        end
+
+        KafkaBatch::Instrumentation.scheduled_index_failed(
+          count:     count || entries.size,
+          batch_id:  batch_id,
+          job_id:    job_id,
+          attempts:  attempt,
+          error:     e
+        )
+        raise KafkaBatch::PartialProduceError.new(
+          "schedule index write failed: #{e.message}",
+          dispatched:     [],
+          produced_count: nil
+        )
       end
     end
 

@@ -262,6 +262,8 @@ module KafkaBatch
       Fairness::TenantPartitions.reset! if defined?(Fairness::TenantPartitions)
       Fairness::Forwarder.stop! if defined?(Fairness::Forwarder)
       SchedulePoller.stop! if defined?(SchedulePoller)
+      AuditLog.reset! if defined?(AuditLog)
+      Metrics.reset!  if defined?(Metrics)
     end
 
     private

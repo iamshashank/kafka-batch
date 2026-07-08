@@ -56,6 +56,19 @@ module KafkaBatchSpec
         add_index :kafka_batch_scheduled_jobs, :job_id, unique: true
         add_index :kafka_batch_scheduled_jobs, %i[run_at lease_until]
         add_index :kafka_batch_scheduled_jobs, :batch_id
+
+        create_table :kafka_batch_audit_logs, force: true do |t|
+          t.string   :action,     null: false
+          t.string   :path,       null: false
+          t.string   :method,     null: false, default: "POST"
+          t.string   :actor
+          t.string   :node_id
+          t.string   :status,     null: false, default: "ok"
+          t.text     :metadata
+          t.datetime :created_at, null: false
+        end
+        add_index :kafka_batch_audit_logs, :created_at
+        add_index :kafka_batch_audit_logs, :action
       end
     end
 
@@ -65,6 +78,7 @@ module KafkaBatchSpec
       conn.execute("DELETE FROM kafka_batch_failures")
       conn.execute("DELETE FROM kafka_batch_consumption_pauses")
       conn.execute("DELETE FROM kafka_batch_scheduled_jobs")
+      conn.execute("DELETE FROM kafka_batch_audit_logs")
     end
   end
 end

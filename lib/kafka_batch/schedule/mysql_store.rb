@@ -1,6 +1,7 @@
 require "active_record"
 require "time"
 require_relative "base"
+require_relative "../database_connection"
 
 module KafkaBatch
   module Schedule
@@ -149,13 +150,18 @@ module KafkaBatch
       end
 
       def model
-        @model ||= begin
-          klass = Class.new(ActiveRecord::Base)
-          klass.table_name         = "kafka_batch_scheduled_jobs"
-          klass.primary_key        = "job_id"
-          klass.inheritance_column = nil
-          klass
-        end
+        @model ||= DatabaseConnection.bind(
+          schedule_model_class,
+          connection: KafkaBatch.config.schedule_store_database_connection
+        )
+      end
+
+      def schedule_model_class
+        klass = Class.new(ActiveRecord::Base)
+        klass.table_name         = "kafka_batch_scheduled_jobs"
+        klass.primary_key        = "job_id"
+        klass.inheritance_column = nil
+        klass
       end
     end
   end

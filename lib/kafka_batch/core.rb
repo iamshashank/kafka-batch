@@ -278,6 +278,8 @@ module KafkaBatch
       Liveness.reset!          if defined?(Liveness)
       ConsumptionControl.reset! if defined?(ConsumptionControl)
       Fairness::TenantPartitions.reset! if defined?(Fairness::TenantPartitions)
+      AuditLog.reset! if defined?(AuditLog)
+      Metrics.reset!  if defined?(Metrics)
     end
 
     private

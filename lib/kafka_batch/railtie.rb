@@ -16,6 +16,10 @@ module KafkaBatch
       raise e
     end
 
+    initializer "kafka_batch.metrics", after: "kafka_batch.validate_config" do
+      KafkaBatch::Metrics.install! if KafkaBatch.config.metrics_enabled
+    end
+
     # Validate that all required Kafka topics exist at boot time.
     # Opt-in via: config.validate_topics_on_boot = true in the initializer.
     # Skipped when WaterDrop is not yet configured or the broker is unreachable.

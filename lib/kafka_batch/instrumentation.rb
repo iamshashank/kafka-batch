@@ -27,6 +27,8 @@ module KafkaBatch
   #   scheduled.enqueued.kafka_batch      – delayed job indexed (perform_in/at)
   #   scheduled.enqueued_bulk.kafka_batch – bulk delayed jobs indexed
   #   scheduled.dispatched.kafka_batch    – SchedulePoller re-produced a due job
+  #   scheduled.index_failed.kafka_batch    – schedule index write failed after Kafka produce
+  #   web.action.kafka_batch                – mutating Web UI action (when audit mirrors AS)
   #   batch.created.kafka_batch             – a new batch was persisted
   #   batch.sealed.kafka_batch              – block-form population finished
   #   batch.completed.kafka_batch           – batch reached terminal state
@@ -144,6 +146,19 @@ module KafkaBatch
           batch_id:     batch_id,
           worker_class: worker_class.to_s,
           topic:        topic
+        })
+      end
+
+      # Fired when Kafka produce succeeded but persisting the schedule index failed
+      # after all retries (transient store outage).
+      def scheduled_index_failed(count:, batch_id: nil, job_id: nil, attempts:, error:)
+        instrument("scheduled.index_failed", {
+          count:         count,
+          batch_id:      batch_id,
+          job_id:        job_id,
+          attempts:      attempts,
+          error_class:   error.class.name,
+          error_message: error.message
         })
       end
 

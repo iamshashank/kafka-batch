@@ -147,12 +147,30 @@ RSpec.describe "KafkaBatch::Batch delayed scheduling (perform_in / perform_at)" 
           handle = double("handle", create_result: report)
           raise KafkaBatch::PartialProduceError.new("boom", dispatched: [handle])
         end
+        allow(sched).to receive(:schedule)
         allow(sched).to receive(:schedule_many)
 
         expect { batch.push_many_at(Time.now + 300, SuccessfulWorker, [{}, {}, {}]) }
           .to raise_error(KafkaBatch::PartialProduceError)
         expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(1)
-        expect(sched).to have_received(:schedule_many).once
+        expect(sched).to have_received(:schedule).once
+      end
+
+      it "retries schedule index writes before failing" do
+        batch = KafkaBatch::Batch.create
+        calls = 0
+        allow(sched).to receive(:schedule_many) do |entries|
+          calls += 1
+          raise KafkaBatch::StoreError, "db blip" if calls == 1
+          entries
+        end
+        KafkaBatch.config.schedule_index_write_retries = 3
+        KafkaBatch.config.schedule_index_write_backoff  = 0
+
+        ids = batch.push_many_at(Time.now + 300, SuccessfulWorker, [{ "id" => 1 }, { "id" => 2 }])
+        expect(ids.size).to eq(2)
+        expect(sched).to have_received(:schedule_many).twice
+        expect(KafkaBatch.store.find_batch(batch.id)[:total_jobs]).to eq(2)
       end
     end
 

@@ -15,6 +15,7 @@ KafkaBatch.configure do |config|
   # :mysql – batch ledger still in Redis; run `rails g kafka_batch:install --store mysql`
   #          then `rails db:migrate` for failures / pause tables.
   config.store = :<%= @store %>
+  # config.store_database_connection = :kafka_batch_ops   # database.yml name, AR class, or Hash
 
   # ── Delayed-job (perform_in / perform_at) index store ─────────────────────────
   # Detached from `store` — the main ledger can be Redis while the (potentially
@@ -23,6 +24,7 @@ KafkaBatch.configure do |config|
   # :mysql – kafka_batch_scheduled_jobs table; run with
   #          `rails g kafka_batch:install --schedule-store mysql` then `rails db:migrate`.
   config.schedule_store = :<%= @schedule_store %>
+  # config.schedule_store_database_connection = :kafka_batch_schedule
 
   # Delayed-job poller. Disabled by default (config.schedule_poller_enabled = false).
   # Enable on scheduler pods — or on every pod in dev when KB_ROLE=all. For high pod
@@ -160,4 +162,15 @@ KafkaBatch.configure do |config|
   # config.max_failures_per_batch  = 1000            # 0 = unlimited (dashboard failure log)
   # config.producer_config = { "compression.type" => "snappy" }
   # config.consumer_config = { "fetch.min.bytes"  => "1024" }
+
+  # ── Web audit log (optional) ────────────────────────────────────────────────
+  # config.audit_enabled = true
+  # config.audit_database_connection = :kafka_batch_audit
+  # config.audit_actor = ->(env) { env["HTTP_X_FORWARDED_USER"] }
+
+  # ── Metrics (StatsD / Datadog / custom proc) ────────────────────────────────
+  # config.metrics_enabled = true
+  # config.metrics_adapter = :statsd   # :datadog or :proc
+  # config.metrics_client  = Statsd.new("localhost", 8125)
+  # config.metrics_proc    = ->(name, payload, duration_ms) { ... }  # for Prometheus etc.
 end
