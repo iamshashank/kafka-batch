@@ -81,9 +81,9 @@ Cancelled batches are cached per process (`cancellation_cache_ttl`, default 120s
 
 In-flight jobs are not killed when higher-priority backlog arrives. Strict mode blocks **new** lower-rank consumes until higher topics are drained.
 
-### 12. No built-in Prometheus/StatsD sink yet
+### 12. Metrics need a client you supply
 
-Events fire via `ActiveSupport::Notifications` only. You must subscribe yourself today — see [Instrumentation](#instrumentation) and the metrics plan below.
+A built-in StatsD/Datadog/proc bridge exists (`config.metrics_enabled`), but it emits through a client **you** provide — the gem has no metrics dependency and ships no dashboard. See [Metrics export](#metrics-export-statsd--datadog--prometheus).
 
 ---
 
@@ -110,8 +110,12 @@ gem "kafka-batch", require: "kafka_batch/ui"
 
 ```bash
 bundle exec rails generate kafka_batch:install
-# optional: --store mysql  (failure log / pauses in MySQL; ledger still Redis)
+# optional: --store mysql           (failure log / pauses in MySQL; ledger still Redis)
+# optional: --schedule-store mysql  (delayed-job index in MySQL)
+# optional: --audit                 (copy the Web UI audit-log migration)
 ```
+
+The generator copies only the migrations the chosen stores/features need, then run `rails db:migrate`. See [Web UI audit log](#web-ui-audit-log) for `--audit`.
 
 Edit `config/initializers/kafka_batch.rb` — at minimum:
 
@@ -152,6 +156,9 @@ end
 class ProcessOrderWorker
   include KafkaBatch::Worker
 
+  job_type "orders.process"   # stable wire ID (defaults from class name)
+  kafka_topic "orders.process"
+
   def perform(payload)
     Order.find(payload["order_id"]).process!
   end
@@ -184,7 +191,7 @@ mount KafkaBatch::Web => "/kafka_batch"
 ```
 App  →  Redis (batch record FIRST)
      →  Kafka worker topic(s)
-          → JobConsumer#perform
+          → JobConsumer (HandlerRegistry → RubyExecutor#perform)
                ├─ success  → events topic → EventConsumer (bitmap dedup) → callbacks topic
                ├─ retry    → retry.{short|medium|large} → RetryConsumer → worker topic
                └─ exhausted → dead_letter + failed event
@@ -211,18 +218,54 @@ CallbackConsumer: invoke callback → then claim (at-least-once)
 class MyWorker
   include KafkaBatch::Worker
 
-  kafka_topic "orders.process"   # optional — defaults to config.jobs_topic;
-                                   # topic_prefix applied automatically (see below)
+  job_type "orders.process"    # stable cross-language ID (optional — see below)
+  kafka_topic "orders.process" # optional — defaults to config.jobs_topic;
+                               # topic_prefix applied automatically (see below)
+  executor :ruby               # default; :go in a future release
   max_retries 5
   retry_tier :large            # pin all retries to one tier (optional)
   fairness_type :time          # :time or :throughput — opts into WFQ lane (optional)
   uniq true                    # dedup enqueue by payload (optional)
+
+  retries_exhausted do |job, error|
+    # job: job_id, batch_id, payload, attempt, job_type, …
+    Alert.notify(job["job_id"], error.message)
+  end
 
   def perform(payload)
     # must be idempotent
   end
 end
 ```
+
+### `job_type` and the handler registry
+
+Every produced job carries a **`job_type`** string (alongside legacy `worker_class`). `JobConsumer` resolves handlers through `KafkaBatch::HandlerRegistry`:
+
+1. Lookup by `job_type` when registered
+2. Fall back to `worker_class` (`const_get` + auto-register)
+3. Unknown handler → DLT (poison-pill safe)
+
+**Default `job_type`** is derived from the class name (`ProcessOrderWorker` → `"process_order"`). Override explicitly when multiple runtimes will share a fair/priority topic:
+
+```ruby
+job_type "campaign.fast_p0"
+```
+
+**Wire envelope** (excerpt):
+
+```json
+{
+  "job_type": "orders.process",
+  "worker_class": "ProcessOrderWorker",
+  "job_id": "...",
+  "batch_id": "...",
+  "payload": {},
+  "attempt": 0
+}
+```
+
+Legacy messages with only `worker_class` still work. Phase 1 supports **`executor :ruby`** only; the registry API is the extension point for a future Go sidecar (`executor :go`).
 
 ### Standalone jobs (no batch)
 
@@ -639,6 +682,37 @@ Built-in defences:
   }
   ```
 
+### Web UI audit log
+
+Every mutating dashboard action (cancel, delete, pause/resume, weight set/reset) can be persisted to a `kafka_batch_audit_logs` table for an operator trail. It's **off by default** and backed by ActiveRecord (independent of `config.store`).
+
+**1. Copy the migration** (the installer only emits it when asked):
+
+```bash
+bundle exec rails generate kafka_batch:install --audit
+bundle exec rails db:migrate
+```
+
+Or, without re-running the generator, copy the migration the gem already ships:
+
+```bash
+cp "$(bundle show kafka-batch)/db/migrate/20240101000004_create_kafka_batch_audit_logs.rb" db/migrate/
+bundle exec rails db:migrate
+```
+
+**2. Enable it** in `config/initializers/kafka_batch.rb`:
+
+```ruby
+config.audit_enabled = true
+# optional: a dedicated DB connection (AR model class, database.yml name, or connection Hash)
+# config.audit_database_connection = :kafka_batch_audit
+# optional: attribute the action to a user — a Proc(env) → String, or a static string.
+# Falls back to request headers when unset.
+config.audit_actor = ->(env) { env["HTTP_X_FORWARDED_USER"] }
+```
+
+Each row records `action`, `path`, `method`, `actor`, `node_id`, `status` (`ok`/`error`), a `metadata` JSON blob, and `created_at`. With `audit_enabled = false` (default) no table is required and nothing is written.
+
 ### Pause / resume (`/lag`)
 
 Pause state is written to Redis (or MySQL when `store = :mysql`) **immediately** when you click Pause. Karafka consumers **cache** that state and re-read it at most every `consumption_control_refresh_interval` seconds (default **30**). Until the cache refreshes, jobs may still run and lag can keep falling — wait up to one interval after pausing.
@@ -678,23 +752,56 @@ Events publish via `ActiveSupport::Notifications` when Rails/AS is loaded:
 | `consumer.priority_yielded.kafka_batch` | Priority gate paused |
 | `reconciler.ran.kafka_batch` | Sweep finished |
 
-### Subscribe today (DIY metrics)
+These events are the integration point for the built-in metrics bridge below.
+
+### Metrics export (StatsD / Datadog / Prometheus)
+
+kafka-batch ships an opt-in bridge from `ActiveSupport::Notifications` to a metrics client **you supply** (no metrics gem dependency). Per event it emits `#{prefix}.<event>.count` (increment) and `#{prefix}.<event>.duration` (timing, when the client supports it), tagged from the event payload (`worker_class`, `outcome`, `dlt_type`, …).
+
+**StatsD / Datadog** — bring a tag-capable client. Use [`dogstatsd-ruby`](https://rubygems.org/gems/dogstatsd-ruby) (works for both); the classic `statsd-ruby` `Statsd` has no `tags:` kwarg, so its emits would be dropped.
+
+```ruby
+# Gemfile: gem "dogstatsd-ruby"
+KafkaBatch.configure do |config|
+  config.metrics_enabled = true
+  config.metrics_adapter = :statsd                       # or :datadog (same wire API)
+  config.metrics_client  = Datadog::Statsd.new("localhost", 8125)
+  config.metrics_prefix  = "kafka_batch"                 # default
+end
+```
+
+The client must respond to `#increment(name, tags:)`; `#timing` is optional. `config.validate!` fails fast if `metrics_enabled` is set without a client.
+
+**Prometheus / custom sink** — use the `:proc` adapter:
+
+```ruby
+config.metrics_enabled = true
+config.metrics_adapter = :proc
+config.metrics_proc = ->(name, payload, duration_ms) {
+  MY_PROMETHEUS.counter(name.tr(".", "_"), labels: payload.slice(:worker_class)).inc
+}
+```
+
+**Wiring:** in Rails the railtie calls `KafkaBatch::Metrics.install!` on boot when `metrics_enabled` is true. In a non-Rails process, call `KafkaBatch::Metrics.install!` yourself after `configure` — in **every** process you want metrics from.
+
+Example series: `kafka_batch.job_processed.count`, `kafka_batch.job_processed.duration`, `kafka_batch.job_failed.count`, `kafka_batch.batch_completed.count` (`outcome:` tag), `kafka_batch.dlt_published.count` (`dlt_type:` tag).
+
+### Where to visualize
+
+- **Live operational state** — mount `KafkaBatch::Web` (batches, `/failures`, `/dead_letter`, `/live`, `/lag`, `/fairness`, `/audit`). This is current state, not time-series.
+- **The metrics above** render wherever your client's pipeline terminates — **Grafana** (Prometheus via `statsd_exporter`, or Graphite) or **Datadog** (via the Agent). The gem ships no dashboard; build panels on the `kafka_batch.*` series, paired with Kafka consumer-lag from your broker's exporter.
+
+### DIY (no bridge)
+
+Prefer to wire it by hand? Subscribe to the notifications directly:
 
 ```ruby
 # config/initializers/kafka_batch_metrics.rb
-ActiveSupport::Notifications.subscribe("job.processed.kafka_batch") do |*args|
-  event = ActiveSupport::Notifications::Event.new(*args)
-  StatsD.increment("kafka_batch.job.processed", tags: ["worker:#{event.payload[:worker_class]}"])
-  StatsD.timing("kafka_batch.job.duration", event.duration * 1000, tags: ["worker:#{event.payload[:worker_class]}"]) if event.payload[:duration]
-end
-
 ActiveSupport::Notifications.subscribe(/\.kafka_batch\z/) do |name, *rest|
   event = ActiveSupport::Notifications::Event.new(name, *rest)
   StatsD.increment("kafka_batch.events", tags: ["event:#{name.sub('.kafka_batch', '')}"])
 end
 ```
-
-> **Built-in Prometheus/StatsD export is planned** — see plan below. Until then, AS::Notifications is the integration point.
 
 ---
 
@@ -709,8 +816,9 @@ end
 | `status.bid` | `batch["batch_id"]` |
 | `status.total` | `batch["total_jobs"]` |
 | `status.failures` | `batch["failed_count"]` |
+| `sidekiq_retries_exhausted` | `retries_exhausted` (alias: `sidekiq_retries_exhausted`) |
 
-Workers use `include KafkaBatch::Worker` and run under Karafka instead of Sidekiq threads. Callback signatures are structurally the same — keep them idempotent.
+Workers use `include KafkaBatch::Worker` and run under Karafka instead of Sidekiq threads. Set an explicit `job_type` when you plan to run Ruby and Go handlers on the same Kafka topic (fair/priority lanes). Callback signatures are structurally the same — keep them idempotent.
 
 ---
 
