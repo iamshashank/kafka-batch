@@ -32,6 +32,16 @@ type Daemon struct {
 	HandlerManifest    string
 	SkipCancelledJobs  bool
 	NodeID             string
+	SchedulePollerEnabled bool
+	ScheduledTopic        string
+	SchedulePollInterval  time.Duration
+	ScheduleLeaseSeconds  int
+	ScheduleBatchSize     int
+	ScheduleReclaimEvery  time.Duration
+	FairnessEnabled       bool
+	FairnessTimeIngest    string
+	FairnessTimeReady     string
+	FairnessReadyWindow   int
 }
 
 func DefaultDaemon() Daemon {
@@ -54,6 +64,14 @@ func DefaultDaemon() Daemon {
 		BatchTTL:          7 * 24 * time.Hour,
 		SkipCancelledJobs: true,
 		NodeID:            hostname(),
+		ScheduledTopic:    "kafka_batch.scheduled",
+		SchedulePollInterval: 5 * time.Second,
+		ScheduleLeaseSeconds: 60,
+		ScheduleBatchSize:    100,
+		ScheduleReclaimEvery: 30 * time.Second,
+		FairnessTimeIngest:   "kafka_batch.fair_time_ingest",
+		FairnessTimeReady:    "kafka_batch.fair_time_ready",
+		FairnessReadyWindow:  100,
 	}
 }
 
@@ -81,6 +99,14 @@ func LoadDaemon(path string) (Daemon, error) {
 		HandlerManifest string            `yaml:"handler_manifest"`
 		MaxRetries         int            `yaml:"max_retries"`
 		CompleteAfter      int            `yaml:"complete_after_retries"`
+		SchedulePollerEnabled bool          `yaml:"schedule_poller_enabled"`
+		ScheduledTopic        string        `yaml:"scheduled_topic"`
+		ScheduleLeaseSeconds  int           `yaml:"schedule_lease_seconds"`
+		ScheduleBatchSize     int           `yaml:"schedule_batch_size"`
+		FairnessEnabled       bool          `yaml:"fairness_enabled"`
+		FairnessTimeIngest    string        `yaml:"fairness_time_ingest"`
+		FairnessTimeReady     string        `yaml:"fairness_time_ready"`
+		FairnessReadyWindow   int           `yaml:"fairness_ready_window"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return cfg, err
@@ -124,6 +150,30 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.CompleteAfter > 0 {
 		cfg.CompleteAfter = doc.CompleteAfter
 	}
+	if doc.SchedulePollerEnabled {
+		cfg.SchedulePollerEnabled = true
+	}
+	if doc.ScheduledTopic != "" {
+		cfg.ScheduledTopic = doc.ScheduledTopic
+	}
+	if doc.ScheduleLeaseSeconds > 0 {
+		cfg.ScheduleLeaseSeconds = doc.ScheduleLeaseSeconds
+	}
+	if doc.ScheduleBatchSize > 0 {
+		cfg.ScheduleBatchSize = doc.ScheduleBatchSize
+	}
+	if doc.FairnessEnabled {
+		cfg.FairnessEnabled = true
+	}
+	if doc.FairnessTimeIngest != "" {
+		cfg.FairnessTimeIngest = doc.FairnessTimeIngest
+	}
+	if doc.FairnessTimeReady != "" {
+		cfg.FairnessTimeReady = doc.FairnessTimeReady
+	}
+	if doc.FairnessReadyWindow > 0 {
+		cfg.FairnessReadyWindow = doc.FairnessReadyWindow
+	}
 	applyEnv(&cfg)
 	cfg.prefixTopics()
 	return cfg, nil
@@ -154,6 +204,9 @@ func (c *Daemon) prefixTopics() {
 	c.CallbacksTopic = prefixName(p, c.CallbacksTopic)
 	c.DeadLetterTopic = prefixName(p, c.DeadLetterTopic)
 	c.RetryTopicBase = prefixName(p, c.RetryTopicBase)
+	c.ScheduledTopic = prefixName(p, c.ScheduledTopic)
+	c.FairnessTimeIngest = prefixName(p, c.FairnessTimeIngest)
+	c.FairnessTimeReady = prefixName(p, c.FairnessTimeReady)
 	for i, t := range c.JobsTopics {
 		c.JobsTopics[i] = prefixName(p, t)
 	}

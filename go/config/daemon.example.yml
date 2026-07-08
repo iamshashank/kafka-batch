@@ -28,6 +28,18 @@ redis_url: redis://localhost:6379/0
 
 max_retries: 3
 
+# Phase 3b — delayed jobs (perform_in / perform_at)
+# schedule_poller_enabled: true
+# scheduled_topic: kafka_batch.scheduled
+# schedule_lease_seconds: 60
+# schedule_batch_size: 100
+
+# Phase 3c — fairness time lane (ingest → WFQ enqueue; forwarder/checkout next)
+# fairness_enabled: true
+# fairness_time_ingest: kafka_batch.fair_time_ingest
+# fairness_time_ready: kafka_batch.fair_time_ready
+# fairness_ready_window: 100
+
 retry_tiers:
   short: 30
   medium: 420

@@ -19,9 +19,11 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/control/event"
 	"github.com/y-shashank/kafka-batch/go/pkg/control/job"
 	"github.com/y-shashank/kafka-batch/go/pkg/control/retry"
+	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch/go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
+	"github.com/y-shashank/kafka-batch/go/pkg/schedule"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
 )
 
@@ -145,6 +147,53 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		_, err := cbProc.Process(ctx, rec.Value)
 		return err
 	}, errCh)
+
+	if cfg.SchedulePollerEnabled {
+		schedStore := schedule.NewRedisStore(rdb, cfg.ScheduleBatchSize*5)
+		reader, err := schedule.NewReader(cfg.Brokers, cfg.ScheduledTopic)
+		if err != nil {
+			return fmt.Errorf("schedule reader: %w", err)
+		}
+		defer reader.Close()
+		defaultTopic := ""
+		if len(jobTopics) > 0 {
+			defaultTopic = jobTopics[0]
+		}
+		poller := &schedule.Poller{
+			Cfg:      cfg,
+			Store:    schedStore,
+			Reader:   reader,
+			Producer: prod,
+			Router: schedule.ManifestRouter{
+				Manifest: manifest,
+				Default:  defaultTopic,
+			},
+			Cancelled: st.BatchCancelled,
+		}
+		go poller.Run(ctx)
+		log.Printf("kbatch schedule poller enabled topic=%s", cfg.ScheduledTopic)
+	}
+
+	if cfg.FairnessEnabled {
+		fairSched := &fairness.Scheduler{
+			Lane: fairness.LaneTime, Client: rdb, Window: cfg.FairnessReadyWindow,
+		}
+		fairDisp := &fairness.Dispatcher{
+			Lane: fairness.LaneTime, Scheduler: fairSched, Window: cfg.FairnessReadyWindow,
+		}
+		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-dispatch-time",
+			[]string{cfg.FairnessTimeIngest}, func(rec *kgo.Record) error {
+				out, err := fairDisp.Process(ctx, rec.Value)
+				if err != nil {
+					return err
+				}
+				if !out.CommitOffset {
+					return fmt.Errorf("fair ingest backpressure tenant=%s", out.TenantID)
+				}
+				return nil
+			}, errCh)
+		log.Printf("kbatch fairness dispatcher enabled lane=time ingest=%s", cfg.FairnessTimeIngest)
+	}
 
 	log.Printf("kbatch daemon running group=%s topics=%v", cfg.ConsumerGroup, jobTopics)
 	if ready := os.Getenv("KBATCH_DAEMON_READY_FILE"); ready != "" {

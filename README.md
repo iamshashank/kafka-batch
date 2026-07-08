@@ -374,7 +374,19 @@ cd go && go build -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
 KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_daemon_spec.rb
 ```
 
-Phase 3 covers **plain topics** first. Fairness lanes, priority YAML, and the schedule poller remain on the Ruby Karafka path until Phase 3b/3c.
+Phase 3 covers **plain topics** first. **Phase 3b** adds schedule poller + priority YAML; **Phase 3c** adds fairness lanes (time lane first). Enable in daemon YAML:
+
+```yaml
+schedule_poller_enabled: true
+scheduled_topic: kafka_batch.scheduled
+
+fairness_enabled: true
+fairness_time_ingest: kafka_batch.fair_time_ingest
+fairness_time_ready: kafka_batch.fair_time_ready
+fairness_ready_window: 100
+```
+
+Phase 3b schedule poller and Phase 3c fairness enqueue/dispatcher are in progress — checkout/forwarder and priority gate are next.
 
 ### Standalone jobs (no batch)
 
