@@ -110,13 +110,14 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		jobProc.FairThroughput = fairness.NewScheduler(rdb, cfg.FairnessThroughputSettings())
 	}
 
-	handleJob := daemon.BuildJobHandler(cfg, prod, jobProc)
-	pauseCtl, _, closePauseCtl := daemon.BuildPauseControl(cfg, rdb)
-	defer closePauseCtl()
 	failures, closeFailures := daemon.BuildFailureRecorder(cfg, st)
 	defer closeFailures()
 	jobProc.Failures = failures
 	live := daemon.NewLivenessReporter(cfg, rdb)
+	jobProc.Liveness = live
+	handleJob := daemon.BuildJobHandler(cfg, prod, jobProc)
+	pauseCtl, _, closePauseCtl := daemon.BuildPauseControl(cfg, rdb)
+	defer closePauseCtl()
 	daemon.StartHealthServer(ctx, cfg, "worker")
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)

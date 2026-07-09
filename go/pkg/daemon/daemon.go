@@ -142,9 +142,10 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	defer closePauseCtl()
 	failures, closeFailures := BuildFailureRecorder(cfg, st)
 	defer closeFailures()
-	jobProc.Failures = failures
-	tenants := BuildTenantPartitions(cfg, rdb, prod)
 	live := NewLivenessReporter(cfg, rdb)
+	jobProc.Failures = failures
+	jobProc.Liveness = live
+	tenants := BuildTenantPartitions(cfg, rdb, prod)
 	StartHealthServer(ctx, cfg, "daemon")
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)

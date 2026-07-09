@@ -74,6 +74,7 @@ type Daemon struct {
 	LivenessEnabled             bool
 	LivenessTTL                 time.Duration
 	LivenessHTTPAddr            string
+	TrackRunningJobs            bool
 	MetricsEnabled              bool
 	MetricsPrefix               string
 	MetricsStatsDAddr           string
@@ -129,6 +130,7 @@ func DefaultDaemon() Daemon {
 		FairnessTenantPartitionCacheTTL: 30 * time.Second,
 		LivenessTTL:                 30 * time.Second,
 		LivenessHTTPAddr:            ":8080",
+		TrackRunningJobs:            true,
 		MetricsPrefix:               "kafka_batch",
 		ReconciliationInterval:      300 * time.Second,
 		ReconcilerLockTTL:           600 * time.Second,
@@ -202,6 +204,7 @@ func LoadDaemon(path string) (Daemon, error) {
 		LivenessEnabled             bool     `yaml:"liveness_enabled"`
 		LivenessTTLSec              float64  `yaml:"liveness_ttl"`
 		LivenessHTTPAddr            string   `yaml:"liveness_http_addr"`
+		TrackRunningJobs            *bool    `yaml:"track_running_jobs"`
 		MetricsEnabled              bool     `yaml:"metrics_enabled"`
 		MetricsPrefix               string   `yaml:"metrics_prefix"`
 		MetricsStatsDAddr           string   `yaml:"metrics_statsd_addr"`
@@ -376,6 +379,9 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.LivenessHTTPAddr != "" {
 		cfg.LivenessHTTPAddr = doc.LivenessHTTPAddr
+	}
+	if doc.TrackRunningJobs != nil {
+		cfg.TrackRunningJobs = *doc.TrackRunningJobs
 	}
 	if doc.MetricsEnabled {
 		cfg.MetricsEnabled = true

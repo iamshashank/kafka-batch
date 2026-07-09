@@ -69,3 +69,11 @@ func (s *RedisStore) RecordFailure(ctx context.Context, e FailureEntry) error {
 	).Result()
 	return err
 }
+
+// ClearFailure removes a per-batch failure row after a successful retry.
+func (s *RedisStore) ClearFailure(ctx context.Context, batchID, jobID string) error {
+	if s == nil || s.client == nil || batchID == "" || jobID == "" {
+		return nil
+	}
+	return s.client.HDel(ctx, failuresKey(batchID), jobID).Err()
+}

@@ -60,6 +60,7 @@ func Reset() {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	registry = map[string]HandlerFunc{}
+	ResetRetriesExhausted()
 }
 
 func runHandler(req ExecuteRequest) ExecuteResponse {

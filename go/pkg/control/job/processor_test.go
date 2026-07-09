@@ -11,6 +11,7 @@ import (
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
+	"github.com/y-shashank/kafka-batch/go/pkg/liveness"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
 )
@@ -146,3 +147,117 @@ func TestProcessRubyUnknownHandlerDLTWithoutRetry(t *testing.T) {
 type rubyStub struct{ err error }
 
 func (r rubyStub) Execute(context.Context, protocol.JobMessage) error { return r.err }
+
+func TestProcessRetriesExhaustedHookBeforeDLT(t *testing.T) {
+	kbatch.Reset()
+	var hookCalled bool
+	kbatch.OnRetriesExhausted("test.exhaust", func(s kbatch.RetriesExhaustedSummary, err error) {
+		hookCalled = true
+		if s.Attempt != 3 {
+			t.Fatalf("attempt %d", s.Attempt)
+		}
+	})
+
+	kbatch.Register("test.exhaust", func(ctx *kbatch.Context) error {
+		return &kbatch.HandlerError{Class: "Boom", Message: "boom"}
+	})
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", JobType: "test.exhaust", WorkerClass: "go:test.exhaust",
+		Payload: map[string]interface{}{}, Attempt: 3, MaxRetries: 3,
+	})
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}}
+	out, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hookCalled {
+		t.Fatal("expected retries_exhausted hook")
+	}
+	if out.DLTPayload == nil {
+		t.Fatal("expected DLT after hook")
+	}
+}
+
+func TestProcessRecordsRetryFailureAndClearsOnSuccess(t *testing.T) {
+	kbatch.Reset()
+	attempts := 0
+	kbatch.Register("test.flip", func(ctx *kbatch.Context) error {
+		attempts++
+		if ctx.Attempt == 0 {
+			return &kbatch.HandlerError{Class: "Boom", Message: "boom"}
+		}
+		return nil
+	})
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+
+	batchID := "b1"
+	seq := int64(1)
+	rawFail, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", BatchID: &batchID, JobType: "test.flip", WorkerClass: "go:test.flip",
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+		BatchSeq: &seq, CompleteAfterRetries: 3,
+	})
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{},
+		Now: func() time.Time { return time.Unix(0, 0) }}
+	out, err := p.Process(context.Background(), rawFail, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 10})
+	if err != nil || out.RetryPayload == nil {
+		t.Fatalf("retry out=%+v err=%v", out, err)
+	}
+
+	raw, err := rdb.HGet(context.Background(), "kafka_batch:b:"+batchID+":failures", "j1").Result()
+	if err != nil || raw == "" {
+		t.Fatalf("expected failure row, err=%v raw=%q", err, raw)
+	}
+	var row map[string]interface{}
+	_ = json.Unmarshal([]byte(raw), &row)
+	if row["status"] != "retrying" {
+		t.Fatalf("status %v", row["status"])
+	}
+
+	rawOK, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", BatchID: &batchID, JobType: "test.flip", WorkerClass: "go:test.flip",
+		Payload: map[string]interface{}{}, Attempt: 1, MaxRetries: 3,
+		BatchSeq: &seq, CompleteAfterRetries: 3,
+	})
+	out, err = p.Process(context.Background(), rawOK, protocol.SourceCoords{Topic: "jobs", Partition: 0, Offset: 11})
+	if err != nil || out.Event == nil {
+		t.Fatalf("success out=%+v err=%v", out, err)
+	}
+	n, err := rdb.HLen(context.Background(), "kafka_batch:b:"+batchID+":failures").Result()
+	if err != nil || n != 0 {
+		t.Fatalf("expected failure cleared, n=%d err=%v", n, err)
+	}
+}
+
+func TestProcessJobLiveness(t *testing.T) {
+	kbatch.Reset()
+	kbatch.Register("test.live", func(ctx *kbatch.Context) error { return nil })
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	st := store.NewRedisStore(rdb, time.Hour)
+	rep := liveness.NewReporter(rdb, time.Minute)
+	rep.TrackRunningJobs = true
+
+	raw, _ := json.Marshal(protocol.JobMessage{
+		JobID: "j1", JobType: "test.live", WorkerClass: "go:test.live",
+		Payload: map[string]interface{}{}, Attempt: 0, MaxRetries: 3,
+	})
+	p := &Processor{Cfg: config.DefaultDaemon(), Store: st, Producer: &memProducer{}, Liveness: rep}
+	_, err := p.Process(context.Background(), raw, protocol.SourceCoords{Topic: "jobs", Partition: 1, Offset: 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mr.Keys()) != 0 {
+		t.Fatalf("expected job key cleaned up, keys=%v", mr.Keys())
+	}
+}
+

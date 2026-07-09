@@ -11,6 +11,7 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch/go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
+	"github.com/y-shashank/kafka-batch/go/pkg/liveness"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
 )
@@ -29,6 +30,7 @@ type Processor struct {
 	FairTime       *fairness.Scheduler
 	FairThroughput *fairness.Scheduler
 	RubyExec       RubyExecutor
+	Liveness       *liveness.Reporter
 	Now            func() time.Time
 }
 
@@ -125,6 +127,15 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		return out, nil
 	}
 
+	jobLive := false
+	defer func() {
+		if jobLive && p.Liveness != nil {
+			p.Liveness.JobFinished(ctx, job.JobID)
+		}
+	}()
+	p.markJobStarted(ctx, job, src)
+	jobLive = true
+
 	run := func() error {
 		if rubyHandler {
 			return p.RubyExec.Execute(ctx, job)
@@ -152,6 +163,9 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 	if job.BatchID != nil && job.BatchSeq != nil && !job.BatchCounted {
 		ev := p.buildEvent(job, "success", src)
 		out.Event = &ev
+	}
+	if job.BatchID != nil && job.Attempt > 0 && p.Store != nil {
+		_ = p.Store.ClearFailure(ctx, *job.BatchID, job.JobID)
 	}
 	p.releaseUniq(ctx, job)
 	emitJobProcessed(job, instrumentSince(started, p.now()))
@@ -189,6 +203,8 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 		delay := p.retryDelay(tier)
 		retryAt := p.now().Add(delay)
 
+		p.recordExecutionFailure(ctx, job, execErr, "retrying", retryAt.UTC().Format(time.RFC3339))
+
 		if job.BatchID != nil && !job.BatchCounted && job.Attempt >= completeAfter && job.BatchSeq != nil {
 			ev := p.buildEvent(job, "failed", src)
 			out.Event = &ev
@@ -209,6 +225,10 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 	if job.BatchID != nil && !job.BatchCounted && job.BatchSeq != nil {
 		ev := p.buildEvent(job, "failed", src)
 		out.Event = &ev
+	}
+	p.recordExecutionFailure(ctx, job, execErr, "failed", "")
+	if _, goHandler := kbatch.Lookup(job.JobType); goHandler {
+		kbatch.RunRetriesExhausted(job, execErr, maxRetries)
 	}
 	dlt, key := p.dltPayload(jobMap(raw), src.Topic, className(execErr), execErr.Error())
 	out.DLTPayload = dlt
@@ -339,4 +359,36 @@ func (p *Processor) recordFailure(ctx context.Context, e store.FailureEntry) {
 	if rec != nil {
 		_ = rec.RecordFailure(ctx, e)
 	}
+}
+
+func (p *Processor) recordExecutionFailure(ctx context.Context, job protocol.JobMessage, execErr error, status, nextRetryAt string) {
+	if job.BatchID == nil || *job.BatchID == "" {
+		return
+	}
+	p.recordFailure(ctx, store.FailureEntry{
+		BatchID:      *job.BatchID,
+		JobID:        job.JobID,
+		WorkerClass:  job.WorkerClass,
+		ErrorClass:   className(execErr),
+		ErrorMessage: execErr.Error(),
+		Attempt:      job.Attempt,
+		Status:       status,
+		NextRetryAt:  nextRetryAt,
+	})
+}
+
+func (p *Processor) markJobStarted(ctx context.Context, job protocol.JobMessage, src protocol.SourceCoords) {
+	if p.Liveness == nil {
+		return
+	}
+	meta := liveness.JobMeta{
+		JobID:       job.JobID,
+		WorkerClass: job.WorkerClass,
+		Topic:       src.Topic,
+		Partition:   src.Partition,
+	}
+	if job.BatchID != nil {
+		meta.BatchID = *job.BatchID
+	}
+	p.Liveness.JobStarted(ctx, meta)
 }

@@ -74,7 +74,9 @@ func NewLivenessReporter(cfg config.Daemon, rdb *redis.Client) *liveness.Reporte
 	if !cfg.LivenessEnabled || rdb == nil {
 		return nil
 	}
-	return liveness.NewReporter(rdb, cfg.LivenessTTL)
+	r := liveness.NewReporter(rdb, cfg.LivenessTTL)
+	r.TrackRunningJobs = cfg.TrackRunningJobs
+	return r
 }
 
 func attachIngestLag(settings fairness.Settings, lag fairness.IngestLagCounter) fairness.Settings {
