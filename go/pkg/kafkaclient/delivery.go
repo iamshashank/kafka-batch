@@ -46,15 +46,15 @@ func (c *Client) ProduceManySync(ctx context.Context, records []ProduceRecord) (
 	results := c.inner.ProduceSync(ctx, krecs...)
 	out := make([]Delivery, 0, len(results))
 	for _, res := range results {
-		if res.Err != nil {
-			return out, res.Err
-		}
 		d := Delivery{}
 		if res.Record != nil {
 			d.Partition = res.Record.Partition
 			d.Offset = res.Record.Offset
 		}
 		out = append(out, d)
+		if res.Err != nil {
+			return out, res.Err
+		}
 	}
 	return out, nil
 }

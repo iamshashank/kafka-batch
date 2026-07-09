@@ -21,24 +21,7 @@ func (c *Client) produceJob(ctx context.Context, route Route, msg protocol.JobMe
 }
 
 func (c *Client) scheduleMessage(ctx context.Context, msg protocol.JobMessage, runAt time.Time, batchID string) error {
-	raw, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	topic := c.cfg.resolveTopic(c.cfg.ScheduledTopic)
-	del, err := c.prod.ProduceSync(ctx, topic, msg.JobID, raw, nil)
-	if err != nil {
-		return err
-	}
-	entry := schedule.ScheduleEntry{
-		JobID: msg.JobID, RunAt: runAt,
-		Partition: del.Partition, Offset: del.Offset,
-	}
-	if err := c.writeScheduleIndex(ctx, []schedule.ScheduleEntry{entry}, batchID, msg.JobID, 1); err != nil {
-		return err
-	}
-	instrument.ScheduledEnqueued(msg.JobID, batchID, msg.WorkerClass, runAt)
-	return nil
+	return c.scheduleMessages(ctx, []protocol.JobMessage{msg}, runAt, batchID)
 }
 
 func (c *Client) writeScheduleIndex(ctx context.Context, entries []schedule.ScheduleEntry, batchID, jobID string, count int) error {
@@ -65,7 +48,7 @@ func (c *Client) writeScheduleIndex(ctx context.Context, entries []schedule.Sche
 		}
 	}
 	instrument.ScheduledIndexFailed(count, batchID, jobID, retries, lastErr)
-	return PartialProduceError{
+	return &PartialProduceError{
 		Message:       "schedule index write failed: " + lastErr.Error(),
 		ProducedCount: 0,
 	}

@@ -20,12 +20,22 @@ func (c *Client) routeFor(entry config.HandlerEntry, jobID, tenantID string, bat
 		if key == "" {
 			key = jobID
 		}
+		var topic string
 		switch lane {
 		case "time":
-			return Route{Topic: c.cfg.resolveTopic(c.cfg.FairnessTimeIngest), Key: key}
+			topic = c.cfg.resolveTopic(c.cfg.FairnessTimeIngest)
 		case "throughput":
-			return Route{Topic: c.cfg.resolveTopic(c.cfg.FairnessThroughputIngest), Key: key}
+			topic = c.cfg.resolveTopic(c.cfg.FairnessThroughputIngest)
+		default:
+			topic = c.cfg.defaultJobsTopic()
 		}
+		if tenantID != "" {
+			if part, ok := c.cfg.FairnessTenantPartitions[tenantID]; ok {
+				p := part
+				return Route{Topic: topic, Partition: &p}
+			}
+		}
+		return Route{Topic: topic, Key: key}
 	}
 	topic := entry.Topic
 	if topic == "" {

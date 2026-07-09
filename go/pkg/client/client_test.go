@@ -38,6 +38,20 @@ func TestResolveRouteFair(t *testing.T) {
 	}
 }
 
+func TestResolveRouteFairPinnedPartition(t *testing.T) {
+	part := int32(2)
+	cfg := DefaultConfig()
+	cfg.FairnessTenantPartitions = map[string]int32{"tenant-a": part}
+	manifest := config.Manifest{Handlers: map[string]config.HandlerEntry{
+		"fair.job": {Runtime: "go", FairnessType: "time"},
+	}}
+	c := &Client{cfg: cfg, manifest: manifest}
+	route := c.routeFor(manifest.Handlers["fair.job"], "j1", "tenant-a", nil)
+	if route.Partition == nil || *route.Partition != part {
+		t.Fatalf("route %+v", route)
+	}
+}
+
 func TestBuildMessageGoHandler(t *testing.T) {
 	manifest := config.Manifest{Handlers: map[string]config.HandlerEntry{
 		"echo": {Runtime: "go", MaxRetries: 5, Uniq: true},

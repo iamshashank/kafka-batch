@@ -53,11 +53,18 @@ _, _ = c.EnqueueJob(ctx, "my.handler", map[string]interface{}{"id": 1}, client.P
 // Batch (block form)
 batch, _ := c.CreateBatch(ctx, client.BatchOptions{OnComplete: "MyCallback"}, func(b *client.Batch) error {
     _, err := b.PushJob(ctx, "my.handler", map[string]interface{}{"id": 1}, client.PushOptions{})
-    return err
-})
+// Batch bulk push
+_, _ = b.PushManyJobs(ctx, "my.handler", []map[string]interface{}{{"id": 1}, {"id": 2}}, client.PushOptions{})
 ```
 
 Wire-compatible with Ruby: same Redis batch keys, job JSON envelope, schedule index members, and uniq fingerprints.
+
+**Integration test binary:**
+
+```bash
+go build -o ../bin/kbatch-client-ittest ./cmd/kbatch-client-ittest
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_client_spec.rb
+```
 
 ## Legacy sidecar
 

@@ -32,6 +32,8 @@ type Config struct {
 
 	FairnessTimeIngest       string
 	FairnessThroughputIngest string
+	// Static tenant_id → ingest partition (Ruby fairness_tenant_partitions).
+	FairnessTenantPartitions map[string]int32
 }
 
 // DefaultConfig returns sensible local defaults.
