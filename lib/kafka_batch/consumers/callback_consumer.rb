@@ -78,14 +78,20 @@ module KafkaBatch
           "jobs=#{data['total_jobs']} ok=#{data['completed_count']} failed=#{data['failed_count']}"
         )
 
-        # on_success fires only when every job succeeded
+        # on_success fires only when every job succeeded (legacy Ruby class only).
         if outcome == "success" && present?(data["on_success"])
-          invoke_callback(data["on_success"], :on_success, data, message)
+          spec = KafkaBatch::Callback.parse(data["on_success"])
+          if spec.is_a?(KafkaBatch::Callback::Legacy)
+            invoke_callback(data["on_success"], :on_success, data, message)
+          end
         end
 
-        # on_complete fires for any terminal outcome
+        # on_complete fires for any terminal outcome (legacy Ruby class only).
         if present?(data["on_complete"])
-          invoke_callback(data["on_complete"], :on_complete, data, message)
+          spec = KafkaBatch::Callback.parse(data["on_complete"])
+          if spec.is_a?(KafkaBatch::Callback::Legacy)
+            invoke_callback(data["on_complete"], :on_complete, data, message)
+          end
         end
 
         # ── Claim AFTER invocation ─────────────────────────────────────────

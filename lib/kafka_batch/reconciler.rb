@@ -178,21 +178,13 @@ module KafkaBatch
 
     # @return [Boolean]
     def self.produce_callback(batch)
-      KafkaBatch::Producer.produce_sync(
-        topic:   KafkaBatch.config.callbacks_topic,
-        payload: {
-          "batch_id"        => batch[:id],
-          "outcome"         => batch["outcome"] || batch[:status],
-          "total_jobs"      => batch[:total_jobs],
-          "completed_count" => batch[:completed_count],
-          "failed_count"    => batch[:failed_count],
-          "on_success"      => batch[:on_success],
-          "on_complete"     => batch[:on_complete],
-          "meta"            => batch[:meta],
-          "finished_at"     => batch[:finished_at],
-          "reconciled"      => batch["reconciled"] || false
-        },
-        key: batch[:id]
+      b = batch.transform_keys(&:to_sym)
+      outcome = batch["outcome"] || batch[:outcome] || b[:status]
+      b[:reconciled] = batch["reconciled"] if batch.key?("reconciled")
+      KafkaBatch::Callbacks::Dispatcher.dispatch!(
+        batch:       b.merge(id: b[:id]),
+        outcome:     outcome,
+        finished_at: b[:finished_at]
       )
       true
     rescue KafkaBatch::ProducerError => e

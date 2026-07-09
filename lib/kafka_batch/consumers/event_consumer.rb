@@ -268,21 +268,7 @@ module KafkaBatch
           failed_count:    batch[:failed_count]
         )
 
-        KafkaBatch::Producer.produce_sync(
-          topic:   KafkaBatch.config.callbacks_topic,
-          payload: {
-            "batch_id"        => batch[:id],
-            "outcome"         => outcome,          # "success" | "complete"
-            "total_jobs"      => batch[:total_jobs],
-            "completed_count" => batch[:completed_count],
-            "failed_count"    => batch[:failed_count],
-            "on_success"      => batch[:on_success],
-            "on_complete"     => batch[:on_complete],
-            "meta"            => batch[:meta],
-            "finished_at"     => Time.now.iso8601
-          },
-          key: batch[:id]
-        )
+        KafkaBatch::Callbacks::Dispatcher.dispatch!(batch: batch, outcome: outcome)
       end
 
       def publish_to_dlt(raw:, error:, topic:)

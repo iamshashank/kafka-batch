@@ -263,32 +263,36 @@ RSpec.describe KafkaBatch::Batch do
     end
   end
 
-  # ── Meta and callback payload propagation ─────────────────────────────────
-  describe "meta hash and callback payload" do
-    it "persists the meta hash and makes it findable" do
-      meta  = { "report_type" => "nightly", "requester" => "ops@example.com" }
+  # ── Meta / callback_args propagation ──────────────────────────────────────
+  describe "meta and callback_args" do
+    it "persists meta on the batch (not sent to callbacks)" do
+      meta  = { "report_type" => "nightly" }
       batch = described_class.create(meta: meta)
       expect(KafkaBatch.store.find_batch(batch.id)[:meta]).to include(meta)
     end
 
-    it "carries meta into the callback payload produced at seal time" do
-      # Complete the job INSIDE the block so the batch is drained when seal!
-      # runs on block return — that's when Batch#produce_callback fires.
-      # Completing after seal! does NOT auto-produce a callback (the EventConsumer
-      # pipeline handles that path; the Batch object handles the block-form path).
-      meta  = { "run_id" => "42" }
-      described_class.create(on_complete: "RecordingCallback", meta: meta) do |b|
+    it "persists callback_args separately from meta" do
+      args = { "run_id" => "42", "slack_channel" => "#imports" }
+      batch = described_class.create(callback_args: args)
+      stored = KafkaBatch.store.find_batch(batch.id)
+      expect(stored[:callback_args]).to eq(args)
+      expect(stored[:meta]).to eq({})
+    end
+
+    it "carries callback_args into the callback payload at seal time" do
+      args = { "run_id" => "42" }
+      described_class.create(on_complete: "RecordingCallback", callback_args: args) do |b|
         b.push(SuccessfulWorker, {})
         KafkaBatch.store.record_completion_by_offset(
           batch_id: b.id, source_topic: "test.success",
           source_partition: 0, job_id: "j1", batch_seq: 1, source_offset: 1, status: "success"
         )
       end
-      # seal! fires now that the batch is drained; callback produced above.
 
       cb = FakeProducer.for_topic(KafkaBatch.config.callbacks_topic)
       expect(cb.last).not_to be_nil
-      expect(cb.last.payload["meta"]).to include("run_id" => "42")
+      expect(cb.last.payload["callback_args"]).to eq("run_id" => "42")
+      expect(cb.last.payload).not_to have_key("meta")
     end
 
     it "stores tenant_id on the batch record" do

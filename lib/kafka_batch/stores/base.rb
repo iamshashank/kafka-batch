@@ -11,7 +11,8 @@ module KafkaBatch
       #   NOT finalize until #seal_batch is called (used by the block form to
       #   bracket initial population). Either way an open batch always accepts
       #   more jobs until it completes or is cancelled.
-      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {}, description: nil, sealed: true)
+      def create_batch(id:, total_jobs:, on_success: nil, on_complete: nil, meta: {},
+                       callback_args: {}, description: nil, tenant_id: nil, sealed: true)
         raise NotImplementedError, "#{self.class}#create_batch"
       end
 

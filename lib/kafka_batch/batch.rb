@@ -43,13 +43,15 @@ module KafkaBatch
     # @param tenant_id [String, nil] default tenant for jobs pushed into this
     #   batch (used by the multi-tenant fairness scheduler). Each push can
     #   override it.
-    def initialize(on_success: nil, on_complete: nil, meta: {}, description: nil, tenant_id: nil, id: nil)
-      @id          = id || SecureRandom.uuid
-      @on_success  = on_success
-      @on_complete = on_complete
-      @meta        = meta
-      @description = description
-      @tenant_id   = tenant_id
+    def initialize(on_success: nil, on_complete: nil, meta: {}, callback_args: {},
+                   description: nil, tenant_id: nil, id: nil)
+      @id            = id || SecureRandom.uuid
+      @on_success    = on_success
+      @on_complete   = on_complete
+      @meta          = meta
+      @callback_args = callback_args
+      @description   = description
+      @tenant_id     = tenant_id
     end
 
     # Create a new batch (persisted immediately with total_jobs = 0).
@@ -60,16 +62,24 @@ module KafkaBatch
     #
     # Without a block: the batch is sealed immediately and will complete as soon
     # as it drains. Returns the Batch for incremental pushing.
-    def self.create(on_success: nil, on_complete: nil, meta: {}, description: nil, tenant_id: nil)
-      batch = new(on_success: on_success, on_complete: on_complete, meta: meta, description: description, tenant_id: tenant_id)
+    def self.create(on_success: nil, on_complete: nil, meta: {}, callback_args: {},
+                    description: nil, tenant_id: nil)
+      on_success  = normalize_callback_spec(on_success)
+      on_complete = normalize_callback_spec(on_complete)
+      batch = new(
+        on_success: on_success, on_complete: on_complete,
+        meta: meta, callback_args: callback_args,
+        description: description, tenant_id: tenant_id
+      )
       KafkaBatch.store.create_batch(
-        id:          batch.id,
-        total_jobs:  0,
-        on_success:  on_success,
-        on_complete: on_complete,
-        meta:        meta,
-        description: description,
-        tenant_id:   tenant_id,
+        id:            batch.id,
+        total_jobs:    0,
+        on_success:    on_success,
+        on_complete:   on_complete,
+        meta:          meta,
+        callback_args: callback_args,
+        description:   description,
+        tenant_id:     tenant_id,
         # Block form: hold the completion gate shut until population finishes.
         sealed:      !block_given?
       )
@@ -110,12 +120,13 @@ module KafkaBatch
       # Bug #13 fix: restore tenant_id from the store record so that jobs pushed
       # via Batch.open inherit the batch-level tenant without re-specifying it.
       new(
-        id:          id,
-        on_success:  data[:on_success],
-        on_complete: data[:on_complete],
-        meta:        data[:meta],
-        description: data[:description],
-        tenant_id:   data[:tenant_id]
+        id:            id,
+        on_success:    data[:on_success],
+        on_complete:   data[:on_complete],
+        meta:          data[:meta],
+        callback_args: data[:callback_args],
+        description:   data[:description],
+        tenant_id:     data[:tenant_id]
       )
     end
 
@@ -728,6 +739,20 @@ module KafkaBatch
       Time.parse(time.to_s)
     end
 
+    def self.normalize_callback_spec(spec)
+      return nil if spec.nil?
+
+      case spec
+      when KafkaBatch::Callback::Job, KafkaBatch::Callback::Legacy
+        KafkaBatch::Callback.dump(spec)
+      when String
+        spec
+      else
+        raise ArgumentError,
+              "on_success/on_complete must be a String or KafkaBatch::Callback.job / .worker"
+      end
+    end
+
     def self.ensure_worker!(worker_class)
       return if worker_class.is_a?(Class) && worker_class.include?(KafkaBatch::Worker)
       raise ArgumentError, "#{worker_class} must include KafkaBatch::Worker"
@@ -947,23 +972,13 @@ module KafkaBatch
       )
     end
 
-    # Produce the callback message when locking finalizes the batch (mirrors
-    # EventConsumer#trigger_callbacks). The CallbackConsumer dedupes via its claim.
+    # Produce batch callbacks when locking finalizes the batch.
     def produce_callback(batch, outcome)
-      KafkaBatch::Producer.produce_sync(
-        topic:   KafkaBatch.config.callbacks_topic,
-        payload: {
-          "batch_id"        => batch[:id],
-          "outcome"         => outcome,
-          "total_jobs"      => batch[:total_jobs],
-          "completed_count" => batch[:completed_count],
-          "failed_count"    => batch[:failed_count],
-          "on_success"      => batch[:on_success],
-          "on_complete"     => batch[:on_complete],
-          "meta"            => batch[:meta],
-          "finished_at"     => batch[:finished_at] || Time.now.iso8601
-        },
-        key: batch[:id]
+      b = batch.transform_keys(&:to_sym)
+      KafkaBatch::Callbacks::Dispatcher.dispatch!(
+        batch:       b.merge(id: b[:id]),
+        outcome:     outcome,
+        finished_at: b[:finished_at]
       )
     end
   end

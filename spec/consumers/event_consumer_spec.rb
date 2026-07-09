@@ -81,7 +81,7 @@ RSpec.describe KafkaBatch::Consumers::EventConsumer do
 
   it "produces a complete (not success) callback when a job failed" do
     id = SecureRandom.uuid
-    KafkaBatch.store.create_batch(id: id, total_jobs: 2)
+    KafkaBatch.store.create_batch(id: id, total_jobs: 2, on_complete: "RecordingCallback")
 
     consumer.send(:process_event, event(id: id, status: "success", src_offset: 10, batch_seq: 1))
     consumer.send(:process_event, event(id: id, status: "failed", src_offset: 11, batch_seq: 2))

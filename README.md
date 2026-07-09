@@ -509,12 +509,106 @@ Workers without `kafka_topic` share `config.jobs_topic` (default `kafka_batch.jo
 
 ## Batches & callbacks
 
+Callbacks are **jobs on a queue** (Sidekiq-style), not in-process Ruby methods. When a batch finalizes, kafka-batch **enqueues a normal job** to the topic you choose — Ruby `JobConsumer` or Go `kbatch worker` runs it.
+
+### Job callbacks (recommended)
+
+Register callback handlers in the manifest (same `job_type` dotted naming as work jobs):
+
+```yaml
+# config/kafka_batch_handlers.yml
+handlers:
+  segment.export:
+    runtime: go
+    topic: segment.exports
+
+  segment.export.on_success:
+    runtime: go
+    topic: segment.exports.callbacks
+
+  segment.export.on_complete:
+    runtime: go
+    topic: segment.exports.callbacks
+
+  import.on_complete:
+    runtime: ruby
+    worker_class: Import::OnCompleteWorker
+    topic: kafka_batch.callbacks.ruby
+```
+
 ```ruby
 KafkaBatch::Batch.create(
-  description: "import run",
+  description: "export run",
+  on_success:  KafkaBatch::Callback.job("segment.export.on_success", topic: "segment.exports.callbacks"),
+  on_complete: KafkaBatch::Callback.job("segment.export.on_complete", topic: "segment.exports.callbacks"),
+  meta:         { "source" => "api" },                    # batch metadata (dashboard, APIs — not sent to callbacks)
+  callback_args: { "run_id" => "42", "channel" => "#ops" } # only passed to on_success / on_complete handlers
+) do |b|
+  b.push_job("segment.export", "segment_id" => 42)          # Go work job
+  b.push(ImportRowWorker, "row_id" => 1)                   # Ruby work job (optional)
+end
+```
+
+**`meta` vs `callback_args`**
+
+| Option | Stored on batch | In callback payload |
+|--------|-----------------|---------------------|
+| `meta` | Yes | No — use for batch labels, audit, `Batch.find` |
+| `callback_args` | Yes | Yes — custom args for your callback job / legacy class only |
+
+Work jobs never receive `callback_args`; only callback handlers see them in `perform(payload)` / `ctx.Payload`.
+
+Go worker registers the callback handler the same way as a work job:
+
+```go
+kbatch.Register("segment.export.on_success", func(ctx *kbatch.Context) error {
+    // ctx.Payload has batch_id, outcome, total_jobs, completed_count, failed_count, callback_args, …
+    return notifySlack(ctx.Payload)
+})
+```
+
+Ruby callback worker:
+
+```ruby
+class Import::OnCompleteWorker
+  include KafkaBatch::Worker
+  job_type "import.on_complete"
+  kafka_topic "kafka_batch.callbacks.ruby"
+
+  def perform(payload)
+    channel = payload.dig("callback_args", "channel") || "#imports"
+    notify_slack(channel, "#{payload['failed_count']} failed in batch #{payload['batch_id']}")
+  end
+end
+```
+
+Or pass a Ruby worker directly:
+
+```ruby
+on_complete: KafkaBatch::Callback.worker(Import::OnCompleteWorker)
+```
+
+| Field | Meaning |
+|---|---|
+| `job_type` | Stable handler id — matches manifest + `kbatch.Register` |
+| `topic` | **Your** execution topic (Go queue or Ruby queue); omit when manifest `topic` is enough |
+| Payload | Batch summary: `batch_id`, `outcome`, `total_jobs`, `completed_count`, `failed_count`, `callback_args`, `callback_kind` (`on_success` / `on_complete`) |
+| `job_id` | Deterministic `#{batch_id}:on_success` / `:on_complete` (idempotent redelivery) |
+
+**Rules**
+
+- Pick a **Go topic** for Go callbacks → `kbatch worker` executes.
+- Pick a **Ruby topic** for Ruby callbacks → Karafka `JobConsumer` executes.
+- Fair handlers need an **explicit callback topic** (callbacks never use fair ingest).
+- Legacy Ruby class strings still work (below) but job callbacks are preferred.
+
+### Legacy Ruby class callbacks
+
+```ruby
+KafkaBatch::Batch.create(
   on_success:  "ImportCallbacks",
   on_complete: "ImportCallbacks",
-  meta:        { "source" => "api" }
+  callback_args: { "slack_channel" => "#imports" }
 ) do |b|
   b.push_many(ProcessUserWorker, users.map { |u| { "user_id" => u.id } })
 end
@@ -523,7 +617,8 @@ end
 ```ruby
 class ImportCallbacks
   def on_success(batch)
-    notify_slack("All #{batch['total_jobs']} succeeded")
+    channel = batch.dig("callback_args", "slack_channel") || "#imports"
+    notify_slack(channel, "All #{batch['total_jobs']} succeeded")
   end
 
   def on_complete(batch)
@@ -532,13 +627,17 @@ class ImportCallbacks
 end
 ```
 
+Legacy callbacks still route through `kafka_batch.callbacks` and `CallbackConsumer` (Ruby control tier).
+
 | Method | Purpose |
 |---|---|
-| `Batch.create` | New batch; block form auto-seals when block exits |
+| `Batch.create` | New batch; block form auto-seals when block exits (`meta`, `callback_args`, callbacks) |
 | `Batch.open(id)` | Push more jobs into a running batch (jobs-adding-jobs) |
 | `Batch.find(id)` | Fetch batch hash from Redis |
 | `Batch.cancel(id)` | Mark cancelled; consumers skip within cache TTL |
 | `Batch.enqueue` | Single job, optional `batch_id:` for open batches |
+| `KafkaBatch::Callback.job` | Build a job callback (`job_type` + optional `topic`) |
+| `KafkaBatch::Callback.worker` | Build a job callback from a Ruby `Worker` class |
 
 **`complete_after_retries`** (per worker or global): after N failures, count the job toward `on_complete` while retries continue in the background.
 
