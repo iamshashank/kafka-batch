@@ -83,6 +83,36 @@ module KafkaBatch
       workers.select(&:fairness?).map(&:fairness_type).uniq
     end
 
+    # True when any handler (worker or manifest) uses a fair lane for a runtime.
+    def fair_handlers_for_runtime?(runtime, lane)
+      lane = lane.to_sym
+      rt   = runtime.to_sym
+      workers.any? { |w| w.fairness? && w.fairness_type == lane && w.executor == rt } ||
+        manifest_fair_handlers_for_runtime?(rt, lane)
+    end
+
+    # Kafka ready topic Ruby Karafka should consume for a fairness lane.
+    # Returns nil when no ruby fair handlers are registered.
+    def fair_ready_consume_topic(lane)
+      lane = lane.to_sym
+      return nil unless fair_handlers_for_runtime?(:ruby, lane)
+
+      cfg = config
+      if cfg.runtime_split_fair_ready?(lane)
+        cfg.fairness_ready_topic(lane, :ruby)
+      else
+        cfg.fairness_ready_topic(lane)
+      end
+    end
+
+    def manifest_fair_handlers_for_runtime?(runtime, lane)
+      return false unless HandlerManifest.loaded?
+
+      HandlerManifest.definitions.values.any? do |d|
+        d.fairness_type == lane && d.runtime == runtime
+      end
+    end
+
     # Loaded priority group definitions from YAML (empty when no paths configured).
     def priority_registry
       @priority_registry ||= Priority::Registry.load(config.resolved_priority_config_paths)
@@ -160,8 +190,11 @@ module KafkaBatch
               max_messages cfg.fairness_dispatcher_batch_size
             end
           end
-          consumer_group "#{cfg.consumer_group}-jobs-fair-#{ft}" do
-            topic(cfg.fairness_ready_topic(ft)) { consumer KafkaBatch::Consumers::JobConsumer }
+          ready_topic = KafkaBatch.fair_ready_consume_topic(ft)
+          if ready_topic && !ready_topic.to_s.empty?
+            consumer_group "#{cfg.consumer_group}-jobs-fair-#{ft}" do
+              topic(ready_topic) { consumer KafkaBatch::Consumers::JobConsumer }
+            end
           end
         end
 
@@ -215,6 +248,7 @@ module KafkaBatch
       end
 
       logger.info("[KafkaBatch] All #{required.size} required topics verified.")
+      validate_fair_ready_split!
       validate_fairness_partitions!(strict: true)
       warn_dispatcher_concurrency!
     end
@@ -244,6 +278,23 @@ module KafkaBatch
         "which breaks per-tenant fairness under load. " \
         "Set `config.concurrency = #{needed}` (or higher) in your karafka.rb."
       )
+    end
+
+    def validate_fair_ready_split!
+      return unless fairness?
+
+      load_handler_manifest! if config.resolved_handler_manifest_path && !HandlerManifest.loaded?
+
+      %i[time throughput].each do |lane|
+        go_fair   = fair_handlers_for_runtime?(:go, lane)
+        ruby_fair = fair_handlers_for_runtime?(:ruby, lane)
+        next unless go_fair && ruby_fair
+        next if config.runtime_split_fair_ready?(lane)
+
+        raise ConfigurationError,
+              "hybrid fairness on #{lane} lane requires split ready topics " \
+              "(fairness_#{lane}_ready_go and fairness_#{lane}_ready_ruby)"
+      end
     end
 
     def validate_fairness_partitions!(strict: config.validate_topics_on_boot)

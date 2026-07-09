@@ -280,6 +280,20 @@ module KafkaBatch
       end
     end
 
+    # True when per-runtime ready topics (.go / .ruby) are configured for a lane.
+    # Mirrors Go config.RuntimeSplitFairReady.
+    def runtime_split_fair_ready?(type = :time)
+      ft = type.to_sym == :throughput ? :throughput : :time
+      go_topic, ruby_topic =
+        case ft
+        when :throughput
+          [fair_throughput_ready_go_topic.to_s, fair_throughput_ready_ruby_topic.to_s]
+        else
+          [fair_time_ready_go_topic.to_s, fair_time_ready_ruby_topic.to_s]
+        end
+      !go_topic.empty? && !ruby_topic.empty?
+    end
+
     # Global in-flight window: max jobs forwarded to the ready topic but not yet
     # completed. Bounds ready-topic depth (keeps fairness dynamic) AND total
     # fair-lane concurrency. The per-tenant share is derived dynamically as

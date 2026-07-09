@@ -121,6 +121,26 @@ module KafkaBatch
       def lookup_by_job_type(job_type)
         @mutex.synchronize { @by_job_type[job_type.to_s] }
       end
+
+      # Resolve handler runtime from a job payload (for fair forwarder routing).
+      # Defaults to :ruby when unknown (Ruby-only stacks).
+      def runtime_for_payload(data)
+        data = data.transform_keys(&:to_s) if data.respond_to?(:transform_keys)
+        job_type = data["job_type"]
+        if job_type && !job_type.to_s.empty?
+          handler = lookup_by_job_type(job_type)
+          return handler.runtime if handler
+        end
+
+        worker_name = data["worker_class"]
+        if worker_name && !worker_name.to_s.empty?
+          handler = @mutex.synchronize { @by_worker_class[worker_name.to_s] }
+          return handler.runtime if handler
+        end
+
+        :ruby
+      end
+
       private :lookup_by_job_type
 
       def resolve_by_worker_class!(worker_name)

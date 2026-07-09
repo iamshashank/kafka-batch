@@ -19,5 +19,11 @@ func (c Daemon) FairnessThroughputSettings() fairness.Settings {
 		s.DefaultWeight = c.FairnessDefaultWeight
 	}
 	s.WeightedConcurrency = c.FairnessWeightedConcurrency
+	if c.FairnessActiveCountTTL > 0 {
+		s.ActiveCountTTL = c.FairnessActiveCountTTL
+	}
+	s.ActiveCountSource = c.FairnessActiveCountSource
+	s.DispatchConsumerGroup = c.DispatchConsumerGroup("throughput")
+	s.IngestTopic = c.FairnessThroughputIngest
 	return s
 }

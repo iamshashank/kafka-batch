@@ -1,9 +1,11 @@
 package schedule
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
+	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
 )
 
 // Route describes where a scheduled job should be re-produced.
@@ -18,6 +20,7 @@ type DaemonRouter struct {
 	Manifest config.Manifest
 	Cfg      config.Daemon
 	Default  string
+	Tenants  *fairness.TenantPartitions
 }
 
 func (r DaemonRouter) Route(payload map[string]interface{}) (Route, error) {
@@ -57,26 +60,36 @@ func (r DaemonRouter) Route(payload map[string]interface{}) (Route, error) {
 }
 
 func (r DaemonRouter) fairRoute(fairnessType, jobID, tenantID, batchID string) (Route, error) {
+	key := tenantID
+	if key == "" {
+		key = batchID
+	}
+	if key == "" {
+		key = jobID
+	}
+	var topic string
 	switch fairnessType {
 	case "time":
-		key := tenantID
-		if key == "" {
-			key = batchID
-		}
-		if key == "" {
-			key = jobID
-		}
-		return Route{Topic: r.Cfg.FairnessTimeIngest, Key: key}, nil
+		topic = r.Cfg.FairnessTimeIngest
 	case "throughput":
-		key := tenantID
-		if key == "" {
-			key = batchID
-		}
-		if key == "" {
-			key = jobID
-		}
-		return Route{Topic: r.Cfg.FairnessThroughputIngest, Key: key}, nil
+		topic = r.Cfg.FairnessThroughputIngest
 	default:
 		return Route{}, fmt.Errorf("unknown fairness_type %q", fairnessType)
 	}
+	route := Route{Topic: topic, Key: key}
+	if tenantID != "" {
+		if part, ok := r.Cfg.FairnessTenantPartitions[tenantID]; ok {
+			p := part
+			route.Partition = &p
+			route.Key = ""
+			return route, nil
+		}
+		if r.Tenants != nil {
+			if p := r.Tenants.Resolve(context.Background(), tenantID, fairnessType); p != nil {
+				route.Partition = p
+				route.Key = ""
+			}
+		}
+	}
+	return route, nil
 }

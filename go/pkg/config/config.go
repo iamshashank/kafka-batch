@@ -64,6 +64,16 @@ type Daemon struct {
 	FairnessLeaseTTL          float64
 	FairnessDefaultWeight     float64
 	FairnessWeightedConcurrency bool
+	FairnessActiveCountTTL      time.Duration
+	FairnessActiveCountSource   string
+	FairnessTenantPartitions    map[string]int32
+	FairnessDynamicTenantPartitions bool
+	FairnessTenantPartitionCacheTTL time.Duration
+	Store                       string
+	StoreMySQLDSN               string
+	LivenessEnabled             bool
+	LivenessTTL                 time.Duration
+	LivenessHTTPAddr            string
 	MetricsEnabled              bool
 	MetricsPrefix               string
 	MetricsStatsDAddr           string
@@ -114,6 +124,11 @@ func DefaultDaemon() Daemon {
 		FairnessLeaseTTL:          1800,
 		FairnessDefaultWeight:     1.0,
 		FairnessWeightedConcurrency: true,
+		FairnessActiveCountTTL:      5 * time.Second,
+		FairnessActiveCountSource:   "inflight_plus_ready",
+		FairnessTenantPartitionCacheTTL: 30 * time.Second,
+		LivenessTTL:                 30 * time.Second,
+		LivenessHTTPAddr:            ":8080",
 		MetricsPrefix:               "kafka_batch",
 		ReconciliationInterval:      300 * time.Second,
 		ReconcilerLockTTL:           600 * time.Second,
@@ -177,6 +192,16 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairnessLeaseTTL          float64    `yaml:"fairness_lease_ttl"`
 		FairnessDefaultWeight     float64    `yaml:"fairness_default_weight"`
 		FairnessWeightedConcurrency bool     `yaml:"fairness_weighted_concurrency"`
+		FairnessActiveCountTTLSec   float64  `yaml:"fairness_active_count_ttl"`
+		FairnessActiveCountSource   string   `yaml:"fairness_active_count_source"`
+		FairnessTenantPartitions    map[string]int32 `yaml:"fairness_tenant_partitions"`
+		FairnessDynamicTenantPartitions bool `yaml:"fairness_dynamic_tenant_partitions"`
+		FairnessTenantPartitionCacheTTLSec float64 `yaml:"fairness_tenant_partition_cache_ttl"`
+		Store                       string   `yaml:"store"`
+		StoreMySQLDSN               string   `yaml:"store_mysql_dsn"`
+		LivenessEnabled             bool     `yaml:"liveness_enabled"`
+		LivenessTTLSec              float64  `yaml:"liveness_ttl"`
+		LivenessHTTPAddr            string   `yaml:"liveness_http_addr"`
 		MetricsEnabled              bool     `yaml:"metrics_enabled"`
 		MetricsPrefix               string   `yaml:"metrics_prefix"`
 		MetricsStatsDAddr           string   `yaml:"metrics_statsd_addr"`
@@ -322,6 +347,36 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.FairnessWeightedConcurrency {
 		cfg.FairnessWeightedConcurrency = true
 	}
+	if doc.FairnessActiveCountTTLSec > 0 {
+		cfg.FairnessActiveCountTTL = time.Duration(doc.FairnessActiveCountTTLSec * float64(time.Second))
+	}
+	if doc.FairnessActiveCountSource != "" {
+		cfg.FairnessActiveCountSource = doc.FairnessActiveCountSource
+	}
+	if len(doc.FairnessTenantPartitions) > 0 {
+		cfg.FairnessTenantPartitions = doc.FairnessTenantPartitions
+	}
+	if doc.FairnessDynamicTenantPartitions {
+		cfg.FairnessDynamicTenantPartitions = true
+	}
+	if doc.FairnessTenantPartitionCacheTTLSec > 0 {
+		cfg.FairnessTenantPartitionCacheTTL = time.Duration(doc.FairnessTenantPartitionCacheTTLSec * float64(time.Second))
+	}
+	if doc.Store != "" {
+		cfg.Store = doc.Store
+	}
+	if doc.StoreMySQLDSN != "" {
+		cfg.StoreMySQLDSN = doc.StoreMySQLDSN
+	}
+	if doc.LivenessEnabled {
+		cfg.LivenessEnabled = true
+	}
+	if doc.LivenessTTLSec > 0 {
+		cfg.LivenessTTL = time.Duration(doc.LivenessTTLSec * float64(time.Second))
+	}
+	if doc.LivenessHTTPAddr != "" {
+		cfg.LivenessHTTPAddr = doc.LivenessHTTPAddr
+	}
 	if doc.MetricsEnabled {
 		cfg.MetricsEnabled = true
 	}
@@ -382,6 +437,15 @@ func applyEnv(cfg *Daemon) {
 	}
 	if v := os.Getenv("KAFKA_BATCH_METRICS_PREFIX"); v != "" {
 		cfg.MetricsPrefix = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("KAFKA_BATCH_STORE_MYSQL_DSN"); v != "" {
+		cfg.StoreMySQLDSN = v
+	}
+	if v := os.Getenv("KAFKA_BATCH_LIVENESS_HTTP_ADDR"); v != "" {
+		cfg.LivenessHTTPAddr = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("KAFKA_BATCH_LIVENESS_ENABLED"); v == "1" || strings.EqualFold(v, "true") {
+		cfg.LivenessEnabled = true
 	}
 	if v := os.Getenv("KAFKA_BATCH_METRICS_STATSD_ADDR"); v != "" {
 		cfg.MetricsStatsDAddr = strings.TrimSpace(v)

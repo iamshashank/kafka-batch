@@ -12,7 +12,6 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
-	"github.com/y-shashank/kafka-batch/go/pkg/consumption"
 	"github.com/y-shashank/kafka-batch/go/pkg/control/job"
 	"github.com/y-shashank/kafka-batch/go/pkg/daemon"
 	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
@@ -112,7 +111,13 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	handleJob := daemon.BuildJobHandler(cfg, prod, jobProc)
-	pauseCtl := consumption.NewControl(rdb, cfg.ConsumptionControlRefreshInterval)
+	pauseCtl, _, closePauseCtl := daemon.BuildPauseControl(cfg, rdb)
+	defer closePauseCtl()
+	failures, closeFailures := daemon.BuildFailureRecorder(cfg, st)
+	defer closeFailures()
+	jobProc.Failures = failures
+	live := daemon.NewLivenessReporter(cfg, rdb)
+	daemon.StartHealthServer(ctx, cfg, "worker")
 
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -121,7 +126,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	group := cfg.ConsumerGroup + "-go-worker"
 
 	if len(jobTopics) > 0 {
-		go daemon.RunConsumer(ctx, cfg.Brokers, group+"-jobs", jobTopics, handleJob, errCh, pauseCtl)
+		go daemon.RunConsumer(ctx, cfg.Brokers, group+"-jobs", jobTopics, handleJob, errCh, pauseCtl, live)
 	}
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
@@ -133,12 +138,12 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	for _, pc := range goPrio {
 		gate := priority.NewGate(priorityLag, cfg.PriorityLagCheckInterval)
 		gate.Consumption = pauseCtl
-		go daemon.RunPriorityGroup(ctx, cfg, pc, gate, handleJob, errCh, pauseCtl)
+		go daemon.RunPriorityGroup(ctx, cfg, pc, gate, handleJob, errCh, pauseCtl, live)
 	}
 
 	for _, spec := range fairReadyTopics {
-		go daemon.RunConsumer(ctx, cfg.Brokers, group+"-fair-ready-"+spec.lane,
-			[]string{spec.topic}, handleJob, errCh, pauseCtl)
+		go daemon.RunConsumer(ctx, cfg.Brokers, cfg.GoWorkerFairReadyGroup(spec.lane),
+			[]string{spec.topic}, handleJob, errCh, pauseCtl, live)
 	}
 
 	log.Printf("kbatch go-worker running group=%s plain=%v priority_groups=%d fair_ready=%v",

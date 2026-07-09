@@ -380,6 +380,12 @@ func (s *Scheduler) activeViewCached() activeView {
 }
 
 func (s *Scheduler) computeActiveView(ctx context.Context) activeView {
+	if s.Settings.ActiveCountSource == "ingest_lag" && s.Settings.IngestLag != nil {
+		n, err := s.Settings.IngestLag.IngestActiveCount(ctx, s.Settings.DispatchConsumerGroup, s.Settings.IngestTopic)
+		if err == nil {
+			return activeView{count: n, sumWeight: 0}
+		}
+	}
 	members, err := s.Client.ZRange(ctx, ringKey(s.Lane), 0, -1).Result()
 	if err != nil {
 		return activeView{}

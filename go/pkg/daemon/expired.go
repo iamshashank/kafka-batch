@@ -15,14 +15,15 @@ import (
 )
 
 type expiredPublisher struct {
-	cfg   config.Daemon
-	prod  *kafkaclient.Client
-	store *store.RedisStore
-	now   func() time.Time
+	cfg      config.Daemon
+	prod     *kafkaclient.Client
+	store    *store.RedisStore
+	failures store.FailureRecorder
+	now      func() time.Time
 }
 
-func newExpiredPublisher(cfg config.Daemon, prod *kafkaclient.Client, st *store.RedisStore) expiredPublisher {
-	return expiredPublisher{cfg: cfg, prod: prod, store: st, now: time.Now}
+func newExpiredPublisher(cfg config.Daemon, prod *kafkaclient.Client, st *store.RedisStore, failures store.FailureRecorder) expiredPublisher {
+	return expiredPublisher{cfg: cfg, prod: prod, store: st, failures: failures, now: time.Now}
 }
 
 func (p expiredPublisher) publish(ctx context.Context, raw []byte, src protocol.SourceCoords) error {
@@ -63,13 +64,19 @@ func (p expiredPublisher) publish(ctx context.Context, raw []byte, src protocol.
 			return err
 		}
 	}
-	if drop.Failure != nil && p.store != nil {
-		_ = p.store.RecordFailure(ctx, store.FailureEntry{
+	if drop.Failure != nil {
+		rec := p.failures
+		if rec == nil && p.store != nil {
+			rec = p.store
+		}
+		if rec != nil {
+			_ = rec.RecordFailure(ctx, store.FailureEntry{
 			BatchID: drop.Failure.BatchID, JobID: drop.Failure.JobID,
 			WorkerClass: drop.Failure.WorkerClass, ErrorClass: drop.Failure.ErrorClass,
 			ErrorMessage: drop.Failure.ErrorMessage, Status: drop.Failure.Status,
-			Attempt: drop.Failure.Attempt,
-		})
+				Attempt: drop.Failure.Attempt,
+			})
+		}
 	}
 	if drop.DLTPayload != nil {
 		if err := p.prod.Produce(ctx, p.cfg.DeadLetterTopic, drop.DLTKey, drop.DLTPayload); err != nil {

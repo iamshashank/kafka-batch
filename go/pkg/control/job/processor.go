@@ -24,6 +24,7 @@ type Processor struct {
 	Cfg            config.Daemon
 	Manifest       config.Manifest
 	Store          *store.RedisStore
+	Failures       store.FailureRecorder
 	Producer       Producer
 	FairTime       *fairness.Scheduler
 	FairThroughput *fairness.Scheduler
@@ -72,8 +73,8 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		out.Event = drop.Event
 		out.DLTPayload = drop.DLTPayload
 		out.DLTKey = drop.DLTKey
-		if drop.Failure != nil && p.Store != nil {
-			_ = p.Store.RecordFailure(ctx, store.FailureEntry{
+		if drop.Failure != nil {
+			p.recordFailure(ctx, store.FailureEntry{
 				BatchID: drop.Failure.BatchID, JobID: drop.Failure.JobID,
 				WorkerClass: drop.Failure.WorkerClass, ErrorClass: drop.Failure.ErrorClass,
 				ErrorMessage: drop.Failure.ErrorMessage, Status: drop.Failure.Status,
@@ -327,5 +328,15 @@ func nonRetryable(err error) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func (p *Processor) recordFailure(ctx context.Context, e store.FailureEntry) {
+	rec := p.Failures
+	if rec == nil && p.Store != nil {
+		rec = p.Store
+	}
+	if rec != nil {
+		_ = rec.RecordFailure(ctx, e)
 	}
 }

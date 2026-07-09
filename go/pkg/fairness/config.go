@@ -1,8 +1,16 @@
 package fairness
 
-import "time"
+import (
+	"context"
+	"time"
+)
 
 const LeaseTTLFloor = 60.0
+
+// IngestLagCounter reports active ingest partitions for fairness cap denominators.
+type IngestLagCounter interface {
+	IngestActiveCount(ctx context.Context, group, topic string) (int, error)
+}
 
 // Settings holds per-lane fairness configuration (mirrors Ruby KafkaBatch.config).
 type Settings struct {
@@ -14,6 +22,10 @@ type Settings struct {
 	DefaultWeight           float64
 	WeightedConcurrency     bool
 	ActiveCountTTL          time.Duration
+	ActiveCountSource       string
+	IngestLag               IngestLagCounter
+	DispatchConsumerGroup   string
+	IngestTopic             string
 	ForwardingRecoveryGrace float64
 	SlotDedupTTL            int
 	WeightCacheTTL          time.Duration
