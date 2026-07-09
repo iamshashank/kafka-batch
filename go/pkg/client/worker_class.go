@@ -43,6 +43,10 @@ func (wc WorkerClassConfig) jobTypeFor(className string) string {
 func (wc WorkerClassConfig) toEntry(className string, cfg Config) config.HandlerEntry {
 	topic := wc.Topic
 	applyPrefix := wc.ApplyTopicPrefix
+	if topic == "" {
+		topic = cfg.JobsTopic
+		applyPrefix = true
+	}
 	if topic != "" && applyPrefix {
 		topic = cfg.resolveTopic(topic)
 		applyPrefix = false
@@ -63,7 +67,16 @@ func (wc WorkerClassConfig) toEntry(className string, cfg Config) config.Handler
 func (c *Client) lookupWorkerClass(workerClass string) (string, config.HandlerEntry, error) {
 	b, ok := c.workerByClass[workerClass]
 	if !ok {
-		return "", config.HandlerEntry{}, UnknownWorkerClassError{WorkerClass: workerClass}
+		if c.cfg.AllowUnknownWorkerClasses || len(c.cfg.Workers) > 0 {
+			if wc, ok := c.cfg.Workers[workerClass]; ok {
+				b = workerBinding{jobType: wc.jobTypeFor(workerClass), entry: wc.toEntry(workerClass, c.cfg)}
+			} else if c.cfg.AllowUnknownWorkerClasses {
+				b = workerBinding{jobType: workerClass, entry: WorkerClassConfig{}.toEntry(workerClass, c.cfg)}
+			}
+		}
+		if b.jobType == "" && b.entry.WorkerClass == "" {
+			return "", config.HandlerEntry{}, UnknownWorkerClassError{WorkerClass: workerClass}
+		}
 	}
 	entry := b.entry
 	entry.WorkerClass = workerClass

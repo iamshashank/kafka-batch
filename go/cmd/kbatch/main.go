@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
@@ -14,6 +15,7 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch/go/pkg/reconciler"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
+	"github.com/y-shashank/kafka-batch/go/pkg/topics"
 	"github.com/y-shashank/kafka-batch/go/pkg/worker"
 
 	"github.com/redis/go-redis/v9"
@@ -34,6 +36,8 @@ func main() {
 		runWorker(os.Args[2:])
 	case "reconcile":
 		runReconcile(os.Args[2:])
+	case "topics":
+		runTopics(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -131,6 +135,104 @@ func runReconcile(args []string) {
 	}
 }
 
+func runTopics(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "topics requires create or validate")
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "create":
+		runTopicsCreate(args[1:])
+	case "validate":
+		runTopicsValidate(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown topics subcommand %q\n", args[0])
+		os.Exit(2)
+	}
+}
+
+func runTopicsCreate(args []string) {
+	fs := flag.NewFlagSet("topics create", flag.ExitOnError)
+	brokers := fs.String("brokers", "localhost:9092", "comma-separated brokers")
+	manifest := fs.String("manifest", "", "handler manifest YAML")
+	prefix := fs.String("topic-prefix", "", "topic prefix")
+	partitions := fs.Int("partitions", 0, "force partition count for all topics")
+	includeControl := fs.Bool("include-control", false, "also provision events/dead_letter")
+	_ = fs.Parse(args)
+
+	ct := topics.ClientTopics{
+		Brokers:             strings.Split(*brokers, ","),
+		TopicPrefix:         *prefix,
+		JobsTopic:           "kafka_batch.jobs",
+		ScheduledTopic:      "kafka_batch.scheduled",
+		CallbacksTopic:      "kafka_batch.callbacks",
+		FairnessTimeIngest:  "kafka_batch.fair_time_ingest",
+		FairnessThroughputIngest: "kafka_batch.fair_throughput_ingest",
+		IncludeControlPlane: *includeControl,
+	}
+	if *partitions > 0 {
+		ct.ForcePartitions = int32(*partitions)
+	}
+	if *manifest != "" {
+		m, err := config.LoadManifest(*manifest, *prefix)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "kbatch topics create: %v\n", err)
+			os.Exit(1)
+		}
+		ct.Manifest = m
+	}
+	res, err := topics.CreateAll(context.Background(), ct.Brokers, topics.Specs(ct))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kbatch topics create: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("created=%d skipped=%d failed=%d\n", len(res.Created), len(res.Skipped), len(res.Failed))
+	for _, f := range res.Failed {
+		fmt.Printf("FAILED %s: %s\n", f.Name, f.Error)
+	}
+	if len(res.Failed) > 0 {
+		os.Exit(1)
+	}
+}
+
+func runTopicsValidate(args []string) {
+	fs := flag.NewFlagSet("topics validate", flag.ExitOnError)
+	brokers := fs.String("brokers", "localhost:9092", "comma-separated brokers")
+	manifest := fs.String("manifest", "", "handler manifest YAML")
+	prefix := fs.String("topic-prefix", "", "topic prefix")
+	includeControl := fs.Bool("include-control", false, "also check events/dead_letter")
+	_ = fs.Parse(args)
+
+	ct := topics.ClientTopics{
+		Brokers:             strings.Split(*brokers, ","),
+		TopicPrefix:         *prefix,
+		JobsTopic:           "kafka_batch.jobs",
+		ScheduledTopic:      "kafka_batch.scheduled",
+		CallbacksTopic:      "kafka_batch.callbacks",
+		FairnessTimeIngest:  "kafka_batch.fair_time_ingest",
+		FairnessThroughputIngest: "kafka_batch.fair_throughput_ingest",
+		IncludeControlPlane: *includeControl,
+	}
+	if *manifest != "" {
+		m, err := config.LoadManifest(*manifest, *prefix)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "kbatch topics validate: %v\n", err)
+			os.Exit(1)
+		}
+		ct.Manifest = m
+	}
+	missing, err := topics.Missing(context.Background(), ct.Brokers, topics.Specs(ct))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "kbatch topics validate: %v\n", err)
+		os.Exit(1)
+	}
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "missing topics: %s\n", strings.Join(missing, ", "))
+		os.Exit(1)
+	}
+	fmt.Println("all required topics exist")
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, `kbatch — KafkaBatch Go runtime
 
@@ -139,6 +241,8 @@ Usage:
   kbatch daemon --config PATH [--manifest PATH]   # control plane
   kbatch worker --config PATH [--manifest PATH]   # Go backend consumer
   kbatch reconcile --config PATH                  # one-shot stuck-batch sweep
+  kbatch topics create [--brokers HOST:PORT] [--manifest PATH]
+  kbatch topics validate [--brokers HOST:PORT] [--manifest PATH]
 
 Environment:
   KAFKA_BROKERS, KAFKA_PREFIX, REDIS_URL, KAFKA_BATCH_HANDLER_MANIFEST

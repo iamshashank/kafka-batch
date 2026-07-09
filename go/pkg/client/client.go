@@ -103,6 +103,12 @@ func New(cfg Config) (*Client, error) {
 		_ = c.tenants.Warm(context.Background(), "time")
 		_ = c.tenants.Warm(context.Background(), "throughput")
 	}
+	if cfg.ValidateTopicsOnConnect {
+		if err := c.ValidateTopics(context.Background()); err != nil {
+			c.Close()
+			return nil, err
+		}
+	}
 	return c, nil
 }
 

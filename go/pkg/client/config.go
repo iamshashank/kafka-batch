@@ -43,6 +43,19 @@ type Config struct {
 
 	// Workers maps Ruby worker class names to routing when not found via manifest worker_class.
 	Workers map[string]WorkerClassConfig
+
+	// AllowUnknownWorkerClasses routes unrecognized worker class strings to JobsTopic
+	// (Ruby-style plain enqueue without a manifest entry).
+	AllowUnknownWorkerClasses bool
+
+	TopicsReplicationFactor int
+	TopicsIncludeControlPlane bool
+	ValidateTopicsOnConnect   bool
+
+	EventsTopic     string
+	DeadLetterTopic string
+	TopicsExtra     []string
+	TopicsForcePartitions int32
 }
 
 // WorkerClassConfig describes a Ruby Worker#perform handler for produce routing.
@@ -65,6 +78,8 @@ func DefaultConfig() Config {
 		JobsTopic:                 "kafka_batch.jobs",
 		ScheduledTopic:            "kafka_batch.scheduled",
 		CallbacksTopic:            "kafka_batch.callbacks",
+		EventsTopic:               "kafka_batch.events",
+		DeadLetterTopic:           "kafka_batch.dead_letter",
 		BatchTTL:                  7 * 24 * time.Hour,
 		MaxRetries:                25,
 		CompleteAfterRetries:      3,

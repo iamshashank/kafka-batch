@@ -54,7 +54,21 @@ func TestBuildWorkerMessageUsesClassName(t *testing.T) {
 	}
 }
 
-func TestUnknownWorkerClass(t *testing.T) {
+func TestUnknownWorkerClassAllowed(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.AllowUnknownWorkerClasses = true
+	c := &Client{cfg: cfg, manifest: config.Manifest{}}
+	c.buildWorkerIndex()
+	jt, entry, err := c.lookupWorkerClass("MyApp::AdHocWorker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jt != "MyApp::AdHocWorker" || entry.Topic == "" {
+		t.Fatalf("jt=%s entry=%+v", jt, entry)
+	}
+}
+
+func TestUnknownWorkerClassRejected(t *testing.T) {
 	c := &Client{cfg: DefaultConfig(), manifest: config.Manifest{}}
 	c.buildWorkerIndex()
 	_, _, err := c.lookupWorkerClass("Missing::Worker")
