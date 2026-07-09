@@ -3,6 +3,7 @@ package fairness
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 
@@ -16,10 +17,11 @@ type Producer interface {
 
 // Forwarder checks out fairly-selected jobs and produces to the ready topic.
 type Forwarder struct {
-	Lane       Lane
-	Scheduler  *Scheduler
-	ReadyTopic string
-	Producer   Producer
+	Lane              Lane
+	Scheduler         *Scheduler
+	ReadyTopic        string
+	ResolveReadyTopic func(payload []byte) (string, error)
+	Producer          Producer
 	IdleSleep  time.Duration
 	Burst      int
 	Now        func() time.Time
@@ -82,7 +84,12 @@ func (f *Forwarder) forwardJob(ctx context.Context, job *CheckoutResult) error {
 	if key == "" {
 		key = job.TenantID
 	}
-	if err := f.Producer.Produce(ctx, f.ReadyTopic, key, marked); err != nil {
+	readyTopic, err := f.readyTopicFor(job.Payload)
+	if err != nil {
+		_, _ = f.Scheduler.AbortForward(ctx, job.SlotID, job.TenantID)
+		return err
+	}
+	if err := f.Producer.Produce(ctx, readyTopic, key, marked); err != nil {
 		_, _ = f.Scheduler.AbortForward(ctx, job.SlotID, job.TenantID)
 		return err
 	}
@@ -138,7 +145,11 @@ func (f *Forwarder) maybeReclaim(ctx context.Context) {
 		}
 		for _, e := range stale {
 			_ = f.Scheduler.ReclaimStaleForward(ctx, e, func(payload []byte, key string) error {
-				return f.Producer.Produce(ctx, f.ReadyTopic, key, payload)
+				readyTopic, err := f.readyTopicFor(payload)
+				if err != nil {
+					return err
+				}
+				return f.Producer.Produce(ctx, readyTopic, key, payload)
 			})
 		}
 	}
@@ -149,4 +160,14 @@ func (f *Forwarder) now() time.Time {
 		return f.Now()
 	}
 	return time.Now()
+}
+
+func (f *Forwarder) readyTopicFor(payload []byte) (string, error) {
+	if f.ResolveReadyTopic != nil {
+		return f.ResolveReadyTopic(payload)
+	}
+	if f.ReadyTopic != "" {
+		return f.ReadyTopic, nil
+	}
+	return "", fmt.Errorf("forwarder has no ready topic router configured")
 }

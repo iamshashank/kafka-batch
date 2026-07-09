@@ -9,6 +9,7 @@ require_relative "../support/ruby_callback_server"
 require_relative "../support/callback_doubles"
 
 RSpec.describe "Go daemon Ruby callbacks (integration)", :integration do
+  include KafkaBatchSpec::GoWorkerLifecycle
   def configured_brokers
     ENV["KAFKA_BATCH_TEST_BROKERS"].to_s
   end
@@ -63,11 +64,11 @@ RSpec.describe "Go daemon Ruby callbacks (integration)", :integration do
     configure_kafka_batch!
     @callback_server = KafkaBatchSpec::RubyCallbackServer.new(socket_path: @callback_socket)
     @callback_server.start!
-    start_daemon!
+    start_go_stack!
   end
 
   after(:each) do
-    stop_daemon! if @daemon_pid
+    stop_go_stack! if @daemon_pid
     @callback_server&.stop!
     FileUtils.rm_rf(@tmpdir) if @tmpdir
     KafkaBatch::Producer.reset! if opted_in?

@@ -8,6 +8,7 @@ require_relative "../support/go_daemon_helper"
 require_relative "../support/mysql_schedule_helper"
 
 RSpec.describe "Go daemon schedule poller (MySQL store, integration)", :integration do
+  include KafkaBatchSpec::GoWorkerLifecycle
   def configured_brokers
     ENV["KAFKA_BATCH_TEST_BROKERS"].to_s
   end
@@ -63,11 +64,11 @@ RSpec.describe "Go daemon schedule poller (MySQL store, integration)", :integrat
     end
 
     configure_kafka_batch!
-    start_daemon!
+    start_go_stack!
   end
 
   after(:each) do
-    stop_daemon! if @daemon_pid
+    stop_go_stack! if @daemon_pid
     FileUtils.rm_rf(@tmpdir) if @tmpdir
     KafkaBatch::Producer.reset! if opted_in?
     KafkaBatchSpec::MysqlScheduleHelper.truncate! if KafkaBatchSpec::MysqlScheduleHelper.available?

@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module KafkaBatch
-# Maps stable job_type identifiers to execution handlers (:ruby in-process, :go sidecar).
+# Maps stable job_type identifiers to execution handlers (:ruby in-process; :go via legacy sidecar or manifest + kbatch worker).
   class HandlerRegistry
     class UnknownHandler < Error; end
 

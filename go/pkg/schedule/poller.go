@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
+	"github.com/y-shashank/kafka-batch/go/pkg/instrument"
 )
 
 // Producer dispatches due jobs back to execution topics.
@@ -159,6 +160,19 @@ func (p *Poller) produceDue(ctx context.Context, raw []byte, jobID string) bool 
 		log.Printf("[kbatch-schedule] produce job_id=%s: %v", jobID, produceErr)
 		return false
 	}
+	batchID, _ := data["batch_id"].(string)
+	workerClass, _ := data["worker_class"].(string)
+	if workerClass == "" {
+		if jt, ok := data["job_type"].(string); ok {
+			workerClass = jt
+		}
+	}
+	instrument.Emit("scheduled.dispatched", map[string]interface{}{
+		"job_id":       jobID,
+		"batch_id":     batchID,
+		"worker_class": workerClass,
+		"topic":        route.Topic,
+	}, 0)
 	return true
 }
 

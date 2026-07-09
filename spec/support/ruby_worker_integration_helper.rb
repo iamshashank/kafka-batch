@@ -42,27 +42,29 @@ module KafkaBatchSpec
       skip "Go daemon binary unavailable" unless go_available?
     end
 
-    def start_ruby_worker_stack!(tmpdir_prefix: "kbatch-ruby")
-      @tmpdir = Dir.mktmpdir("#{tmpdir_prefix}-#{suffix}")
-      @marker_path = File.join(@tmpdir, "marker")
-      @worker_socket = File.join(Dir.tmpdir, "kb-rw-#{suffix}.sock")
-      @events_topic = "kb.ruby.events.#{suffix}"
-      @callbacks_topic = "kb.ruby.callbacks.#{suffix}"
-      @dlt_topic = "kb.ruby.dlt.#{suffix}"
-      @retry_base = "kb.ruby.retry.#{suffix}"
+  def start_ruby_worker_stack!(tmpdir_prefix: "kbatch-ruby")
+    @tmpdir = Dir.mktmpdir("#{tmpdir_prefix}-#{suffix}")
+    @marker_path = File.join(@tmpdir, "marker")
+    @worker_socket = File.join(Dir.tmpdir, "kb-rw-#{suffix}.sock")
+    @events_topic = "kb.ruby.events.#{suffix}"
+    @callbacks_topic = "kb.ruby.callbacks.#{suffix}"
+    @dlt_topic = "kb.ruby.dlt.#{suffix}"
+    @retry_base = "kb.ruby.retry.#{suffix}"
 
-      write_manifest!
-      write_daemon_config!
-      create_integration_topics!
+    write_manifest!
+    write_daemon_config!
+    create_integration_topics!
 
-      configure_kafka_batch!
-      ENV["KBATCH_RUBY_WORKER_ITEST_MARKER"] = @marker_path
-      KafkaBatch::WorkerServer.start!(socket_path: @worker_socket)
-      start_daemon!
-    end
+    configure_kafka_batch!
+    ENV["KBATCH_RUBY_WORKER_ITEST_MARKER"] = @marker_path
+    KafkaBatch::WorkerServer.start!(socket_path: @worker_socket)
+    start_daemon!
+    after_stack_started! if respond_to?(:after_stack_started!, true)
+  end
 
-    def stop_ruby_worker_stack!
-      stop_daemon! if @daemon_pid
+  def stop_ruby_worker_stack!
+    stop_go_worker! if respond_to?(:stop_go_worker!, true) && @worker_pid
+    stop_daemon! if @daemon_pid
       KafkaBatch::WorkerServer.stop!
       ENV.delete("KBATCH_RUBY_WORKER_ITEST_MARKER")
       FileUtils.rm_rf(@tmpdir) if @tmpdir

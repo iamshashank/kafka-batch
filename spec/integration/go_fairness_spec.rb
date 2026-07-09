@@ -7,6 +7,7 @@ require "fileutils"
 require_relative "../support/go_daemon_helper"
 
 RSpec.describe "Go daemon fairness (integration)", :integration do
+  include KafkaBatchSpec::GoWorkerLifecycle
   def configured_brokers
     ENV["KAFKA_BATCH_TEST_BROKERS"].to_s
   end
@@ -55,7 +56,8 @@ RSpec.describe "Go daemon fairness (integration)", :integration do
     @marker_path = File.join(@tmpdir, "marker")
     @worker_topic = "kb.fair.worker.#{suffix}"
     @fair_ingest_topic = "kb.fair.ingest.#{suffix}"
-    @fair_ready_topic = "kb.fair.ready.#{suffix}"
+    @fair_ready_go_topic = "kb.fair.ready.go.#{suffix}"
+    @fair_ready_ruby_topic = "kb.fair.ready.ruby.#{suffix}"
     @events_topic = "kb.fair.events.#{suffix}"
     @callbacks_topic = "kb.fair.callbacks.#{suffix}"
     @dlt_topic = "kb.fair.dlt.#{suffix}"
@@ -64,18 +66,18 @@ RSpec.describe "Go daemon fairness (integration)", :integration do
     write_manifest!(fair_handlers)
     write_daemon_config!
 
-    [@worker_topic, @fair_ingest_topic, @fair_ready_topic, @events_topic,
+    [@worker_topic, @fair_ingest_topic, @fair_ready_go_topic, @fair_ready_ruby_topic, @events_topic,
      @callbacks_topic, @dlt_topic, "#{@retry_base}.short",
      "#{@retry_base}.medium", "#{@retry_base}.large"].each do |t|
       create_topic!(t)
     end
 
     configure_kafka_batch!
-    start_daemon!
+    start_go_stack!
   end
 
   after(:each) do
-    stop_daemon! if @daemon_pid
+    stop_go_stack! if @daemon_pid
     FileUtils.rm_rf(@tmpdir) if @tmpdir
     KafkaBatch::Producer.reset! if opted_in?
   end
@@ -103,7 +105,8 @@ RSpec.describe "Go daemon fairness (integration)", :integration do
       "retry_tiers" => { "short" => 0, "medium" => 0, "large" => 0 },
       "fairness_enabled" => true,
       "fairness_time_ingest" => @fair_ingest_topic,
-      "fairness_time_ready" => @fair_ready_topic,
+      "fairness_time_ready_go" => @fair_ready_go_topic,
+      "fairness_time_ready_ruby" => @fair_ready_ruby_topic,
       "fairness_ready_window" => 100,
       "fairness_global_concurrency" => 4,
       "fairness_lease_ttl" => 300,
@@ -122,7 +125,8 @@ RSpec.describe "Go daemon fairness (integration)", :integration do
       c.handler_manifest_path = @manifest_path
       c.callbacks_topic = @callbacks_topic
       c.fair_time_ingest_topic = @fair_ingest_topic
-      c.fair_time_ready_topic = @fair_ready_topic
+      c.fair_time_ready_go_topic = @fair_ready_go_topic
+      c.fair_time_ready_ruby_topic = @fair_ready_ruby_topic
     end
     KafkaBatch::HandlerManifest.load!(@manifest_path)
     KafkaBatchSpec::RedisHelper.flush!

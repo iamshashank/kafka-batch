@@ -7,6 +7,7 @@ require "fileutils"
 require_relative "../support/go_daemon_helper"
 
 RSpec.describe "Go daemon priority queues (integration)", :integration do
+  include KafkaBatchSpec::GoWorkerLifecycle
   def configured_brokers
     ENV["KAFKA_BATCH_TEST_BROKERS"].to_s
   end
@@ -58,11 +59,11 @@ RSpec.describe "Go daemon priority queues (integration)", :integration do
     end
 
     configure_kafka_batch!
-    start_daemon!
+    start_go_stack!
   end
 
   after(:each) do
-    stop_daemon! if @daemon_pid
+    stop_go_stack! if @daemon_pid
     FileUtils.rm_rf(@tmpdir) if @tmpdir
     KafkaBatch::Producer.reset! if opted_in?
   end
@@ -205,21 +206,9 @@ RSpec.describe "Go daemon priority queues (integration)", :integration do
 
   it "processes p0 rank jobs on the higher-priority topic" do
     marker_p0 = File.join(@tmpdir, "marker_p0")
-    env = ENV.to_h.merge(
-      "KBATCH_DAEMON_ITEST_MARKER_P0" => marker_p0,
-      "KBATCH_DAEMON_READY_FILE" => @ready_path,
-      "REDIS_URL" => KafkaBatchSpec::RedisHelper::TEST_URL,
-      "KAFKA_PREFIX" => ""
-    )
-    stop_daemon!
-    cmd = if File.executable?(daemon_binary)
-            [daemon_binary, "--config", @config_path, "--manifest", @manifest_path]
-          else
-            ["go", "run", "./cmd/kbatch-daemon-ittest", "--config", @config_path, "--manifest", @manifest_path]
-          end
-    @daemon_pid = Process.spawn(env, *cmd, chdir: File.expand_path("../../go", __dir__),
-                                out: File::NULL, err: File::NULL)
-    wait_for_daemon!
+    stop_go_stack!
+    @p0_marker = marker_p0
+    start_go_stack!
 
     job_id = KafkaBatch::Batch.enqueue_job("integration.go_p0", { "n" => 1 })
     deadline = Time.now + 45

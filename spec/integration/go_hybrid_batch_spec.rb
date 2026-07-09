@@ -5,6 +5,7 @@ require_relative "../support/ruby_daemon_workers"
 
 RSpec.describe "Go daemon hybrid batch (integration)", :integration do
   include KafkaBatchSpec::RubyWorkerIntegrationHelper
+  include KafkaBatchSpec::GoWorkerLifecycle
 
   before(:each) do
     integration_preflight!
@@ -22,7 +23,8 @@ RSpec.describe "Go daemon hybrid batch (integration)", :integration do
 
   def write_manifest!
     @manifest_path = File.join(@tmpdir, "handlers.yml")
-    @worker_topic = "kb.hybrid.worker.#{suffix}"
+    @go_topic = "kb.hybrid.go.#{suffix}"
+    @ruby_topic = "kb.hybrid.ruby.#{suffix}"
     @go_marker = File.join(@tmpdir, "go_marker")
     @ruby_marker = File.join(@tmpdir, "ruby_marker")
     ENV["KBATCH_GO_HYBRID_MARKER"] = @go_marker
@@ -32,14 +34,14 @@ RSpec.describe "Go daemon hybrid batch (integration)", :integration do
       "handlers" => {
         "integration.go_hybrid_partner" => {
           "runtime" => "go",
-          "topic" => @worker_topic,
+          "topic" => @go_topic,
           "apply_topic_prefix" => false,
           "max_retries" => 2
         },
         "integration.ruby_hybrid" => {
           "runtime" => "ruby",
           "worker_class" => "IntegrationRubyHybridWorker",
-          "topic" => @worker_topic,
+          "topic" => @ruby_topic,
           "apply_topic_prefix" => false,
           "max_retries" => 2
         }
@@ -48,14 +50,18 @@ RSpec.describe "Go daemon hybrid batch (integration)", :integration do
   end
 
   def extra_daemon_config
-    { "jobs_topics" => [@worker_topic] }
+    {}
   end
 
   def integration_topics
-    super + [@worker_topic]
+    super + [@go_topic, @ruby_topic]
   end
 
-  it "completes a batch with one Go job and one Ruby job on the same topic" do
+  def after_stack_started!
+    start_go_worker!
+  end
+
+  it "completes a batch with one Go job and one Ruby job on separate runtime topics" do
     go_id = ruby_id = nil
     batch = KafkaBatch::Batch.create(description: "hybrid #{suffix}") do |b|
       go_id   = b.push_job("integration.go_hybrid_partner", { "role" => "go" })

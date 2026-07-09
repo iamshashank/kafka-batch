@@ -14,7 +14,6 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
 )
-
 // Producer publishes Kafka messages.
 type Producer interface {
 	Produce(ctx context.Context, topic, key string, payload []byte) error
@@ -45,11 +44,13 @@ type Outcome struct {
 
 func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.SourceCoords) (Outcome, error) {
 	out := Outcome{CommitOffset: true}
+	started := p.now()
 	var job protocol.JobMessage
 	if err := json.Unmarshal(raw, &job); err != nil {
 		dlt, key := p.dltPayload(map[string]interface{}{"raw_payload": string(raw)}, src.Topic, "json.ParseError", err.Error())
 		out.DLTPayload = dlt
 		out.DLTKey = key
+		emitDLTPublished("", "", "job", src.Topic)
 		return out, nil
 	}
 
@@ -60,6 +61,7 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		}
 		if cancelled {
 			p.releaseUniq(ctx, job)
+			emitJobCancelled(job)
 			return out, nil
 		}
 	}
@@ -79,6 +81,11 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 			})
 		}
 		p.releaseUniq(ctx, job)
+		emitJobExpired(job, job.ValidTill)
+		if out.DLTPayload != nil {
+			jid, bid, dt := dltMeta(out.DLTPayload)
+			emitDLTPublished(jid, bid, dt, src.Topic)
+		}
 		return out, nil
 	}
 
@@ -95,6 +102,8 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		out.DLTPayload = dlt
 		out.DLTKey = key
 		p.releaseUniq(ctx, job)
+		emitJobFailed(job, job.Attempt, "UnknownHandler", err.Error())
+		emitDLTPublished(job.JobID, deref(job.BatchID), "job", src.Topic)
 		return out, nil
 	}
 	if rubyHandler && p.RubyExec == nil {
@@ -110,6 +119,8 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		out.DLTPayload = dlt
 		out.DLTKey = key
 		p.releaseUniq(ctx, job)
+		emitJobFailed(job, job.Attempt, rubyClassName(err), err.Error())
+		emitDLTPublished(job.JobID, deref(job.BatchID), "job", src.Topic)
 		return out, nil
 	}
 
@@ -142,6 +153,7 @@ func (p *Processor) Process(ctx context.Context, raw []byte, src protocol.Source
 		out.Event = &ev
 	}
 	p.releaseUniq(ctx, job)
+	emitJobProcessed(job, instrumentSince(started, p.now()))
 	return out, nil
 }
 
@@ -165,6 +177,8 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 		out.DLTPayload = dlt
 		out.DLTKey = key
 		p.releaseUniq(ctx, job)
+		emitJobFailed(job, job.Attempt, className(execErr), execErr.Error())
+		emitDLTPublished(job.JobID, deref(job.BatchID), "job", src.Topic)
 		return out, nil
 	}
 
@@ -187,6 +201,7 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 		out.RetryTopic = p.Cfg.RetryTopic(tier)
 		out.RetryKey = job.JobID
 		out.RetryPayload = retryPayload
+		emitJobRetried(job, job.Attempt+1, out.RetryTopic)
 		return out, nil
 	}
 
@@ -198,6 +213,8 @@ func (p *Processor) handleFailure(ctx context.Context, job protocol.JobMessage, 
 	out.DLTPayload = dlt
 	out.DLTKey = key
 	p.releaseUniq(ctx, job)
+	emitJobFailed(job, job.Attempt, className(execErr), execErr.Error())
+	emitDLTPublished(job.JobID, deref(job.BatchID), "job", src.Topic)
 	return out, nil
 }
 
@@ -206,6 +223,13 @@ func (p *Processor) releaseUniq(ctx context.Context, job protocol.JobMessage) {
 		return
 	}
 	_ = p.Store.ReleaseUniqLock(ctx, job.UniqFP, job.JobID)
+}
+
+func instrumentSince(started, now time.Time) float64 {
+	if started.IsZero() {
+		return 0
+	}
+	return float64(now.Sub(started).Milliseconds())
 }
 
 func (p *Processor) buildEvent(job protocol.JobMessage, status string, src protocol.SourceCoords) protocol.EventMessage {

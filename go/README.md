@@ -1,51 +1,39 @@
-# kbatch (Go sidecar)
+# kbatch (Go runtime)
 
-Phase 2 execution host for KafkaBatch. Ruby Karafka keeps the control plane; this
-binary runs Go `job_type` handlers over a Unix socket.
+Go binaries for the KafkaBatch control plane and backend workers.
+
+## Binaries
+
+| Command | Role |
+|---------|------|
+| `kbatch daemon` | Control plane — fairness dispatch, events, retry, callbacks, schedule; consumes **ruby** job topics only |
+| `kbatch worker` | Go backend — consumes **go** plain, priority, and fair-ready topics; runs handlers in-process |
+| `kbatch serve` | **Deprecated** — Phase 2 sidecar for pure Ruby Karafka + `executor :go` only |
 
 ## Build
 
-Requires **Go 1.24+** on macOS 26 (Tahoe) — older Go versions omit `LC_UUID` and dyld aborts at launch.
-
-```bash
-brew upgrade go
-go version   # go1.24.x or newer
-```
-
 ```bash
 cd go
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o ../bin/kbatch ./cmd/kbatch
+go build -o kbatch-daemon ./cmd/kbatch-daemon   # link your handlers via kbatch.Register
+go build -o kbatch-worker ./cmd/kbatch-worker-ittest  # or your worker main
 ```
 
-On Apple Silicon use `GOARCH=arm64`; on Intel Mac use `GOARCH=amd64`.
-
-### Integration tests (real broker + sidecar)
+Integration test binaries:
 
 ```bash
-cd go && go build -o ../bin/kbatch-ittest ./cmd/kbatch-ittest
-KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_sidecar_spec.rb
+go build -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest
+go build -o ../bin/kbatch-worker-ittest ./cmd/kbatch-worker-ittest
+KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_*.rb
 ```
 
-CI builds `bin/kbatch-ittest` and runs this with the KRaft broker. Requires **Go 1.24+** on macOS 26.
+## Three-tier deployment (v1.1+)
 
-## Run
+1. **Ruby gem** — `daemon_mode: true`, produce only
+2. **`kbatch daemon`** — internal topics + ruby execution (unix socket to worker server)
+3. **`kbatch worker`** — all `runtime: go` handlers
 
-```bash
-./bin/kbatch serve --socket /var/run/kbatch.sock
-```
+See the main [README](../README.md#go-stack-deployment-v110) for full deployment docs.
 
-Register handlers from your application (import your handler package in `main`):
+## Legacy sidecar
 
-```go
-package main
-
-import (
-    "github.com/y-shashank/kafka-batch/go/cmd/kbatch"
-    "github.com/y-shashank/kafka-batch/go/pkg/kbatch"
-    _ "your/app/handlers" // calls kbatch.Register in init()
-)
-
-func main() { kbatch.Main() } // or copy serve wiring from cmd/kbatch/main.go
-```
-
-See `protocol/README.md` for the HTTP/JSON contract.
+`kbatch serve` is retained for Karafka-only apps that have not migrated to `daemon_mode`. Do not run it alongside `kbatch daemon` or `kbatch worker`.

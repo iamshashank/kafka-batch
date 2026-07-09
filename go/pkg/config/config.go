@@ -52,8 +52,12 @@ type Daemon struct {
 	FairnessEnabled       bool
 	FairnessTimeIngest    string
 	FairnessTimeReady     string
+	FairnessTimeReadyGo   string
+	FairnessTimeReadyRuby string
 	FairnessThroughputIngest string
 	FairnessThroughputReady  string
+	FairnessThroughputReadyGo   string
+	FairnessThroughputReadyRuby string
 	FairnessReadyWindow   int
 	FairnessGlobalConcurrency int
 	FairnessMaxInflightPerTenant int
@@ -93,8 +97,12 @@ func DefaultDaemon() Daemon {
 		ConsumptionControlRefreshInterval: 30 * time.Second,
 		FairnessTimeIngest:   "kafka_batch.fair_time_ingest",
 		FairnessTimeReady:    "kafka_batch.fair_time_ready",
+		FairnessTimeReadyGo:  "kafka_batch.fair_time_ready.go",
+		FairnessTimeReadyRuby: "kafka_batch.fair_time_ready.ruby",
 		FairnessThroughputIngest: "kafka_batch.fair_throughput_ingest",
 		FairnessThroughputReady:  "kafka_batch.fair_throughput_ready",
+		FairnessThroughputReadyGo:   "kafka_batch.fair_throughput_ready.go",
+		FairnessThroughputReadyRuby: "kafka_batch.fair_throughput_ready.ruby",
 		FairnessReadyWindow:  100,
 		FairnessGlobalConcurrency: 50,
 		FairnessLeaseTTL:          1800,
@@ -147,8 +155,12 @@ func LoadDaemon(path string) (Daemon, error) {
 		FairnessEnabled       bool          `yaml:"fairness_enabled"`
 		FairnessTimeIngest    string        `yaml:"fairness_time_ingest"`
 		FairnessTimeReady     string        `yaml:"fairness_time_ready"`
+		FairnessTimeReadyGo   string        `yaml:"fairness_time_ready_go"`
+		FairnessTimeReadyRuby string        `yaml:"fairness_time_ready_ruby"`
 		FairnessThroughputIngest string     `yaml:"fairness_throughput_ingest"`
 		FairnessThroughputReady  string     `yaml:"fairness_throughput_ready"`
+		FairnessThroughputReadyGo   string  `yaml:"fairness_throughput_ready_go"`
+		FairnessThroughputReadyRuby string  `yaml:"fairness_throughput_ready_ruby"`
 		FairnessReadyWindow   int           `yaml:"fairness_ready_window"`
 		FairnessGlobalConcurrency int       `yaml:"fairness_global_concurrency"`
 		FairnessMaxInflightPerTenant int    `yaml:"fairness_max_inflight_per_tenant"`
@@ -258,11 +270,23 @@ func LoadDaemon(path string) (Daemon, error) {
 	if doc.FairnessTimeReady != "" {
 		cfg.FairnessTimeReady = doc.FairnessTimeReady
 	}
+	if doc.FairnessTimeReadyGo != "" {
+		cfg.FairnessTimeReadyGo = doc.FairnessTimeReadyGo
+	}
+	if doc.FairnessTimeReadyRuby != "" {
+		cfg.FairnessTimeReadyRuby = doc.FairnessTimeReadyRuby
+	}
 	if doc.FairnessThroughputIngest != "" {
 		cfg.FairnessThroughputIngest = doc.FairnessThroughputIngest
 	}
 	if doc.FairnessThroughputReady != "" {
 		cfg.FairnessThroughputReady = doc.FairnessThroughputReady
+	}
+	if doc.FairnessThroughputReadyGo != "" {
+		cfg.FairnessThroughputReadyGo = doc.FairnessThroughputReadyGo
+	}
+	if doc.FairnessThroughputReadyRuby != "" {
+		cfg.FairnessThroughputReadyRuby = doc.FairnessThroughputReadyRuby
 	}
 	if doc.FairnessReadyWindow > 0 {
 		cfg.FairnessReadyWindow = doc.FairnessReadyWindow
@@ -334,8 +358,12 @@ func (c *Daemon) prefixTopics() {
 	c.ScheduledTopic = prefixName(p, c.ScheduledTopic)
 	c.FairnessTimeIngest = prefixName(p, c.FairnessTimeIngest)
 	c.FairnessTimeReady = prefixName(p, c.FairnessTimeReady)
+	c.FairnessTimeReadyGo = prefixName(p, c.FairnessTimeReadyGo)
+	c.FairnessTimeReadyRuby = prefixName(p, c.FairnessTimeReadyRuby)
 	c.FairnessThroughputIngest = prefixName(p, c.FairnessThroughputIngest)
 	c.FairnessThroughputReady = prefixName(p, c.FairnessThroughputReady)
+	c.FairnessThroughputReadyGo = prefixName(p, c.FairnessThroughputReadyGo)
+	c.FairnessThroughputReadyRuby = prefixName(p, c.FairnessThroughputReadyRuby)
 	for i, t := range c.JobsTopics {
 		c.JobsTopics[i] = prefixName(p, t)
 	}
@@ -423,21 +451,40 @@ func LoadManifest(path, topicPrefix string) (Manifest, error) {
 }
 
 func (m Manifest) JobTopics(defaultTopic string, includeRuby bool) []string {
+	return m.jobTopics(defaultTopic, includeRuby, false)
+}
+
+// JobTopicsGo returns plain topics for go handlers only.
+func (m Manifest) JobTopicsGo(defaultTopic string) []string {
+	return m.jobTopics(defaultTopic, false, true)
+}
+
+func (m Manifest) jobTopics(defaultTopic string, includeRuby, goOnly bool) []string {
 	seen := map[string]struct{}{}
 	var out []string
 	for _, h := range m.Handlers {
+		if fairnessLane(h.FairnessType) != "" {
+			continue
+		}
 		rt := strings.ToLower(strings.TrimSpace(h.Runtime))
-		if rt == "go" || (includeRuby && rt == "ruby") {
-			t := h.Topic
-			if t == "" {
-				t = defaultTopic
-			}
-			if _, ok := seen[t]; ok {
+		if goOnly {
+			if rt != RuntimeGo {
 				continue
 			}
-			seen[t] = struct{}{}
-			out = append(out, t)
+		} else if rt == RuntimeGo || (includeRuby && rt == RuntimeRuby) {
+			// keep
+		} else {
+			continue
 		}
+		t := h.Topic
+		if t == "" {
+			t = defaultTopic
+		}
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
 	}
 	return out
 }
@@ -451,7 +498,19 @@ func (m Manifest) HasRubyHandlers() bool {
 	return false
 }
 
-func (m Manifest) Validate() error {
+func (m Manifest) HasGoHandlers() bool {
+	for _, h := range m.Handlers {
+		if strings.EqualFold(h.Runtime, "go") {
+			return true
+		}
+	}
+	return false
+}
+
+func (m Manifest) Validate(defaultTopic string) error {
+	if err := m.ValidateTopicRuntimeExclusivity(defaultTopic); err != nil {
+		return err
+	}
 	for jobType, h := range m.Handlers {
 		switch strings.ToLower(strings.TrimSpace(h.Runtime)) {
 		case "go":

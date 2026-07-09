@@ -21,6 +21,7 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/control/job"
 	"github.com/y-shashank/kafka-batch/go/pkg/control/retry"
 	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
+	"github.com/y-shashank/kafka-batch/go/pkg/instrument"
 	"github.com/y-shashank/kafka-batch/go/pkg/jobexpiry"
 	"github.com/y-shashank/kafka-batch/go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
@@ -44,21 +45,29 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		return err
 	}
 	config.SetHandlerLookup(func(jt string) bool { _, ok := kbatch.Lookup(jt); return ok })
-	if err := manifest.Validate(); err != nil {
+	defaultTopic := prefixOr(cfg.TopicPrefix, "") + "kafka_batch.jobs"
+	if err := manifest.Validate(defaultTopic); err != nil {
+		return err
+	}
+	if err := cfg.ValidateFairReadySplit(manifest); err != nil {
 		return err
 	}
 	if manifest.HasRubyHandlers() && cfg.RubyWorkerSocket == "" {
 		return fmt.Errorf("handler manifest includes runtime:ruby handlers but ruby_worker_socket is not set")
 	}
+	if manifest.HasGoHandlers() {
+		log.Printf("kbatch daemon: runtime:go handlers are executed by kbatch worker (control plane does not run Go jobs)")
+	}
 
-	rubyTopics := cfg.RubyWorkerSocket != ""
-	jobTopics := cfg.JobsTopics
-	if len(jobTopics) == 0 {
-		jobTopics = manifest.JobTopics(prefixOr(cfg.TopicPrefix, "")+"kafka_batch.jobs", rubyTopics)
+	jobTopics := manifest.JobTopicsForRuntime(config.RuntimeRuby, defaultTopic)
+	if len(cfg.JobsTopics) > 0 {
+		for _, t := range cfg.JobsTopics {
+			if manifest.TopicRuntime(t, defaultTopic) == config.RuntimeRuby {
+				jobTopics = append(jobTopics, t)
+			}
+		}
 	}
-	if len(jobTopics) == 0 {
-		return fmt.Errorf("no job topics configured (set jobs_topics or handler manifest)")
-	}
+	jobTopics = uniqueTopicNames(jobTopics)
 
 	var prioReg priority.Registry
 	if len(cfg.PriorityConfigPaths) > 0 {
@@ -80,8 +89,9 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		}
 		jobTopics = filtered
 	}
-	if len(jobTopics) == 0 && len(prioReg.Configs) == 0 {
-		return fmt.Errorf("no job topics configured (set jobs_topics or handler manifest)")
+	rubyPrio := rubyPriorityConfigs(prioReg, manifest, defaultTopic)
+	if len(jobTopics) == 0 && len(rubyPrio) == 0 && !manifest.HasRubyHandlers() {
+		log.Printf("kbatch daemon: no ruby job topics (go handlers only — control plane + fair dispatch)")
 	}
 
 	rOpts, err := redis.ParseURL(cfg.RedisURL)
@@ -110,34 +120,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 			Timeout:    cfg.RubyWorkerTimeout,
 		}
 	}
-	handleJob := func(rec *kgo.Record) error {
-		src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
-		out, err := jobProc.Process(ctx, rec.Value, src)
-		if err != nil {
-			return err
-		}
-		if out.Event != nil {
-			raw, _ := json.Marshal(out.Event)
-			key := fmt.Sprintf("%s/%d", out.Event.SrcTopic, out.Event.SrcPartition)
-			if err := prod.Produce(ctx, cfg.EventsTopic, key, raw); err != nil {
-				return err
-			}
-		}
-		if out.RetryPayload != nil {
-			if err := prod.Produce(ctx, out.RetryTopic, out.RetryKey, out.RetryPayload); err != nil {
-				return err
-			}
-		}
-		if out.DLTPayload != nil {
-			if err := prod.Produce(ctx, cfg.DeadLetterTopic, out.DLTKey, out.DLTPayload); err != nil {
-				return err
-			}
-		}
-		if !out.CommitOffset {
-			return fmt.Errorf("job not committed")
-		}
-		return nil
-	}
+	handleJob := BuildJobHandler(cfg, prod, jobProc)
 	eventProc := &event.Processor{Cfg: cfg, Store: st, Producer: prod}
 	retryProc := &retry.Processor{Producer: prod, MaxPause: cfg.RetryMaxPause}
 
@@ -156,7 +139,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 
 	errCh := make(chan error, 8)
 	if len(jobTopics) > 0 {
-		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-jobs", jobTopics, handleJob, errCh, pauseCtl)
+		go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-jobs", jobTopics, handleJob, errCh, pauseCtl)
 	}
 
 	lagClient, err := kgo.NewClient(kgo.SeedBrokers(cfg.Brokers...))
@@ -165,23 +148,23 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 	defer lagClient.Close()
 	priorityLag := priority.NewLagReader(lagClient)
-	for _, pc := range prioReg.Configs {
+	for _, pc := range rubyPrio {
 		gate := priority.NewGate(priorityLag, cfg.PriorityLagCheckInterval)
 		gate.Consumption = pauseCtl
-		go runPriorityGroup(ctx, cfg, pc, gate, handleJob, errCh, pauseCtl)
+		go RunPriorityGroup(ctx, cfg, pc, gate, handleJob, errCh, pauseCtl)
 	}
-	if len(prioReg.Configs) > 0 {
-		log.Printf("kbatch priority consumers enabled groups=%d", len(prioReg.Configs))
+	if len(rubyPrio) > 0 {
+		log.Printf("kbatch priority consumers enabled groups=%d (ruby topics only)", len(rubyPrio))
 	}
 
-	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
+	go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
 		_, err := eventProc.ProcessBatch(ctx, [][]byte{rec.Value})
 		return err
 	}, errCh, nil)
 
 	retryTopics := cfg.RetryTopics()
 	if len(retryTopics) > 0 {
-		go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-retry", retryTopics, func(rec *kgo.Record) error {
+		go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-retry", retryTopics, func(rec *kgo.Record) error {
 			src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 			out, err := retryProc.Process(ctx, rec.Value, src)
 			if err != nil {
@@ -212,7 +195,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 		}, errCh, pauseCtl)
 	}
 
-	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-callbacks", []string{cfg.CallbacksTopic}, func(rec *kgo.Record) error {
+	go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-callbacks", []string{cfg.CallbacksTopic}, func(rec *kgo.Record) error {
 		_, err := cbProc.Process(ctx, rec.Value)
 		return err
 	}, errCh, pauseCtl)
@@ -260,11 +243,11 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	if cfg.FairnessEnabled {
-		wireFairLane(ctx, cfg, rdb, prod, st, jobProc, handleJob, errCh, pauseCtl,
-			fairness.LaneTime, cfg.FairnessTimeIngest, cfg.FairnessTimeReady, cfg.FairnessTimeSettings())
-		wireFairLane(ctx, cfg, rdb, prod, st, jobProc, handleJob, errCh, pauseCtl,
-			fairness.LaneThroughput, cfg.FairnessThroughputIngest, cfg.FairnessThroughputReady, cfg.FairnessThroughputSettings())
-		log.Printf("kbatch fairness enabled time=%s throughput=%s",
+		wireFairLane(ctx, cfg, manifest, rdb, prod, st, jobProc, handleJob, errCh, pauseCtl,
+			fairness.LaneTime, cfg.FairnessTimeIngest, cfg.FairnessTimeSettings())
+		wireFairLane(ctx, cfg, manifest, rdb, prod, st, jobProc, handleJob, errCh, pauseCtl,
+			fairness.LaneThroughput, cfg.FairnessThroughputIngest, cfg.FairnessThroughputSettings())
+		log.Printf("kbatch fairness enabled time=%s throughput=%s (ruby ready consumers only)",
 			cfg.FairnessTimeIngest, cfg.FairnessThroughputIngest)
 	}
 
@@ -283,6 +266,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 func wireFairLane(
 	ctx context.Context,
 	cfg config.Daemon,
+	manifest config.Manifest,
 	rdb *redis.Client,
 	prod *kafkaclient.Client,
 	st *store.RedisStore,
@@ -291,7 +275,7 @@ func wireFairLane(
 	errCh chan<- error,
 	pauseCtl *consumption.Control,
 	lane fairness.Lane,
-	ingest, ready string,
+	ingest string,
 	settings fairness.Settings,
 ) {
 	sched := fairness.NewScheduler(rdb, settings)
@@ -300,19 +284,25 @@ func wireFairLane(
 	} else {
 		jobProc.FairThroughput = sched
 	}
+	laneName := string(lane)
+	resolveReady := fairReadyResolver(manifest, cfg, laneName)
+	readyTopics := controlFairReadyTopics(cfg, manifest, laneName)
 	expPub := newExpiredPublisher(cfg, prod, st)
 	coord := fairness.NewCoordinator(func(l fairness.Lane) {
 		if l != lane {
 			return
 		}
 		fwd := &fairness.Forwarder{
-			Lane: l, Scheduler: sched, ReadyTopic: ready, Producer: prod,
+			Lane: l, Scheduler: sched, ResolveReadyTopic: resolveReady, Producer: prod,
 			OnExpired: func(ctx context.Context, _ *fairness.CheckoutResult, raw []byte) error {
 				var m map[string]interface{}
 				_ = json.Unmarshal(raw, &m)
 				src := jobexpiry.SourceCoords(m)
 				return expPub.publish(ctx, raw, src)
 			},
+		}
+		if len(readyTopics) == 1 {
+			fwd.ReadyTopic = readyTopics[0]
 		}
 		go fwd.Run(ctx)
 	})
@@ -323,7 +313,7 @@ func wireFairLane(
 		},
 	}
 	suffix := string(lane)
-	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-dispatch-"+suffix,
+	go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-dispatch-"+suffix,
 		[]string{ingest}, func(rec *kgo.Record) error {
 			src := protocol.SourceCoords{Topic: rec.Topic, Partition: rec.Partition, Offset: rec.Offset}
 			out, err := disp.Process(ctx, rec.Value, src)
@@ -335,8 +325,52 @@ func wireFairLane(
 			}
 			return nil
 		}, errCh, pauseCtl)
-	go runConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-ready-"+suffix,
-		[]string{ready}, handleJob, errCh, pauseCtl)
+	if len(readyTopics) > 0 {
+		go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-fair-ready-"+suffix,
+			readyTopics, handleJob, errCh, pauseCtl)
+	}
+}
+
+func controlFairReadyTopics(cfg config.Daemon, manifest config.Manifest, lane string) []string {
+	topics := cfg.FairReadyTopics(lane)
+	if cfg.RuntimeSplitFairReady(lane) {
+		if topics.Ruby != "" {
+			return []string{topics.Ruby}
+		}
+		return nil
+	}
+	if topics.Legacy != "" && manifest.HasFairHandlersForRuntime(config.RuntimeRuby, lane) {
+		return []string{topics.Legacy}
+	}
+	return nil
+}
+
+func rubyPriorityConfigs(reg priority.Registry, manifest config.Manifest, defaultTopic string) []priority.Config {
+	var out []priority.Config
+	for _, pc := range reg.Configs {
+		topics := manifest.FilterTopicsForRuntime(config.RuntimeRuby, pc.Topics, defaultTopic)
+		if len(topics) == 0 {
+			continue
+		}
+		out = append(out, pc.WithTopics(topics))
+	}
+	return out
+}
+
+func uniqueTopicNames(in []string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 type callbackDLT struct {
@@ -348,7 +382,7 @@ func (d callbackDLT) ProduceDLT(ctx context.Context, key string, payload []byte)
 	return d.prod.Produce(ctx, d.topic, key, payload)
 }
 
-func runPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, errCh chan<- error, pauseCtl *consumption.Control) {
+func RunPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config, gate *priority.Gate, handle func(*kgo.Record) error, errCh chan<- error, pauseCtl *consumption.Control) {
 	specByTopic := map[string]priority.TopicSpec{}
 	for _, s := range pc.TopicSpecs() {
 		specByTopic[s.Topic] = s
@@ -401,6 +435,19 @@ func runPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config
 			tick := weightedTicks[rec.Topic]
 			if yield, _ := priority.ShouldYield(spec, gate, &tick, ctx); yield {
 				weightedTicks[rec.Topic] = tick
+				p0 := ""
+				if len(spec.HigherTopics) > 0 {
+					p0 = spec.HigherTopics[0]
+				}
+				instrument.Emit("consumer.priority_yielded", map[string]interface{}{
+					"consumer_class": "kbatch.priority",
+					"p0_topic":       p0,
+					"consumer_group": spec.ConsumerGroup,
+					"pause_ms":       yieldSleep.Milliseconds(),
+					"mode":           string(spec.Mode),
+					"rank":           spec.Rank,
+					"higher_topics":  spec.HigherTopics,
+				}, 0)
 				time.Sleep(yieldSleep)
 				return
 			}
@@ -415,7 +462,7 @@ func runPriorityGroup(ctx context.Context, cfg config.Daemon, pc priority.Config
 	}
 }
 
-func runConsumer(ctx context.Context, brokers []string, group string, topics []string, handle func(*kgo.Record) error, errCh chan<- error, pauseCtl *consumption.Control) {
+func RunConsumer(ctx context.Context, brokers []string, group string, topics []string, handle func(*kgo.Record) error, errCh chan<- error, pauseCtl *consumption.Control) {
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
 		kgo.ConsumerGroup(group),

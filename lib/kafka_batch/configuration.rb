@@ -38,9 +38,13 @@ module KafkaBatch
       # (:time | :throughput). Each lane has its own ingest → ready topics,
       # scheduler, and tenant weights, so both run side by side.
       fair_time_ingest_topic:       "kafka_batch.fair_time_ingest",       # time-fairness intake
-      fair_time_ready_topic:        "kafka_batch.fair_time_ready",        # time-fairness execution queue
+      fair_time_ready_topic:        "kafka_batch.fair_time_ready",        # legacy single ready (pre-v1.1)
+      fair_time_ready_go_topic:     "kafka_batch.fair_time_ready.go",     # time-fairness go execution queue
+      fair_time_ready_ruby_topic:   "kafka_batch.fair_time_ready.ruby",   # time-fairness ruby execution queue
       fair_throughput_ingest_topic: "kafka_batch.fair_throughput_ingest", # throughput-fairness intake
-      fair_throughput_ready_topic:  "kafka_batch.fair_throughput_ready"  # throughput-fairness execution queue
+      fair_throughput_ready_topic:  "kafka_batch.fair_throughput_ready",  # legacy single ready (pre-v1.1)
+      fair_throughput_ready_go_topic:   "kafka_batch.fair_throughput_ready.go",
+      fair_throughput_ready_ruby_topic: "kafka_batch.fair_throughput_ready.ruby"
     }.freeze
 
     PREFIXED_SETTINGS.each do |name, base|
@@ -261,8 +265,19 @@ module KafkaBatch
       type.to_sym == :throughput ? fair_throughput_ingest_topic : fair_time_ingest_topic
     end
 
-    def fairness_ready_topic(type)
-      type.to_sym == :throughput ? fair_throughput_ready_topic : fair_time_ready_topic
+    def fairness_ready_topic(type, runtime = nil)
+      ft = type.to_sym == :throughput ? :throughput : :time
+      if runtime
+        rt = runtime.to_sym
+        case ft
+        when :throughput
+          rt == :go ? fair_throughput_ready_go_topic : fair_throughput_ready_ruby_topic
+        else
+          rt == :go ? fair_time_ready_go_topic : fair_time_ready_ruby_topic
+        end
+      else
+        ft == :throughput ? fair_throughput_ready_topic : fair_time_ready_topic
+      end
     end
 
     # Global in-flight window: max jobs forwarded to the ready topic but not yet
@@ -410,9 +425,9 @@ module KafkaBatch
     attr_accessor :metrics_proc      # alias hook for :proc adapter
     attr_accessor :metrics_prefix    # metric name prefix; default "kafka_batch"
 
-    # ── Go execution sidecar (Phase 2) ─────────────────────────────────────────
-    # Unix socket path for `kbatch serve`. Required when any handler uses
-    # executor :go or a manifest entry with runtime: go.
+    # ── Go execution sidecar (Phase 2, deprecated) ─────────────────────────────
+    # Unix socket for legacy `kbatch serve` sidecar used with Karafka + executor :go.
+    # Do NOT use with daemon_mode — run `kbatch worker` for Go handlers instead.
     attr_accessor :go_executor_socket          # String – e.g. /var/run/kbatch.sock
     attr_accessor :go_executor_timeout         # Float – read timeout seconds; default 300
     attr_accessor :go_executor_open_timeout    # Float – connect timeout seconds; default 1
@@ -577,6 +592,7 @@ module KafkaBatch
     end
 
     def validate!
+      warn_deprecated_go_sidecar!
       raise ConfigurationError, "store must be :mysql or :redis" unless %i[mysql redis].include?(@store)
       unless %i[mysql redis].include?(@schedule_store)
         raise ConfigurationError, "schedule_store must be :mysql or :redis"
@@ -662,6 +678,15 @@ module KafkaBatch
 
     def daemon_mode?
       @daemon_mode == true
+    end
+
+    def warn_deprecated_go_sidecar!
+      return unless daemon_mode?
+      return if @go_executor_socket.to_s.strip.empty?
+
+      logger&.warn(
+        "[KafkaBatch] go_executor_socket is ignored in daemon_mode — Go handlers run in kbatch worker, not kbatch serve sidecar"
+      )
     end
 
     private

@@ -10,6 +10,7 @@ import (
 
 	"github.com/y-shashank/kafka-batch/go/pkg/daemon"
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
+	"github.com/y-shashank/kafka-batch/go/pkg/worker"
 )
 
 func main() {
@@ -23,6 +24,8 @@ func main() {
 		serve(os.Args[2:])
 	case "daemon":
 		runDaemon(os.Args[2:])
+	case "worker":
+		runWorker(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -65,12 +68,30 @@ func runDaemon(args []string) {
 	}
 }
 
+func runWorker(args []string) {
+	fs := flag.NewFlagSet("worker", flag.ExitOnError)
+	cfg := fs.String("config", "", "daemon config YAML path")
+	manifest := fs.String("manifest", "", "handler manifest YAML path")
+	_ = fs.Parse(args)
+	if *cfg == "" {
+		fmt.Fprintln(os.Stderr, "worker requires --config")
+		os.Exit(2)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := worker.Run(ctx, *cfg, *manifest); err != nil {
+		fmt.Fprintf(os.Stderr, "kbatch worker: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func usage() {
-	fmt.Fprintf(os.Stderr, `kbatch — KafkaBatch Go runtime (Phase 2 sidecar + Phase 3 daemon)
+	fmt.Fprintf(os.Stderr, `kbatch — KafkaBatch Go runtime
 
 Usage:
-  kbatch serve [--socket PATH]           # Phase 2: handler sidecar only
-  kbatch daemon --config PATH [--manifest PATH]   # Phase 3: control plane
+  kbatch serve [--socket PATH]           # deprecated: Phase 2 sidecar (Karafka only)
+  kbatch daemon --config PATH [--manifest PATH]   # control plane
+  kbatch worker --config PATH [--manifest PATH]   # Go backend consumer
 
 Environment:
   KAFKA_BROKERS, KAFKA_PREFIX, REDIS_URL, KAFKA_BATCH_HANDLER_MANIFEST

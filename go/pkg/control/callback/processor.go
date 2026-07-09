@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 
+	"github.com/y-shashank/kafka-batch/go/pkg/instrument"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
 )
@@ -59,6 +60,12 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 	if p.Invoker != nil {
 		if err := p.Invoker.Invoke(ctx, cb); err != nil {
 			log.Printf("[kbatch-daemon] callback invoke batch_id=%s: %v", cb.BatchID, err)
+			instrument.Emit("callback.failed", map[string]interface{}{
+				"batch_id":        cb.BatchID,
+				"callback_class":  cb.OnSuccess,
+				"callback_method": "on_success",
+				"error_message":   err.Error(),
+			}, 0)
 			if p.DLT != nil {
 				dlt := map[string]interface{}{
 					"batch_id":           cb.BatchID,
@@ -70,7 +77,22 @@ func (p *Processor) Process(ctx context.Context, raw []byte) (Outcome, error) {
 				}
 				rawDLT, _ := json.Marshal(dlt)
 				_ = p.DLT.ProduceDLT(ctx, cb.BatchID, rawDLT)
+				instrument.Emit("dlt.published", map[string]interface{}{
+					"batch_id": cb.BatchID, "dlt_type": "callback_error",
+				}, 0)
 			}
+		} else {
+			method := "on_complete"
+			class := cb.OnComplete
+			if cb.Outcome == "success" && cb.OnSuccess != "" {
+				method = "on_success"
+				class = cb.OnSuccess
+			}
+			instrument.Emit("callback.invoked", map[string]interface{}{
+				"batch_id":        cb.BatchID,
+				"callback_class":  class,
+				"callback_method": method,
+			}, 0)
 		}
 	}
 	_, _ = p.Store.ClaimCallback(ctx, cb.BatchID, p.NodeID)

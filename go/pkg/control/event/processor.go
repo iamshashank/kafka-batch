@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
+	"github.com/y-shashank/kafka-batch/go/pkg/instrument"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
 )
@@ -55,6 +56,13 @@ func (p *Processor) ProcessBatch(ctx context.Context, rawEvents [][]byte) (Outco
 		if fin.Batch == nil {
 			continue
 		}
+		instrument.Emit("batch.completed", map[string]interface{}{
+			"batch_id":        fin.Batch.ID,
+			"outcome":         fin.Outcome,
+			"total_jobs":      fin.Batch.TotalJobs,
+			"completed_count": fin.Batch.CompletedCount,
+			"failed_count":    fin.Batch.FailedCount,
+		}, 0)
 		cb := protocol.CallbackMessage{
 			BatchID:        fin.Batch.ID,
 			Outcome:        fin.Outcome,

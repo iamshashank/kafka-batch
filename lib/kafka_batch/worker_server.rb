@@ -64,6 +64,7 @@ module KafkaBatch
       @running = true
       @thread  = Thread.new { accept_loop }
       wait_until_listening!
+      KafkaBatch::Metrics.install! if defined?(KafkaBatch::Metrics) && KafkaBatch.config.metrics_enabled
       KafkaBatch.logger.info("[KafkaBatch::WorkerServer] listening on #{@socket_path}")
     end
 
@@ -174,6 +175,7 @@ module KafkaBatch
     end
 
     def execute(body)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       req = JSON.parse(body)
       data = build_job_data(req)
       handler = HandlerRegistry.resolve!(data)
@@ -183,6 +185,13 @@ module KafkaBatch
 
       context = ExecutionContext.new(data: data, message: nil, handler: handler)
       handler.executor.call(context)
+      duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+      KafkaBatch::Instrumentation.job_processed(
+        job_id:       data["job_id"],
+        batch_id:     data["batch_id"],
+        worker_class: data["worker_class"],
+        duration:     duration
+      )
       [200, { "ok" => true }]
     rescue HandlerRegistry::UnknownHandler => e
       [422, error_response("UnknownHandler", e.message)]

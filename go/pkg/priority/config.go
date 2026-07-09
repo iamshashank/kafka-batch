@@ -111,6 +111,12 @@ func Load(path string, cfg config.Daemon, defaultJobsTopic string) (Config, erro
 	}, nil
 }
 
+func (c Config) WithTopics(topics []string) Config {
+	out := c
+	out.Topics = append([]string(nil), topics...)
+	return out
+}
+
 func (c Config) TopicSpecs() []TopicSpec {
 	specs := make([]TopicSpec, len(c.Topics))
 	for i, topic := range c.Topics {

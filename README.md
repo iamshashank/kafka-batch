@@ -17,7 +17,7 @@ Built on [Karafka](https://karafka.io) (WaterDrop + consumers).
 - [Workers & jobs](#workers--jobs)
 - [Batches & callbacks](#batches--callbacks)
 - [Configuration](#configuration)
-- [Go stack deployment (v1.0.0+)](#go-stack-deployment-v100)
+- [Go stack deployment (v1.1.0+)](#go-stack-deployment-v110)
 - [Priority queues](#priority-queues)
 - [Multi-tenant fairness](#multi-tenant-fairness)
 - [Delayed jobs](#delayed-jobs)
@@ -267,18 +267,18 @@ job_type "campaign.fast_p0"
 
 Legacy messages with only `worker_class` still work.
 
-**Executors:**
+**Executors (pure Ruby / Karafka mode only):**
 
 | `executor` | Where `#perform` runs |
 |------------|----------------------|
 | `:ruby` (default) | In-process Ruby `Worker#perform` |
-| `:go` | Go handler via `kbatch serve` sidecar (Unix socket RPC) |
+| `:go` | **Deprecated** — legacy `kbatch serve` sidecar |
 
-### Go handlers (Phase 2)
+> **Go stack (`daemon_mode: true`):** declare `runtime: go` in the handler manifest and run **`kbatch worker`**. Do not use `executor :go` or `go_executor_socket`.
 
-Hybrid hosts run Ruby Karafka for the control plane (fairness, retries, batches) and a **Go sidecar** for hot handlers.
+### Go handlers
 
-**1. Register handlers in Go** (`go/pkg/kbatch`):
+**1. Register handlers in Go** (linked into your `kbatch worker` binary):
 
 ```go
 kbatch.Register("segment.export", func(ctx *kbatch.Context) error {
@@ -286,21 +286,7 @@ kbatch.Register("segment.export", func(ctx *kbatch.Context) error {
 })
 ```
 
-**2. Start the sidecar** (alongside `karafka server`):
-
-```bash
-kbatch serve --socket /var/run/kbatch.sock
-```
-
-**3. Configure the Ruby host:**
-
-```ruby
-# config/initializers/kafka_batch.rb
-config.go_executor_socket = "/var/run/kbatch.sock"
-config.handler_manifest_path = Rails.root.join("config/kafka_batch_handlers.yml").to_s
-```
-
-**Manifest** (`config/kafka_batch_handlers.yml`) — for Go-only handlers with no Ruby worker class:
+**2. Manifest** (`config/kafka_batch_handlers.yml`):
 
 ```yaml
 handlers:
@@ -310,9 +296,7 @@ handlers:
     max_retries: 25
 ```
 
-Or declare a thin Ruby worker that owns routing/topic and sets `executor :go`.
-
-**Enqueue by `job_type`:**
+**3. Enqueue by `job_type`:**
 
 ```ruby
 batch.push_job("segment.export", "segment_id" => 42)
@@ -321,51 +305,24 @@ KafkaBatch::Batch.enqueue_job("segment.export", "segment_id" => 42)
 
 Protocol fixtures live in `protocol/`; the Go module is under `go/` (same repo, separate artifact — not shipped via RubyGems).
 
-### Go control plane (Phase 3)
+### Legacy Phase 2 sidecar (deprecated)
 
-For Go-only workloads you can run **`kbatch daemon`** instead of Ruby Karafka job consumers. The Ruby gem stays the **client** (`Batch.create`, `push_job`, Web UI); the daemon owns:
+The **`kbatch serve`** sidecar + Ruby `executor :go` path remains for existing pure-Ruby Karafka deployments only. It is **not** used with `daemon_mode` or the three-tier stack below. New deployments should use `kbatch worker` instead.
 
-- Job consumption + in-process Go handlers (no sidecar RPC)
-- Completion events → Redis batch ledger (same Lua scripts as Ruby)
-- Retry-tier routing + dead-letter produce
-- Callback topic produce + claim (log-only invoker by default)
-
-**1. Register handlers** (linked into your daemon binary):
-
-```go
-kbatch.Register("segment.export", func(ctx *kbatch.Context) error {
-    return exportSegment(ctx.Payload)
-})
-```
-
-**2. Daemon config** (`config/kbatch_daemon.yml` — see `go/config/daemon.example.yml`):
-
-```yaml
-brokers: ["kafka:9092"]
-consumer_group: kafka-batch
-handler_manifest: config/kafka_batch_handlers.yml
-redis_url: redis://redis:6379/0
-# jobs_topics: optional — defaults from manifest Go handler topics
-events_topic: kafka_batch.events
-callbacks_topic: kafka_batch.callbacks
-dead_letter_topic: kafka_batch.dead_letter
-retry_topic: kafka_batch.jobs.retry
-```
-
-**3. Start the daemon** (no `karafka server` job consumers needed on these pods):
+<details>
+<summary>Legacy sidecar setup (Karafka only — do not use with daemon_mode)</summary>
 
 ```bash
-kbatch daemon --config config/kbatch_daemon.yml
+kbatch serve --socket /var/run/kbatch.sock
 ```
-
-**4. Ruby host** (producer + UI only):
 
 ```ruby
-config.go_executor_socket = ""   # daemon runs handlers in-process
-config.handler_manifest_path = Rails.root.join("config/kafka_batch_handlers.yml").to_s
+config.go_executor_socket = "/var/run/kbatch.sock"  # NOT with daemon_mode
 ```
 
-`KAFKA_PREFIX` / `config.topic_prefix` must match between Ruby producers and the daemon YAML (both read `KAFKA_PREFIX` from the environment).
+</details>
+
+### Go control plane (Phase 3+)
 
 **Integration test** (real Kafka + Redis):
 
@@ -450,165 +407,107 @@ KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_fairness_spec.rb
 
 ---
 
-## Go stack deployment (v1.0.0+)
+## Go stack deployment (v1.1.0+)
 
-**v1.0.0** is the baseline release for the Go control plane + optional Ruby worker server. All future Go work builds on this tag. The last pure-Ruby-only release is [v0.3.2](https://github.com/y-shashank/kafka-batch/releases/tag/v0.3.2).
+**v1.1.0** splits runtime execution into three independently deployable tiers. **v1.0.0** combined Go and Ruby job consumption in a single daemon process; upgrade by adding `kbatch worker` and per-runtime fair ready topics.
 
-### Architecture
-
-Split into three roles — never run Karafka job consumers on API pods when the Go daemon is active:
+### Architecture (v1.1)
 
 ```
-┌─────────────────┐     produce jobs/events      ┌──────────────────┐
-│  API pods       │ ───────────────────────────► │  Kafka + Redis   │
-│  (Ruby gem)     │                                └────────┬─────────┘
-│  daemon_mode    │                                         │
-└─────────────────┘                    consume / dispatch     │
-                                       ┌────────────────────▼────────────────────┐
-                                       │  Daemon pods (kbatch daemon)            │
-                                       │  • plain + fair + priority consumers    │
-                                       │  • Go handlers in-process               │
-                                       │  • Ruby handlers → unix socket RPC      │
-                                       │  • events / retries / callbacks / DLT   │
-                                       └────────────────────┬────────────────────┘
-                                                            │ POST /v1/execute
-                                       ┌────────────────────▼────────────────────┐
-                                       │  Worker pods (rake kafka_batch:worker_server) │
-                                       │  • Worker#perform only                    │
-                                       │  • no Kafka consumers                     │
-                                       └───────────────────────────────────────────┘
+┌─────────────────┐     produce only           ┌──────────────────┐
+│  API pods       │ ────────────────────────► │  Kafka + Redis   │
+│  (Ruby gem)     │                           └────────┬─────────┘
+│  daemon_mode    │                                    │
+└─────────────────┘                                    │
+                                                       │
+                    ┌──────────────────────────────────▼──────────────────────────┐
+                    │  Control pods (kbatch daemon)                               │
+                    │  • fair ingest / WFQ / forwarder / events / retry / schedule│
+                    │  • consumes: ruby plain topics + fair_time_ready.ruby       │
+                    │  • Ruby handlers → unix socket RPC                          │
+                    └────────────────────────────┬────────────────────────────────┘
+                                                 │ POST /v1/execute
+                    ┌────────────────────────────▼────────────────────────────────┐
+                    │  Ruby worker pods (rake kafka_batch:worker_server)        │
+                    │  • Worker#perform only — no Kafka consumers                 │
+                    └─────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────────────────────────────────────────────────┐
+                    │  Go worker pods (kbatch worker)                             │
+                    │  • consumes: go plain topics + fair_time_ready.go         │
+                    │  • Go handlers in-process (no sidecar)                      │
+                    └─────────────────────────────────────────────────────────────┘
 ```
 
-| Role | Process | Kafka consumers | Runs `#perform` |
-|------|---------|---------------|-----------------|
-| **API** | Rails / Sinatra + gem | **none** (`daemon_mode: true`) | no |
-| **Daemon** | `kbatch daemon` | all control + job topics | Go in-process; Ruby via socket |
-| **Worker** | `rake kafka_batch:worker_server` | none | yes (Ruby only) |
+| Role | Process | Kafka consumers | Runs handlers |
+|------|---------|-----------------|---------------|
+| **API** | Rails + gem | **none** (`daemon_mode: true`) | no — produce only |
+| **Control** | `kbatch daemon` | ingest, events, retry, callbacks, schedule, **ruby** plain/priority/fair-ready | Ruby via socket only |
+| **Go worker** | `kbatch worker` | **go** plain, priority, and fair-ready topics | Go in-process |
+| **Ruby worker** | `rake kafka_batch:worker_server` | none | Ruby `#perform` |
 
-Optional fourth role: **Web UI** (`require: "kafka_batch/ui"`) — no consumers.
+**Topic rules (v1.1):**
+
+- One plain or priority Kafka topic = one runtime. Manifest rejects shared topics.
+- Priority YAML groups may list both runtimes' topics; each process consumes only its runtime's subset.
+- Fairness: one shared **ingest** topic per lane; two **ready** topics per lane (`.go` / `.ruby`). The forwarder routes by handler runtime.
+- No sidecar required for hybrid batches — deploy control + go-worker + ruby worker-server separately.
+
+**Config (fair ready split):**
+
+```yaml
+fairness_enabled: true
+fairness_time_ingest: kafka_batch.fair_time_ingest
+fairness_time_ready_go: kafka_batch.fair_time_ready.go
+fairness_time_ready_ruby: kafka_batch.fair_time_ready.ruby
+ruby_worker_socket: /var/run/kbatch/ruby.sock
+```
+
+Ruby gem mirrors the same names via `fair_time_ready_go_topic` / `fair_time_ready_ruby_topic`.
 
 ### Development (local)
 
 **Prerequisites:** Kafka, Redis, Go 1.22+, Ruby 2.7+.
 
 ```bash
-# 1. Build the daemon (link your handlers into cmd/kbatch-daemon-ittest or your own main)
-cd go && go build -o ../bin/kbatch-daemon ./cmd/kbatch-daemon-ittest && cd ..
+cd go && go build -o ../bin/kbatch-daemon ./cmd/kbatch-daemon-ittest && \
+  go build -o ../bin/kbatch-worker ./cmd/kbatch-worker-ittest && cd ..
 
-# 2. Shared env — topic prefix must match across Ruby and daemon
 export KAFKA_PREFIX=dev
 export REDIS_URL=redis://localhost:6379/0
-export KAFKA_BATCH_TEST_BROKERS=localhost:9092   # integration tests only
 
-# 3. Terminal A — daemon (control plane)
-kbatch daemon --config config/kbatch_daemon.yml \
-              --manifest config/kafka_batch_handlers.yml
+# Terminal A — control plane
+kbatch daemon --config config/kbatch_daemon.yml --manifest config/kafka_batch_handlers.yml
 
-# 4. Terminal B — Ruby worker server (skip if Go-only handlers)
-KAFKA_BATCH_WORKER_SOCKET=/tmp/kbatch-ruby.sock \
-  bundle exec rake kafka_batch:worker_server
+# Terminal B — Go backend (skip if no runtime:go handlers)
+kbatch worker --config config/kbatch_daemon.yml --manifest config/kafka_batch_handlers.yml
 
-# 5. Terminal C — Rails console / API with daemon_mode
-# config/initializers/kafka_batch.rb:
-#   config.daemon_mode = true
-#   config.ruby_worker_socket = "/tmp/kbatch-ruby.sock"
-#   config.handler_manifest_path = Rails.root.join("config/kafka_batch_handlers.yml")
-bundle exec rails console
+# Terminal C — Ruby worker server (skip if no runtime:ruby handlers)
+KAFKA_BATCH_WORKER_SOCKET=/tmp/kbatch-ruby.sock bundle exec rake kafka_batch:worker_server
 ```
-
-**Dev checklist**
-
-- `KAFKA_PREFIX` identical on API, daemon, and worker pods (or empty everywhere).
-- `handler_manifest` path identical on API and daemon.
-- API initializer sets `config.go_executor_socket = ""` (daemon owns execution).
-- Do **not** run `karafka server` job groups when `daemon_mode` is enabled — the gem logs a warning and skips routes.
-- Fairness / priority / schedule flags in `kbatch_daemon.yml` must match Ruby `config/kafka_batch.rb` topic names.
 
 **Run integration tests locally**
 
 ```bash
-cd go && go build -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest && cd ..
+cd go && go build -o ../bin/kbatch-daemon-ittest ./cmd/kbatch-daemon-ittest && \
+  go build -o ../bin/kbatch-worker-ittest ./cmd/kbatch-worker-ittest && cd ..
 KAFKA_BATCH_INTEGRATION=1 bundle exec rspec spec/integration/go_*.rb
 ```
 
 ### Production (Kubernetes)
 
-Use **separate Deployments** with distinct `KB_ROLE`-equivalent boundaries:
+| Deployment | Command | Notes |
+|------------|---------|-------|
+| `kafka-batch-api` | Puma | `daemon_mode: true`; producers only |
+| `kafka-batch-control` | `kbatch daemon` | fairness, events, retry; ruby job consumption |
+| `kafka-batch-go-worker` | `kbatch worker` | scale on go-topic lag; link handlers in your main |
+| `kafka-batch-ruby-worker` | `rake kafka_batch:worker_server` | unix socket to control pods |
 
-| Deployment | Replicas | Command | Notes |
-|------------|----------|---------|-------|
-| `kafka-batch-api` | HPA on HTTP | Puma/Unicorn | `daemon_mode: true`; no Karafka |
-| `kafka-batch-daemon` | HPA on consumer lag | `kbatch daemon --config …` | CPU for Go handlers; scale on job-topic lag |
-| `kafka-batch-worker` | HPA on daemon socket latency / CPU | `rake kafka_batch:worker_server` | Scale with Ruby `#perform` cost |
-| `kafka-batch-scheduler` | **2–3 fixed** | daemon + `schedule_poller_enabled: true` | Only if using delayed jobs |
-| `kafka-batch-web` | 1–2 | UI only | optional |
+**Rolling deploy order:** ruby worker → go worker → control daemon → API.
 
-**Shared ConfigMap / secrets (all roles)**
+### v1.0.0 (legacy single daemon)
 
-| Variable | API | Daemon | Worker |
-|----------|-----|--------|--------|
-| `KAFKA_PREFIX` | ✓ | ✓ | ✓ |
-| `REDIS_URL` | ✓ | ✓ | — (worker is stateless) |
-| `KAFKA_BROKERS` / `config.brokers` | ✓ | ✓ | — |
-| `handler_manifest` path | ✓ | ✓ | ✓ (worker resolves `worker_class`) |
-| `ruby_worker_socket` | — | ✓ (client) | ✓ (server bind path) |
-| `ruby_callback_socket` | — | ✓ (optional) | ✓ (callback server if used) |
-
-**Daemon `config/kbatch_daemon.yml` (production)**
-
-```yaml
-brokers: ["kafka-bootstrap:9092"]
-consumer_group: myapp-kafka-batch
-topic_prefix: ""                    # or rely on KAFKA_PREFIX env
-handler_manifest: /config/kafka_batch_handlers.yml
-redis_url: redis://redis:6379/0
-
-events_topic: kafka_batch.events
-callbacks_topic: kafka_batch.callbacks
-dead_letter_topic: kafka_batch.dead_letter
-retry_topic: kafka_batch.jobs.retry
-
-ruby_worker_socket: /var/run/kbatch/ruby.sock   # omit for Go-only
-ruby_worker_timeout: 300
-ruby_callback_socket: /var/run/kbatch/callback.sock  # optional
-
-schedule_poller_enabled: false      # true only on scheduler deployment
-fairness_enabled: true
-priority_config_paths:
-  - /config/kafka_batch/priority/jobs-fast.yml
-```
-
-**Health & readiness**
-
-| Component | Probe | Pass criteria |
-|-----------|-------|---------------|
-| Daemon | exec / file | `KBATCH_DAEMON_READY_FILE` written on startup; optional HTTP if you add a sidecar |
-| Worker server | `GET /health` on unix socket | `{"ok":true}` — use a minimal sidecar or init container that curls the socket |
-| API | app `/health` | no Kafka consumer lag expected |
-
-Mount a shared `emptyDir` or Unix socket volume between daemon and worker pods **on the same node** (or use a TCP bridge if sockets must cross nodes).
-
-**Rolling deploy order**
-
-1. Worker server (backward-compatible `/v1/execute` protocol)
-2. Daemon (drains old consumer group generation via Kafka rebalance)
-3. API last (producers only — safe anytime)
-
-**Observability:** wire `config.metrics_enabled` on API pods; daemon emits through the same instrumentation hooks where parity exists. Monitor DLT topic rate, fair-lane inflight (`kafka_batch:fair_time:leases` ZCARD), and batch `running` index size in Redis.
-
-### Pure Ruby fallback
-
-To stay on Karafka consumers only (no Go daemon), use gem **v0.3.2** or set `daemon_mode: false` and run `karafka server` per [Karafka routing & deployment](#karafka-routing--deployment). Do not run Karafka job consumers and `kbatch daemon` against the same topics.
-
-### Building release binaries
-
-```bash
-cd go
-go build -o kbatch-daemon ./cmd/kbatch-daemon   # your main links kbatch.Register handlers
-go build -o kbatch ./cmd/kbatch                  # sidecar (Phase 2) if still needed
-```
-
-Link application handlers in `main` via blank import or explicit `kbatch.Register` calls before `daemon.Run`.
+**v1.0.0** ran Go and Ruby handlers in one `kbatch daemon` process with a single fair ready topic. To stay on that model, use gem **v1.0.0** and omit the split ready topics (set only `fairness_time_ready`). The last pure-Ruby-only release is [v0.3.2](https://github.com/y-shashank/kafka-batch/releases/tag/v0.3.2).
 
 ---
 
@@ -1127,7 +1026,17 @@ config.metrics_proc = ->(name, payload, duration_ms) {
 }
 ```
 
-**Wiring:** in Rails the railtie calls `KafkaBatch::Metrics.install!` on boot when `metrics_enabled` is true. In a non-Rails process, call `KafkaBatch::Metrics.install!` yourself after `configure` — in **every** process you want metrics from.
+**Wiring:** in Rails the railtie calls `KafkaBatch::Metrics.install!` on boot when `metrics_enabled` is true. In a non-Rails process, call `KafkaBatch::Metrics.install!` yourself after `configure` — in **every** process you want metrics from (including `rake kafka_batch:worker_server`).
+
+**Go stack (`kbatch daemon` / `kbatch worker`):** the Go runtime emits the same event names via `go/pkg/instrument` (structured log + optional callback). Register a bridge in your binary before `daemon.Run` / `worker.Run`:
+
+```go
+instrument.SetHandler(func(event string, payload map[string]interface{}, durationMs float64) {
+    // forward to StatsD, Prometheus, Datadog, etc.
+})
+```
+
+Ruby `ActiveSupport::Notifications` subscribers do **not** see Go-process events — wire both sides if you run hybrid deployments.
 
 Example series: `kafka_batch.job_processed.count`, `kafka_batch.job_processed.duration`, `kafka_batch.job_failed.count`, `kafka_batch.batch_completed.count` (`outcome:` tag), `kafka_batch.dlt_published.count` (`dlt_type:` tag).
 

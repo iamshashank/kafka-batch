@@ -228,13 +228,19 @@ module KafkaBatch
       end
       private :default_job_type
 
-      # Execution runtime for this handler. :ruby (default) or :go (sidecar).
+      # Execution runtime for this handler. :ruby (default) or :go (deprecated — use manifest runtime: go + kbatch worker).
       # @return [Symbol]
       def executor(runtime = :__unset__)
         if runtime == :__unset__
           @executor || :ruby
         else
-          @executor = runtime.to_sym
+          rt = runtime.to_sym
+          if rt == :go && KafkaBatch.config.daemon_mode?
+            KafkaBatch.logger&.warn(
+              "[KafkaBatch] executor :go is deprecated with daemon_mode — declare runtime: go in the handler manifest and run kbatch worker"
+            )
+          end
+          @executor = rt
           KafkaBatch::HandlerRegistry.register_ruby(self) if name && !name.to_s.empty?
         end
       end
