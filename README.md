@@ -15,6 +15,7 @@ Built on [Karafka](https://karafka.io) (WaterDrop + consumers). **Go runtime:** 
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
 - [Workers & jobs](#workers--jobs)
+- [Ruby + Go handlers (mixed runtime)](#ruby--go-handlers-mixed-runtime)
 - [Batches & callbacks](#batches--callbacks)
 - [Configuration](#configuration)
 - [Three-tier architecture](#three-tier-architecture)
@@ -125,6 +126,9 @@ KafkaBatch.configure do |config|
   config.brokers   = ENV.fetch("KAFKA_BROKERS", "localhost:9092").split(",")
   config.redis_url = ENV.fetch("REDIS_URL", "redis://localhost:6379/0")
   config.topic_prefix = ENV["KAFKA_PREFIX"].to_s.strip  # optional namespace
+
+  # Required when enqueueing Go handlers — see [Ruby + Go handlers](#ruby--go-handlers-mixed-runtime)
+  # config.handler_manifest_path = Rails.root.join("config/kafka_batch_handlers.yml").to_s
 end
 ```
 
@@ -254,7 +258,7 @@ Every produced job carries a **`job_type`** string (alongside legacy `worker_cla
 job_type "campaign.fast_p0"
 ```
 
-Each Kafka **execution** topic belongs to exactly one runtime (`ruby` or `go`). The client routes jobs from the handler manifest; Ruby enqueues both runtimes. Go execution uses [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go).
+Each Kafka **execution** topic belongs to exactly one runtime (`ruby` or `go`). See **[Ruby + Go handlers (mixed runtime)](#ruby--go-handlers-mixed-runtime)** for manifest setup, enqueue examples, and deployment.
 
 **Wire envelope** (excerpt):
 
@@ -271,23 +275,163 @@ Each Kafka **execution** topic belongs to exactly one runtime (`ruby` or `go`). 
 
 Legacy messages with only `worker_class` still work.
 
-Ruby workers run in-process via Karafka `JobConsumer`. Go workers use [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go). Never mix runtimes on the same execution topic or consumer group.
+---
 
-**Go handlers** — declare `runtime: go` in the manifest; execution lives in kafka-batch-go:
+## Ruby + Go handlers (mixed runtime)
+
+The **client tier** (`KafkaBatch::Batch`) can enqueue **both** Ruby and Go jobs from one Rails app. Each job carries a stable `job_type`; routing picks the Kafka topic; **execution happens on the matching runtime**.
+
+| Runtime | Declared in | Executed by |
+|---|---|---|
+| `ruby` | Ruby `Worker` class (+ optional manifest entry) | Karafka `JobConsumer` (this gem) |
+| `go` | Handler manifest YAML only | [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) `kbatch worker` |
+
+Both runtimes share the same **Kafka topics**, **Redis** fairness state, **batch** completion counting, and **control plane** (events, retry, callbacks on Ruby Karafka `-control` groups).
+
+### 1. Create the handler manifest
+
+`config/kafka_batch_handlers.yml`:
 
 ```yaml
 handlers:
+  # Plain Go job — client produces directly to this topic
   segment.export:
     runtime: go
     topic: segment.exports
+    max_retries: 25
+
+  # Plain Ruby job — worker_class must match a loaded Worker
+  orders.process:
+    runtime: ruby
+    worker_class: Orders::ProcessWorker
+    topic: orders.process
+
+  # Fair Go job — client produces to shared ingest; forwarder routes to .go ready
+  reports.rebuild:
+    runtime: go
+    fairness_type: time
+    max_retries: 10
+
+  # Fair Ruby job — same ingest lane; forwarder routes to .ruby ready
+  campaigns.dispatch:
+    runtime: ruby
+    worker_class: Campaigns::DispatchWorker
+    fairness_type: time
 ```
 
-Enqueue from Ruby:
+**Rules:**
+
+- The YAML key (`segment.export`, `orders.process`, …) is the wire **`job_type`** — it must match `job_type` on the Ruby Worker and `kbatch.Register("…")` in kafka-batch-go.
+- Each Kafka **execution** topic belongs to **one** runtime only.
+- Fair handlers on both runtimes share the **ingest** topic per lane; the control-tier forwarder splits to `fair_*_ready.ruby` vs `fair_*_ready.go` (enabled by default).
+
+### 2. Configure every process that enqueues
 
 ```ruby
-batch.push_job("segment.export", "segment_id" => 42)
-KafkaBatch::Batch.enqueue_job("segment.export", "segment_id" => 42)
+# config/initializers/kafka_batch.rb
+KafkaBatch.configure do |config|
+  config.brokers   = ENV.fetch("KAFKA_BROKERS", "localhost:9092").split(",")
+  config.redis_url = ENV.fetch("REDIS_URL", "redis://localhost:6379/0")
+
+  config.handler_manifest_path =
+    Rails.root.join("config/kafka_batch_handlers.yml").to_s
+  # Or: ENV["KAFKA_BATCH_HANDLER_MANIFEST"]=/path/to/handlers.yml
+end
 ```
+
+Karafka processes load the same manifest automatically when `draw_routes` runs.
+
+### 3. Define Ruby workers (match manifest `job_type`)
+
+```ruby
+class Orders::ProcessWorker
+  include KafkaBatch::Worker
+
+  job_type "orders.process"       # must match manifest
+  kafka_topic "orders.process"
+
+  def perform(payload)
+    Order.find(payload["order_id"]).process!
+  end
+end
+
+class Campaigns::DispatchWorker
+  include KafkaBatch::Worker
+
+  job_type "campaigns.dispatch"
+  fairness_type :time              # must match manifest
+
+  def perform(payload)
+    Campaign.dispatch!(payload)
+  end
+end
+```
+
+Go handlers are **not** Ruby classes. Register them in kafka-batch-go with the same `job_type` string (see [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go)).
+
+### 4. Enqueue from the client
+
+**Standalone jobs**
+
+```ruby
+# Ruby — by Worker class
+KafkaBatch::Batch.enqueue(Orders::ProcessWorker, "order_id" => 42)
+
+# Go — by manifest job_type
+KafkaBatch::Batch.enqueue_job("segment.export", "segment_id" => 99)
+
+# Delayed Go job
+KafkaBatch::Batch.enqueue_job_at(1.hour.from_now, "segment.export", "segment_id" => 99)
+KafkaBatch::Batch.enqueue_job_in(30.minutes, "segment.export", "segment_id" => 99)
+
+# Fair job (Ruby or Go) — tenant_id drives WFQ partitioning
+KafkaBatch::Batch.enqueue_job(
+  "reports.rebuild",
+  { "report_id" => 1 },
+  tenant_id: "acme"
+)
+```
+
+**Mixed batch** — Ruby + Go jobs in one batch; `on_success` / `on_complete` fire when **all** jobs finish:
+
+```ruby
+KafkaBatch::Batch.create(
+  description: "nightly export",
+  on_success:  "NightlyCallback",
+  on_complete: "NightlyCallback"
+) do |b|
+  b.push(Orders::ProcessWorker, "order_id" => 1)    # Ruby
+  b.push_job("segment.export", "segment_id" => 42)  # Go
+  b.push_job("campaigns.dispatch", "campaign_id" => 7, tenant_id: "acme")
+end
+```
+
+### 5. Where each job lands
+
+| Handler | `fairness_type` | Client produces to | Executed by |
+|---|---|---|---|
+| Plain Ruby | — | worker `kafka_topic` | Ruby Karafka `-jobs` |
+| Plain Go | — | manifest `topic` | `kbatch worker` |
+| Fair Ruby | `:time` / `:throughput` | `fair_*_ingest` → `fair_*_ready.ruby` | Ruby Karafka `-jobs-fair-*` |
+| Fair Go | `:time` / `:throughput` | `fair_*_ingest` → `fair_*_ready.go` | `kbatch worker` |
+
+### 6. Provision topics & run both runtimes
+
+```bash
+bundle exec rake kafka_batch:create_topics   # Ruby workers + fairness lanes
+# Also create Go handler topics (e.g. segment.exports) — not auto-discovered from the manifest yet
+```
+
+| Deployment | Gem / repo | What runs |
+|---|---|---|
+| API (tier 1) | kafka-batch | `daemon_mode: true` — enqueue only, no Karafka |
+| Control (tier 2) | kafka-batch | Karafka `-control`, `-dispatch-*` (fair forwarder, events, retry, callbacks) |
+| Ruby execution (tier 3) | kafka-batch | Karafka `-jobs`, `-jobs-fair-*` |
+| Go execution (tier 3) | kafka-batch-go | `kbatch worker` on Go topics + `fair_*_ready.go` |
+
+**Dev — Ruby only:** `KB_ROLE=all bundle exec karafka server` + `rails server` is enough.
+
+**Dev / prod — mixed:** run Ruby Karafka **and** `kbatch worker` alongside the API. See [Deployment](#deployment) for consumer-group commands.
 
 ---
 
@@ -307,13 +451,13 @@ KafkaBatch splits into **three independent tiers**. This gem implements all thre
 
 **Control (tier 2):** Does **not** run `#perform`. Fair WFQ (ingest → `.go` / `.ruby` ready), batch event counting, tiered retries, batch callbacks, delayed-job poller, reconciler.
 
-**Execution (tier 3):** Consumes **ruby** plain/priority topics and `fair_*_ready.ruby` only. Go execution topics are consumed by `kbatch worker` in kafka-batch-go.
+**Execution (tier 3):** Ruby handlers run in Karafka `JobConsumer`. Go handlers run in [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) `kbatch worker`. See [Ruby + Go handlers](#ruby--go-handlers-mixed-runtime).
 
 ### Data flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  Tier 1 — Client (KafkaBatch::Batch)                                        │
+│  Tier 1 — Client (KafkaBatch::Batch)  — enqueues Ruby + Go via job_type     │
 └───────────────────────────────────┬─────────────────────────────────────────┘
                                     │ produce
                                     ▼
@@ -322,34 +466,23 @@ KafkaBatch splits into **three independent tiers**. This gem implements all thre
 └───────────────┬───────────────────────────────┬───────────────────────────┘
                 │                               │
                 ▼                               ▼
-┌───────────────────────────────┐   ┌─────────────────────────────────────────┐
-│  Tier 2 — Karafka control     │   │  Tier 3 — Karafka JobConsumer (ruby)    │
-│  • fair ingest → WFQ          │   │  • Worker#perform                       │
-│  • events / retry / callbacks │   │  • publish success/failed → events      │
-│  • schedule poller            │   │                                         │
-└───────────────────────────────┘   └─────────────────────────────────────────┘
+┌───────────────────────────────┐   ┌──────────────────────┐  ┌─────────────────┐
+│  Tier 2 — Karafka control     │   │ Tier 3 — Ruby exec   │  │ Tier 3 — Go exec│
+│  • fair ingest → WFQ forward  │   │ JobConsumer #perform │  │ kbatch worker   │
+│  • events / retry / callbacks │   │ plain + fair .ruby   │  │ plain + fair .go│
+│  • schedule poller            │   └──────────────────────┘  └─────────────────┘
+└───────────────────────────────┘
 ```
 
-For **Go handlers**, use kafka-batch-go for tier 2 (`kbatch daemon`) and/or tier 3 (`kbatch worker`) on go topics + `fair_*_ready.go`.
+For **Go-only control** (optional), kafka-batch-go also provides `kbatch daemon` for tier 2. Most mixed stacks use Ruby Karafka for control and share events/retry/callback topics.
 
 ### Topic rules
 
-- **One execution topic = one runtime.** Manifest validation rejects a topic shared by `ruby` and `go` handlers.
-- **Fairness:** one **ingest** topic per lane (shared); two **ready** topics per lane (`.go` / `.ruby`). Forwarder routes by manifest `runtime`.
-- **Consumer groups** on ready topics: `-jobs-fair-*` (Ruby), `-go-worker-fair-ready-*` (Go worker).
+- **One execution topic = one runtime.** Never register Ruby and Go handlers on the same plain or priority topic.
+- **Fairness:** one **ingest** topic per lane (shared by both runtimes); separate **ready** topics per runtime (`.ruby` / `.go`). The forwarder routes by manifest `runtime`.
+- **Consumer groups:** `-jobs-fair-*` (Ruby), Go worker groups in kafka-batch-go.
 
-### Handler manifest
-
-```yaml
-handlers:
-  segment.export:
-    runtime: go
-    topic: segment.exports
-  orders.process:
-    runtime: ruby
-    worker_class: Orders::ProcessWorker
-    topic: kafka_batch.jobs
-```
+Handler manifest format and enqueue examples: **[Ruby + Go handlers](#ruby--go-handlers-mixed-runtime)**.
 
 See **[Deployment](#deployment)** for how to run all three tiers together, standalone on one host, or split into separate processes.
 
@@ -358,9 +491,14 @@ See **[Deployment](#deployment)** for how to run all three tiers together, stand
 ### Standalone jobs (no batch)
 
 ```ruby
+# Ruby handler
 KafkaBatch::Batch.enqueue(MyWorker, { "id" => 1 })
 KafkaBatch::Batch.enqueue_at(MyWorker, { "id" => 1 }, 1.hour.from_now)
 KafkaBatch::Batch.enqueue_in(MyWorker, { "id" => 1 }, 30.minutes)
+
+# Go handler (manifest job_type)
+KafkaBatch::Batch.enqueue_job("segment.export", "segment_id" => 42)
+KafkaBatch::Batch.enqueue_job_at(1.hour.from_now, "segment.export", "segment_id" => 42)
 ```
 
 ### Shared default queue
@@ -676,7 +814,29 @@ config.schedule_poller_enabled =
 | `kafka-batch-scheduler` | 2 | 2–3 | `KB_ROLE=scheduler karafka server --include-consumer-groups ${CG}-control` |
 | `kafka-batch-worker` | 3 | autoscale | `karafka server --include-consumer-groups ${CG}-jobs,${CG}-jobs-fair-time,...` |
 
-**Go handlers:** tier 2/3 for `runtime: go` jobs live in [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) (`kbatch daemon` / `kbatch worker`). Ruby and Go tiers still share Kafka topics and Redis — deploy them as separate pods.
+**Go handlers:** tier 2/3 for `runtime: go` jobs live in [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) (`kbatch worker` on Go topics + `fair_*_ready.go`). Ruby and Go tiers share Kafka topics and Redis — deploy them as separate pods. Full setup: [Ruby + Go handlers](#ruby--go-handlers-mixed-runtime).
+
+### Mixed Ruby + Go (production)
+
+Typical layout when the API enqueues both runtimes:
+
+```bash
+# Tier 1 — API (enqueue Ruby + Go jobs; manifest loaded in initializer)
+KAFKA_BATCH_DAEMON_MODE=1 bundle exec puma
+
+# Tier 2 — Control (fair forwarder, events, retry, callbacks)
+KB_ROLE=scheduler bundle exec karafka server \
+  --include-consumer-groups ${CG}-control,${CG}-dispatch-time
+
+# Tier 3 — Ruby execution
+bundle exec karafka server \
+  --include-consumer-groups ${CG}-jobs,${CG}-jobs-fair-time
+
+# Tier 3 — Go execution (separate repo / Deployment)
+# kbatch worker --manifest config/kafka_batch_handlers.yml ...
+```
+
+The client never chooses a runtime at enqueue time beyond the `job_type` — manifest `runtime` drives topic routing and which worker fleet picks up the job.
 
 ---
 
