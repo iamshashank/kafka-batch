@@ -67,6 +67,9 @@ type Daemon struct {
 	MetricsEnabled              bool
 	MetricsPrefix               string
 	MetricsStatsDAddr           string
+	ReconciliationInterval      time.Duration
+	ReconcilerLockTTL           time.Duration
+	MaxReconcilePerRun          int
 }
 
 func DefaultDaemon() Daemon {
@@ -112,6 +115,9 @@ func DefaultDaemon() Daemon {
 		FairnessDefaultWeight:     1.0,
 		FairnessWeightedConcurrency: true,
 		MetricsPrefix:               "kafka_batch",
+		ReconciliationInterval:      300 * time.Second,
+		ReconcilerLockTTL:           600 * time.Second,
+		MaxReconcilePerRun:          100,
 	}
 }
 
@@ -174,6 +180,9 @@ func LoadDaemon(path string) (Daemon, error) {
 		MetricsEnabled              bool     `yaml:"metrics_enabled"`
 		MetricsPrefix               string   `yaml:"metrics_prefix"`
 		MetricsStatsDAddr           string   `yaml:"metrics_statsd_addr"`
+		ReconciliationIntervalSec   float64  `yaml:"reconciliation_interval"`
+		ReconcilerLockTTLSec        float64  `yaml:"reconciler_lock_ttl"`
+		MaxReconcilePerRun          int      `yaml:"max_reconcile_per_run"`
 	}
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
 		return cfg, err
@@ -321,6 +330,15 @@ func LoadDaemon(path string) (Daemon, error) {
 	}
 	if doc.MetricsStatsDAddr != "" {
 		cfg.MetricsStatsDAddr = doc.MetricsStatsDAddr
+	}
+	if doc.ReconciliationIntervalSec > 0 {
+		cfg.ReconciliationInterval = time.Duration(doc.ReconciliationIntervalSec * float64(time.Second))
+	}
+	if doc.ReconcilerLockTTLSec > 0 {
+		cfg.ReconcilerLockTTL = time.Duration(doc.ReconcilerLockTTLSec * float64(time.Second))
+	}
+	if doc.MaxReconcilePerRun > 0 {
+		cfg.MaxReconcilePerRun = doc.MaxReconcilePerRun
 	}
 	applyEnv(&cfg)
 	cfg.prefixTopics()

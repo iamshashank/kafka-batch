@@ -34,6 +34,8 @@ type Config struct {
 	FairnessThroughputIngest string
 	// Static tenant_id → ingest partition (Ruby fairness_tenant_partitions).
 	FairnessTenantPartitions map[string]int32
+	FairnessDynamicTenantPartitions bool
+	FairnessTenantPartitionCacheTTL time.Duration
 }
 
 // DefaultConfig returns sensible local defaults.
@@ -56,6 +58,7 @@ func DefaultConfig() Config {
 		ProduceChunkSize:          500,
 		FairnessTimeIngest:        "kafka_batch.fair_time_ingest",
 		FairnessThroughputIngest:  "kafka_batch.fair_throughput_ingest",
+		FairnessTenantPartitionCacheTTL: 30 * time.Second,
 	}
 }
 

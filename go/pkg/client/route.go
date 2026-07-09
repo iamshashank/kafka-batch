@@ -1,6 +1,8 @@
 package client
 
 import (
+	"context"
+
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
 )
 
@@ -33,6 +35,11 @@ func (c *Client) routeFor(entry config.HandlerEntry, jobID, tenantID string, bat
 			if part, ok := c.cfg.FairnessTenantPartitions[tenantID]; ok {
 				p := part
 				return Route{Topic: topic, Partition: &p}
+			}
+			if c.tenants != nil {
+				if p := c.tenants.Resolve(context.Background(), tenantID, lane); p != nil {
+					return Route{Topic: topic, Partition: p}
+				}
 			}
 		}
 		return Route{Topic: topic, Key: key}

@@ -8,6 +8,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/y-shashank/kafka-batch/go/pkg/config"
+	"github.com/y-shashank/kafka-batch/go/pkg/fairness"
 	"github.com/y-shashank/kafka-batch/go/pkg/instrument"
 	"github.com/y-shashank/kafka-batch/go/pkg/kafkaclient"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
@@ -25,6 +26,7 @@ type Client struct {
 	prod     *kafkaclient.Client
 	uniq     *uniq.Locker
 	rdb      *redis.Client
+	tenants  *fairness.TenantPartitions
 }
 
 // New connects to Kafka and Redis and loads the handler manifest.
@@ -66,6 +68,26 @@ func New(cfg Config) (*Client, error) {
 		return nil, err
 	}
 	c.prod = prod
+	c.tenants = fairness.NewTenantPartitions(rdb, fairness.TenantPartitionsConfig{
+		Static:  cfg.FairnessTenantPartitions,
+		Dynamic: cfg.FairnessDynamicTenantPartitions,
+		CacheTTL: cfg.FairnessTenantPartitionCacheTTL,
+		Counter: prod,
+		IngestTopic: func(lane string) string {
+			switch lane {
+			case "time":
+				return cfg.resolveTopic(cfg.FairnessTimeIngest)
+			case "throughput":
+				return cfg.resolveTopic(cfg.FairnessThroughputIngest)
+			default:
+				return cfg.defaultJobsTopic()
+			}
+		},
+	})
+	if cfg.FairnessDynamicTenantPartitions {
+		_ = c.tenants.Warm(context.Background(), "time")
+		_ = c.tenants.Warm(context.Background(), "throughput")
+	}
 	return c, nil
 }
 

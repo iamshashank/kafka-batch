@@ -29,6 +29,7 @@ type Batch struct {
 	Meta            string
 	Description     string
 	TenantID        string
+	LockedAt        string
 	FinishedAt      string
 	CallbackClaimed bool
 }
@@ -53,6 +54,14 @@ type RedisStore struct {
 
 func NewRedisStore(client *redis.Client, ttl time.Duration) *RedisStore {
 	return &RedisStore{client: client, ttl: ttl}
+}
+
+// RawClient exposes the underlying Redis client (reconciler summaries, tests).
+func (s *RedisStore) RawClient() *redis.Client {
+	if s == nil {
+		return nil
+	}
+	return s.client
 }
 
 func (s *RedisStore) completionKeys(batchID string) []string {
@@ -120,15 +129,7 @@ func (s *RedisStore) FindBatch(ctx context.Context, id string) (*Batch, error) {
 	if len(h) == 0 {
 		return nil, nil
 	}
-	b := &Batch{
-		ID: h["id"], Status: h["status"], OnSuccess: h["on_success"], OnComplete: h["on_complete"],
-		Meta: h["meta"], Description: h["description"], TenantID: h["tenant_id"],
-		FinishedAt: h["finished_at"],
-	}
-	b.TotalJobs, _ = strconv.ParseInt(h["total_jobs"], 10, 64)
-	b.CompletedCount, _ = strconv.ParseInt(h["completed_count"], 10, 64)
-	b.FailedCount, _ = strconv.ParseInt(h["failed_count"], 10, 64)
-	b.CallbackClaimed = h["callback_dispatched_at"] != ""
+	b := hashToBatch(h)
 	return b, nil
 }
 

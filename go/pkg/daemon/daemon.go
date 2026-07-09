@@ -27,6 +27,7 @@ import (
 	"github.com/y-shashank/kafka-batch/go/pkg/kbatch"
 	"github.com/y-shashank/kafka-batch/go/pkg/metrics"
 	"github.com/y-shashank/kafka-batch/go/pkg/priority"
+	"github.com/y-shashank/kafka-batch/go/pkg/reconciler"
 	"github.com/y-shashank/kafka-batch/go/pkg/protocol"
 	"github.com/y-shashank/kafka-batch/go/pkg/schedule"
 	"github.com/y-shashank/kafka-batch/go/pkg/store"
@@ -163,6 +164,7 @@ func Run(ctx context.Context, cfgPath, manifestPath string) error {
 	}
 
 	go RunConsumer(ctx, cfg.Brokers, cfg.ConsumerGroup+"-events", []string{cfg.EventsTopic}, func(rec *kgo.Record) error {
+		reconciler.MaybeRun(ctx, cfg, st, prod)
 		_, err := eventProc.ProcessBatch(ctx, [][]byte{rec.Value})
 		return err
 	}, errCh, nil)

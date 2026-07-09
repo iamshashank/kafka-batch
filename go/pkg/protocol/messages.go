@@ -47,6 +47,7 @@ type CallbackMessage struct {
 	OnComplete     string                 `json:"on_complete,omitempty"`
 	Meta           map[string]interface{} `json:"meta,omitempty"`
 	FinishedAt     string                 `json:"finished_at"`
+	Reconciled     bool                   `json:"reconciled,omitempty"`
 }
 
 // SourceCoords identifies a consumed Kafka record.

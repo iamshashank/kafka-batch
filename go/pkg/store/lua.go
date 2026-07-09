@@ -137,6 +137,31 @@ const doneIndex = "kafka_batch:index:done"
 const allIndex = "kafka_batch:index:all"
 const countsKey = "kafka_batch:counts"
 const cancelledIndex = "kafka_batch:index:cancelled"
+const reconcilerLockKey = "kafka_batch:b:reconciler_lock"
+
+const acquireLockLua = `
+return redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', tonumber(ARGV[2]))
+`
+
+const releaseLockLua = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+`
+
+const markFinishedIfRunningLua = `
+if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+if redis.call('HGET', KEYS[1], 'status') ~= 'running' then return 0 end
+redis.call('HSET', KEYS[1], 'status', ARGV[1])
+redis.call('HSET', KEYS[1], 'finished_at', ARGV[2])
+redis.call('ZREM', KEYS[3], ARGV[4])
+redis.call('ZADD', KEYS[4], tonumber(ARGV[3]), ARGV[4])
+redis.call('HINCRBY', KEYS[2], 'running', -1)
+redis.call('HINCRBY', KEYS[2], ARGV[1], 1)
+return 1
+`
 
 func batchKey(id string) string   { return keyPrefix + ":" + id }
 func bitmapKey(id string) string  { return keyPrefix + ":bitmap:" + id }
