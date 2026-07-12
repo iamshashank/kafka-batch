@@ -489,12 +489,12 @@ module KafkaBatch
       @uniq_lock_ttl            = 7 * 24 * 3600  # 7 days — covers max_schedule_horizon + retries
       @uniq_on_duplicate        = :skip
       @consumption_control_refresh_interval = 30
-      @max_retries              = 3
+      @max_retries              = 7
       @retry_jitter             = 0.1  # +/- 10%
       @retry_tiers              = { short: 30, medium: 7 * 60, large: 20 * 60 }
       @retry_tier_progression   = %i[short medium large]
       @retry_max_pause_seconds  = 30
-      @complete_after_retries   = 3    # == max_retries default → no early completion by default
+      @complete_after_retries   = 7    # == max_retries default → no early completion by default
       @schedule_store           = :redis
       @schedule_poller_enabled  = false
       @schedule_poll_interval   = 5.0

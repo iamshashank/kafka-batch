@@ -334,7 +334,7 @@ module KafkaBatch
         return { status: :invalid } if batch_seq.nil? || batch_seq.to_i <= 0
 
         field = status == "success" ? "completed_count" : "failed_count"
-        now   = Time.now.iso8601
+        now   = Time.now.utc.iso8601
 
         result = with_redis do |r|
           r.eval(BATCH_DONE_JOB_LUA,
@@ -365,7 +365,7 @@ module KafkaBatch
       #     delivery) this is empty, so the EventConsumer does zero extra reads.
       def record_completions_batch(events)
         return { finished: [], replays: [] } if events.empty?
-        now = Time.now.iso8601
+        now = Time.now.utc.iso8601
 
         now_float = Time.now.to_f.to_s
         results = with_redis do |r|
@@ -455,7 +455,7 @@ module KafkaBatch
       end
 
       def claim_callback(id, dispatched_by = nil)
-        now = Time.now.iso8601
+        now = Time.now.utc.iso8601
         # #8 fix: KEYS[2]=DONE_INDEX and ARGV[3]=id so the ZREM happens inside
         # the Lua script atomically with the HSETNX claim, preventing a crash
         # between the two from leaving the batch stranded in DONE_INDEX.
@@ -527,7 +527,7 @@ module KafkaBatch
           "attempt"       => attempt.to_i,
           "status"        => status,
           "next_retry_at" => (next_retry_at.respond_to?(:iso8601) ? next_retry_at.iso8601 : next_retry_at),
-          "failed_at"     => Time.now.iso8601
+          "failed_at"     => Time.now.utc.iso8601
         }, mode: :compat)
 
         with_redis do |r|

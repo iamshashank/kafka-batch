@@ -279,7 +279,7 @@ module KafkaBatch
             "dlt_raw_payload"   => raw,
             "dlt_error_class"   => error.class.name,
             "dlt_error_message" => error.message,
-            "dlt_at"            => Time.now.iso8601
+            "dlt_at"            => Time.now.utc.iso8601
           },
           dlt_type:     "malformed_event",
           source_topic: topic
@@ -300,7 +300,7 @@ module KafkaBatch
             "dlt_type"         => "incomplete_event",
             "dlt_source_topic" => topic,
             "dlt_reason"       => reason,
-            "dlt_at"           => Time.now.iso8601
+            "dlt_at"           => Time.now.utc.iso8601
           ),
           key:          data["batch_id"] || data["job_id"],
           dlt_type:     "incomplete_event",

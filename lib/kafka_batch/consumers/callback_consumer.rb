@@ -209,7 +209,7 @@ module KafkaBatch
             "dlt_error_class"     => error.class.name,
             "dlt_error_message"   => error.message,
             "dlt_source_topic"    => original_message.topic,
-            "dlt_at"              => Time.now.iso8601
+            "dlt_at"              => Time.now.utc.iso8601
           ),
           key:          data["batch_id"],
           dlt_type:     dlt_type,

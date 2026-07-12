@@ -71,11 +71,15 @@ module KafkaBatch
           # the producer, so no in-flight work is cut off mid-produce.
           KafkaBatch::Fairness::Forwarder.stop! if defined?(KafkaBatch::Fairness::Forwarder)
           KafkaBatch::SchedulePoller.stop!       if defined?(KafkaBatch::SchedulePoller)
-          KafkaBatch::Producer.reset!
+          KafkaBatch::Producer.reset!            if defined?(KafkaBatch::Producer)
         end
       else
         # Fallback for non-Karafka environments (e.g. Sidekiq, plain Puma).
-        at_exit { KafkaBatch::Producer.reset! }
+        # Guard on the constant: UI/producer-only load paths (require
+        # "kafka_batch/ui") pull in the railtie but never require producer.rb,
+        # so Producer is undefined at exit — e.g. during `rails g
+        # kafka_batch:install`, which boots the app but not the backend.
+        at_exit { KafkaBatch::Producer.reset! if defined?(KafkaBatch::Producer) }
       end
     end
 

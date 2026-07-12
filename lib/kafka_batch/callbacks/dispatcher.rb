@@ -70,7 +70,7 @@ module KafkaBatch
             "completed_count" => batch[:completed_count],
             "failed_count"    => batch[:failed_count],
             "callback_args"   => batch[:callback_args] || {},
-            "finished_at"     => finished_at || batch[:finished_at] || Time.now.iso8601,
+            "finished_at"     => finished_at || batch[:finished_at] || Time.now.utc.iso8601,
             "description"     => batch[:description],
             "tenant_id"       => batch[:tenant_id]
           }

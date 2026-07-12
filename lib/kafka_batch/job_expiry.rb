@@ -106,7 +106,7 @@ module KafkaBatch
         "job_id"        => job_id,
         "status"        => "failed",
         "worker_class"  => worker_name,
-        "occurred_at"   => Time.now.iso8601,
+        "occurred_at"   => Time.now.utc.iso8601,
         "src_topic"     => topic,
         "src_partition" => partition,
         "src_offset"    => offset,
@@ -143,7 +143,7 @@ module KafkaBatch
           "dlt_source_topic"  => topic,
           "dlt_error_class"   => error.class.name,
           "dlt_error_message" => error.message,
-          "dlt_at"            => Time.now.iso8601
+          "dlt_at"            => Time.now.utc.iso8601
         ),
         key:          data["job_id"],
         dlt_type:     "expired",

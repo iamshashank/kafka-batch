@@ -122,7 +122,7 @@ module KafkaBatch
             "dlt_raw_payload"   => message.raw_payload.to_s,
             "dlt_parse_error"   => error.message,
             "dlt_error_class"   => error.class.name,
-            "dlt_at"            => Time.now.iso8601
+            "dlt_at"            => Time.now.utc.iso8601
           },
           key:          nil,
           dlt_type:     "malformed_ingest",

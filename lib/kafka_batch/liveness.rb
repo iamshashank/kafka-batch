@@ -100,7 +100,7 @@ module KafkaBatch
         payload = dump(
           "job_id" => job_id, "batch_id" => batch_id, "worker_class" => worker_class.to_s,
           "consumer_id" => consumer_id, "topic" => topic, "partition" => partition,
-          "started_at" => Time.now.iso8601
+          "started_at" => Time.now.utc.iso8601
         )
         redis_with { |r| r.set("#{JOB_PREFIX}#{consumer_id}:#{job_id}", payload, ex: ttl) }
       end
@@ -115,7 +115,7 @@ module KafkaBatch
           "hostname"    => Socket.gethostname,
           "pid"         => Process.pid,
           "topic"       => topic,
-          "last_seen"   => Time.now.iso8601
+          "last_seen"   => Time.now.utc.iso8601
         }
         payload.merge!(current_stats)
 

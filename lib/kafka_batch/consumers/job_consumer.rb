@@ -572,7 +572,7 @@ module KafkaBatch
           "job_id"        => job_id,
           "status"        => status,
           "worker_class"  => worker_class.to_s,
-          "occurred_at"   => Time.now.iso8601,
+          "occurred_at"   => Time.now.utc.iso8601,
           "src_topic"     => message.topic,
           "src_partition" => message.partition,
           "src_offset"    => message.offset
@@ -633,7 +633,7 @@ module KafkaBatch
             "dlt_source_topic"  => topic,
             "dlt_error_class"   => error.class.name,
             "dlt_error_message" => error.message,
-            "dlt_at"            => Time.now.iso8601
+            "dlt_at"            => Time.now.utc.iso8601
           ),
           key:          data["job_id"],
           dlt_type:     "job",

@@ -9,9 +9,9 @@ RSpec.describe KafkaBatch::Configuration do
     it "ships sane topic + retry defaults" do
       expect(config.jobs_topic).to eq("kafka_batch.jobs")
       expect(config.retry_topic).to eq("kafka_batch.jobs.retry")
-      expect(config.max_retries).to eq(3)
+      expect(config.max_retries).to eq(7)
       expect(config.retry_jitter).to eq(0.1)
-      expect(config.complete_after_retries).to eq(3)
+      expect(config.complete_after_retries).to eq(7)
     end
 
     it "ships tiered retry delays (short/medium/large)" do
