@@ -140,7 +140,30 @@ bundle exec rake kafka_batch:create_topics
 # dry-run: bundle exec rake kafka_batch:topics
 ```
 
-Topics are derived from registered workers, priority YAML files, and fairness settings.
+Topics are derived from registered workers, priority YAML files, and fairness settings. The task is **idempotent** — existing topics are skipped, never altered (Kafka cannot shrink partitions or change replication factor in place). It prints a `created / skipped / failed` summary and exits non-zero on any failure.
+
+Two env vars tune what gets created (both also apply to the `:topics` dry-run):
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `REPLICATION_FACTOR` | `config.topics_replication_factor` (**3**) | Replication factor for **every** topic. Set to `1` on a single-broker cluster (local/dev/CI) — the default `3` fails there with `NOT_ENOUGH_REPLICAS`. |
+| `PARTITIONS` | per-category [defaults](#scaling--partitions) | Forces **every** topic to exactly N partitions, overriding the per-category sizing. Omit to keep the tuned per-category defaults. |
+
+```bash
+# Local single-broker Kafka — replication factor MUST be 1:
+REPLICATION_FACTOR=1 bundle exec rake kafka_batch:create_topics
+
+# Force every topic to 12 partitions (e.g. a small staging cluster):
+PARTITIONS=12 bundle exec rake kafka_batch:create_topics
+
+# Both together — 24 partitions, single replica:
+PARTITIONS=24 REPLICATION_FACTOR=1 bundle exec rake kafka_batch:create_topics
+
+# Preview the exact plan (name / partitions / rf) without creating anything:
+PARTITIONS=24 REPLICATION_FACTOR=1 bundle exec rake kafka_batch:topics
+```
+
+> Prefer setting per-topic partition counts by sizing your workers/priority topics (see [Scaling & partitions](#scaling--partitions)); reach for `PARTITIONS=N` only when you want a uniform override across the whole set (e.g. dev/staging).
 
 ### 4. Wire Karafka routes
 

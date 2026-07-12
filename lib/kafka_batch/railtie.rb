@@ -92,9 +92,9 @@ module KafkaBatch
         end
 
         desc "Create all KafkaBatch Kafka topics (idempotent). " \
-             "Env: PARTITIONS=N forces every topic to N partitions; " \
-             "REPLICATION_FACTOR=N (default config.topics_replication_factor, currently 3); " \
-             "INCLUDE_FAIRNESS=false skips ingest/ready topics."
+             "Env: PARTITIONS=N forces every topic to N partitions " \
+             "(default: per-category KafkaBatch::Topics::DEFAULT_PARTITIONS); " \
+             "REPLICATION_FACTOR=N (default config.topics_replication_factor, currently 3)."
         task create_topics: :environment do
           # Topics is part of the full backend — not loaded when only
           # kafka_batch/ui is required (dashboard-only processes). Require it
@@ -148,10 +148,15 @@ module KafkaBatch
             warn "[KafkaBatch] eager_load skipped: #{e.message}"
           end
 
+          # Honor the same env knobs as create_topics so the preview reflects
+          # exactly what would be created.
+          partitions = ENV["PARTITIONS"] && !ENV["PARTITIONS"].empty? ? ENV["PARTITIONS"].to_i : nil
+          rf         = (ENV["REPLICATION_FACTOR"] || KafkaBatch.config.topics_replication_factor).to_i
+
           puts ""
           puts "[KafkaBatch] Topic plan (dry-run — nothing created):"
           puts ""
-          KafkaBatch::Topics.specs.each do |s|
+          KafkaBatch::Topics.specs(partitions: partitions, replication_factor: rf).each do |s|
             puts "  %-50s  partitions=%-3d  rf=%-2d" % [s[:name], s[:partitions], s[:replication_factor]]
           end
           puts ""
