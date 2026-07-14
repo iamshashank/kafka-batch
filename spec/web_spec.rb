@@ -69,6 +69,17 @@ RSpec.describe KafkaBatch::Web do
       expect(html).to include("location.reload()")
     end
 
+    it "embeds an inline SVG favicon and header logo mark (works at any mount path)" do
+      html = get("/").last.join
+      expect(html).to include('<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,')
+      expect(html).to include('rel="apple-touch-icon"')
+      expect(html).to include('class="logo-mark"')
+      # The data URI decodes back to the fan-out SVG mark.
+      require "base64"
+      expect(Base64.strict_decode64(KafkaBatch::Web::FAVICON_DATA_URI.split(",", 2).last))
+        .to include("<svg").and include("</svg>")
+    end
+
     it "has bulk select checkboxes and cancel/delete actions" do
       seed
       html = get("/").last.join

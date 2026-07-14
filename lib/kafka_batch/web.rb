@@ -1,5 +1,6 @@
 require "erb"
 require "cgi"
+require "base64"
 require "securerandom"
 require "time"
 require_relative "system_info"
@@ -41,6 +42,27 @@ module KafkaBatch
     # the cookie, then replay the token on mutating POSTs.
     CSRF_COOKIE = "_kb_csrf"
     CSRF_FIELD  = "_csrf"
+
+    # ── Favicon / brand mark ──────────────────────────────────────────────────
+    # A "fan-out" glyph: one source node (the consumer) splitting into parallel
+    # partition lanes ending in batched records — the shape of the pipeline.
+    # Embedded as an inline data URI so it works at any mount path with no extra
+    # route or asset pipeline, and reused (currentColor) as the header logo mark.
+    FAVICON_SVG = <<~SVG.freeze
+      <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" fill="none">
+        <defs><linearGradient id="kb-bg" x1="0" y1="0" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#6D5EF6"/><stop offset="1" stop-color="#A855F7"/></linearGradient></defs>
+        <rect width="32" height="32" rx="7" fill="url(#kb-bg)"/>
+        <g stroke="#FFFFFF" stroke-width="1.9" stroke-linecap="round" fill="none">
+          <path d="M11 16 Q16.5 16 21 8" opacity="0.72"/><path d="M11 16 H21" opacity="0.92"/>
+          <path d="M11 16 Q16.5 16 21 24" opacity="0.72"/></g>
+        <circle cx="10" cy="16" r="3.1" fill="#FFFFFF"/><circle cx="10" cy="16" r="1.3" fill="#7C4DFF"/>
+        <rect x="21" y="6.4" width="4.6" height="3.2" rx="1" fill="#FFFFFF" opacity="0.80"/>
+        <rect x="21" y="14.4" width="4.6" height="3.2" rx="1" fill="#FFFFFF"/>
+        <rect x="21" y="22.4" width="4.6" height="3.2" rx="1" fill="#FFFFFF" opacity="0.80"/>
+      </svg>
+    SVG
+    FAVICON_DATA_URI = "data:image/svg+xml;base64,#{Base64.strict_encode64(FAVICON_SVG)}".freeze
 
     STATUS_COLORS = {
       "running"      => "#3b82f6",
@@ -2455,11 +2477,13 @@ module KafkaBatch
           <meta charset="utf-8">
           <meta name="viewport" content="width=device-width, initial-scale=1">
           <title>KafkaBatch — #{h(title)}</title>
+          <link rel="icon" type="image/svg+xml" href="#{FAVICON_DATA_URI}">
+          <link rel="apple-touch-icon" href="#{FAVICON_DATA_URI}">
           <style>#{CSS}</style>
         </head>
         <body>
           <header>
-            <a href="#{index_path}" class="logo">KafkaBatch</a>
+            <a href="#{index_path}" class="logo"><img class="logo-mark" src="#{FAVICON_DATA_URI}" width="22" height="22" alt="">KafkaBatch</a>
             <nav class="header-nav">
               #{nav_btn("/", "Batches")}
               #{nav_btn("/failures", "⚠ Failures")}
@@ -2504,7 +2528,8 @@ module KafkaBatch
       body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
              background: #f3f4f6; color: #111827; }
       header { background: #111827; color: #fff; padding: 10px 24px; display: flex; align-items: center; gap: 10px; }
-      header .logo { color: #fff; text-decoration: none; font-weight: 700; font-size: 18px; }
+      header .logo { color: #fff; text-decoration: none; font-weight: 700; font-size: 18px; display: inline-flex; align-items: center; gap: 8px; }
+      header .logo-mark { display: block; border-radius: 5px; }
       header .tag { color: #9ca3af; font-size: 13px; }
       .header-nav { margin-left: auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
       header .btn { background: transparent; border-color: #4b5563; color: #e5e7eb; font-size: 12px; padding: 4px 10px; }
