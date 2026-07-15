@@ -76,7 +76,7 @@ RSpec.describe KafkaBatch::Configuration do
     end
 
     it "ships SuperFetch concurrency + reclaim defaults (always on)" do
-      expect(config.super_fetch_concurrency).to eq(32)
+      expect(config.super_fetch_concurrency).to eq(1)
       expect(config.super_fetch_lease_ttl).to eq(120)
       expect(config.super_fetch_orphan_grace).to eq(40)
       expect(config.super_fetch_reclaim_enabled).to eq(true)

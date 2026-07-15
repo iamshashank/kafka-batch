@@ -57,7 +57,7 @@ A topic in a **priority YAML** must **not** also be consumed by flat `-jobs`. Bo
 
 ### 5. Partition count is fixed at topic creation
 
-Kafka cannot shrink partitions. Size execution topics for **peak pods × SuperFetch concurrency** (e.g. 150 pods × `super_fetch_concurrency` 32 → plan partitions for that peak in-flight shape, not only Karafka `concurrency`). Undersized topics leave pods idle at peak; oversized topics are harmless.
+Kafka cannot shrink partitions. Size execution topics for **peak pods × effective in-flight** (Karafka `concurrency` × `super_fetch_concurrency`, default often `N × 1`). Undersized topics leave pods idle at peak; oversized topics are harmless.
 
 Ruby job consumers are **SuperFetch always-on** on every execution group (plain, priority, fair-ready; scheduled jobs hit those topics after the poller). Claim in Redis → Kafka mark → thread-pool `#perform`. **EventConsumer** (and other control consumers) stay sync. Crash recovery: Ruby control runs the same workset **reclaim** loop as Go `kbatch daemon` (either control plane is enough on shared Redis). Keep **one topic = one runtime** (Ruby or Go), never both.
 
@@ -696,7 +696,7 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | `fairness_lease_ttl` | `1800` | Seconds; install template: `7200` |
 | `track_running_jobs` | `true` | Set `false` at very high throughput (keeps heartbeats) |
 | `uniq_enabled` | `true` | Master switch for `uniq true` workers |
-| `super_fetch_concurrency` | `32` | Concurrent `#perform`s per consumer process (thread pool) |
+| `super_fetch_concurrency` | `1` | Concurrent `#perform`s per consumer process (thread pool). Default `1` (MRI GVL); see [SuperFetch concurrency (Ruby)](#superfetch-concurrency-ruby) |
 | `super_fetch_lease_ttl` | `120` | Redis workset job key TTL (renewed during long jobs) |
 | `super_fetch_orphan_grace` | `40` | Seconds before a dead owner's job is stealable / reclaimable |
 | `super_fetch_reclaim_enabled` | `true` | Control-plane orphan reclaim loop (parity with Go daemon) |
@@ -1180,7 +1180,38 @@ Subscribe your own consumer to `config.dead_letter_topic` for alerting.
 
 ## Scaling & partitions
 
-**Rule:** `partitions ≥ peak_pods × super_fetch_concurrency` (IO-bound jobs) on every execution topic you intend to scale. Karafka `concurrency` still sizes how many partitions a process can hold; SuperFetch sizes concurrent `#perform`s **per** assigned partition.
+**Rule:** `partitions ≥ peak_pods × karafka_concurrency × super_fetch_concurrency` on every execution topic you intend to scale. Karafka `concurrency` sizes how many partitions a process can hold; SuperFetch sizes concurrent `#perform`s **inside** that process.
+
+### SuperFetch concurrency (Ruby)
+
+These are **different knobs**:
+
+| Knob | Controls |
+|---|---|
+| Karafka `concurrency` | How many partitions / consumer instances one process works on |
+| `super_fetch_concurrency` | How many `#perform` threads may run after Claim+ack (default **`1`**) |
+
+MRI Ruby threads share the GVL — they do **not** run Ruby CPU work in parallel. The default `super_fetch_concurrency = 1` keeps behavior close to sync consume. Raising it only helps when `#perform` spends time waiting on IO (HTTP, DB, Redis) so another thread can run while one is blocked.
+
+**Production recommendation:** keep
+
+```text
+Karafka concurrency × super_fetch_concurrency ≤ 10
+```
+
+per process (e.g. Karafka `5` × SF `2`, or Karafka `10` × SF `1`). Higher products add thread/GC pressure without true parallelism.
+
+**How to test higher values** (staging / load tests):
+
+```ruby
+# config/initializers/kafka_batch.rb
+KafkaBatch.configure do |config|
+  config.super_fetch_concurrency = 4  # try 2, 4, 8 while measuring lag + p99
+end
+# or: KAFKA_BATCH_SUPER_FETCH_CONCURRENCY=4
+```
+
+Watch consumer lag, Redis pool checkout wait (`redis_pool_size` should be ≥ SF + renewers + Karafka), RSS, and GC. If CPU-bound jobs dominate, prefer more pods (or Go workers) over raising SF.
 
 Default partition targets (`KafkaBatch::Topics::DEFAULT_PARTITIONS`):
 
@@ -1196,13 +1227,14 @@ Autoscale execution Deployments on **consumer lag** (KEDA / HPA). Partitions are
 
 ### High-volume checklist
 
-1. Size execution topics for peak pods × `super_fetch_concurrency`; keep Ruby or Go control-plane reclaim on the same Redis
-2. Tune tenant weights at `/kafka_batch/weights` (weighted concurrency is on by default)
-3. `fairness_lease_ttl` > longest job runtime
-4. `schedule_poller_enabled` only on 2–3 scheduler pods
-5. `track_running_jobs = false` at 50M+ jobs/day if `/live` per-job detail isn't needed
-6. Split control from execution — see [Deployment](#split-deployment--run-one-tier-per-process)
-7. Cap batch size or shard mega-batches in application code
+1. Size execution topics for peak pods × Karafka concurrency × `super_fetch_concurrency`; keep Ruby or Go control-plane reclaim on the same Redis
+2. Keep `karafka_concurrency × super_fetch_concurrency ≤ 10` in prod; A/B higher SF only for IO-heavy handlers
+3. Tune tenant weights at `/kafka_batch/weights` (weighted concurrency is on by default)
+4. `fairness_lease_ttl` > longest job runtime
+5. `schedule_poller_enabled` only on 2–3 scheduler pods
+6. `track_running_jobs = false` at 50M+ jobs/day if `/live` per-job detail isn't needed
+7. Split control from execution — see [Deployment](#split-deployment--run-one-tier-per-process)
+8. Cap batch size or shard mega-batches in application code
 
 ---
 
