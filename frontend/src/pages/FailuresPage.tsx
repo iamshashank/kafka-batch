@@ -78,6 +78,41 @@ export function FailuresPage() {
   const isRetrying = status === 'retrying'
   const allIds = failures.map((f) => f.job_id).filter(Boolean)
 
+  const retryPagination = (
+    <Stack direction="row" spacing={1} alignItems="center" justifyContent="center" sx={{ minHeight: 40 }}>
+      <Button
+        size="small"
+        disabled={!cursorStack.length || busy}
+        onClick={() => {
+          const prev = [...cursorStack]
+          const back = prev.pop() || ''
+          setCursorStack(prev)
+          setParams(back ? { status: 'retrying', cursor: back } : { status: 'retrying' })
+        }}
+        sx={{ minHeight: 36 }}
+      >
+        Previous
+      </Button>
+      <Box sx={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', minHeight: 36, px: 1 }}>
+        <Typography variant="body2" color="text.secondary" component="span" sx={{ lineHeight: 1 }}>
+          Page {cursorStack.length + 1}
+        </Typography>
+      </Box>
+      <Button
+        size="small"
+        disabled={!data?.has_next || busy}
+        onClick={() => {
+          if (!data?.cursor) return
+          setCursorStack((s) => [...s, cursor])
+          setParams({ status: 'retrying', cursor: data.cursor })
+        }}
+        sx={{ minHeight: 36 }}
+      >
+        Next
+      </Button>
+    </Stack>
+  )
+
   return (
     <Box>
       <PageHeader
@@ -110,66 +145,35 @@ export function FailuresPage() {
       ) : null}
 
       <SectionCard noPadding>
-        <Stack
-          direction={{ xs: 'column', sm: 'row' }}
-          spacing={1}
-          sx={{ px: 2, pt: 2, pb: 1 }}
-          alignItems={{ sm: 'center' }}
-          justifyContent="space-between"
-          flexWrap="wrap"
-          useFlexGap
-        >
-          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-            {['retrying', 'failed'].map((s) => (
-              <Chip
-                key={s}
-                label={s === 'retrying' ? 'Retrying' : 'Failed'}
-                clickable
-                color={status === s ? 'primary' : 'default'}
-                variant={status === s ? 'filled' : 'outlined'}
-                onClick={() => {
-                  setCursorStack([])
-                  setParams(s === 'retrying' ? { status: s } : { status: s, page: '1' })
-                }}
-              />
-            ))}
-          </Stack>
-          {isRetrying ? (
-            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-              <Button
-                size="small"
-                color="error"
-                disabled={busy || !selected.length}
-                onClick={() => {
-                  if (!confirm(`Skip ${selected.length} retrying job(s)?`)) return
-                  void mutate(
-                    () => apiMutate('POST', '/api/retries/delete', { job_ids: selected }),
-                    'Selected retries cancelled',
-                  )
-                }}
-              >
-                Delete selected
-              </Button>
-              <Button
-                size="small"
-                color="error"
-                variant="outlined"
-                disabled={busy}
-                onClick={() => {
-                  if (!confirm('Skip all pending retries up to the current Kafka watermarks?')) return
-                  void mutate(() => apiMutate('POST', '/api/retries/delete_all', {}), 'All pending retries marked to skip')
-                }}
-              >
-                Delete all
-              </Button>
-            </Stack>
-          ) : null}
+        <Stack direction="row" spacing={1} sx={{ px: 2, pt: 2, pb: 1 }} flexWrap="wrap" useFlexGap>
+          {['retrying', 'failed'].map((s) => (
+            <Chip
+              key={s}
+              label={s === 'retrying' ? 'Retrying' : 'Failed'}
+              clickable
+              color={status === s ? 'primary' : 'default'}
+              variant={status === s ? 'filled' : 'outlined'}
+              onClick={() => {
+                setCursorStack([])
+                setParams(s === 'retrying' ? { status: s } : { status: s, page: '1' })
+              }}
+            />
+          ))}
         </Stack>
         <TableContainer>
           <Table size="small">
             <TableHead>
               <TableRow>
-                {isRetrying ? <TableCell padding="checkbox" /> : null}
+                {isRetrying ? (
+                  <TableCell padding="checkbox">
+                    <Checkbox
+                      checked={allIds.length > 0 && selected.length === allIds.length}
+                      indeterminate={selected.length > 0 && selected.length < allIds.length}
+                      disabled={busy || allIds.length === 0}
+                      onChange={(e) => setSelected(e.target.checked ? allIds : [])}
+                    />
+                  </TableCell>
+                ) : null}
                 <TableCell>Batch</TableCell>
                 <TableCell>Job</TableCell>
                 <TableCell>Worker</TableCell>
@@ -194,11 +198,16 @@ export function FailuresPage() {
                 </TableRow>
               ) : (
                 failures.map((f: any) => (
-                  <TableRow key={`${f.topic || f.batch_id}-${f.partition ?? ''}-${f.offset ?? f.job_id}`} hover>
+                  <TableRow
+                    key={`${f.topic || f.batch_id}-${f.partition ?? ''}-${f.offset ?? f.job_id}`}
+                    hover
+                    selected={isRetrying && selected.includes(f.job_id)}
+                  >
                     {isRetrying ? (
                       <TableCell padding="checkbox">
                         <Checkbox
                           checked={selected.includes(f.job_id)}
+                          disabled={busy}
                           onChange={(e) =>
                             setSelected((prev) =>
                               e.target.checked ? [...prev, f.job_id] : prev.filter((id) => id !== f.job_id),
@@ -254,52 +263,55 @@ export function FailuresPage() {
             </TableBody>
           </Table>
         </TableContainer>
-        <Box sx={{ p: 2 }}>
-          {isRetrying ? (
-            <Stack direction="row" spacing={1} alignItems="center" justifyContent="center">
+
+        {isRetrying ? (
+          <Stack
+            direction={{ xs: 'column', sm: 'row' }}
+            spacing={1.5}
+            alignItems="center"
+            justifyContent="space-between"
+            sx={{ p: 2 }}
+          >
+            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
               <Button
-                size="small"
-                disabled={!cursorStack.length || busy}
+                variant="outlined"
+                color="error"
+                disabled={busy || !selected.length}
                 onClick={() => {
-                  const prev = [...cursorStack]
-                  const back = prev.pop() || ''
-                  setCursorStack(prev)
-                  setParams(back ? { status: 'retrying', cursor: back } : { status: 'retrying' })
+                  if (!confirm(`Skip ${selected.length} retrying job(s)?`)) return
+                  void mutate(
+                    () => apiMutate('POST', '/api/retries/delete', { job_ids: selected }),
+                    'Selected retries cancelled',
+                  )
                 }}
               >
-                Previous
-              </Button>
-              <Typography variant="body2" color="text.secondary" sx={{ px: 1 }}>
-                Page {cursorStack.length + 1}
-              </Typography>
-              <Button
-                size="small"
-                disabled={!data?.has_next || busy}
-                onClick={() => {
-                  if (!data?.cursor) return
-                  setCursorStack((s) => [...s, cursor])
-                  setParams({ status: 'retrying', cursor: data.cursor })
-                }}
-              >
-                Next
+                Delete selected
               </Button>
             </Stack>
-          ) : (
+            {retryPagination}
+            <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+              <Button
+                color="error"
+                disabled={busy}
+                onClick={() => {
+                  if (!confirm('Skip all pending retries up to the current Kafka watermarks?')) return
+                  void mutate(() => apiMutate('POST', '/api/retries/delete_all', {}), 'All pending retries marked to skip')
+                }}
+              >
+                Delete all
+              </Button>
+            </Stack>
+          </Stack>
+        ) : (
+          <Box sx={{ p: 2 }}>
             <PaginationBar
               page={page}
               hasNext={!!data?.has_next}
               onPrev={() => setParams({ status, page: String(page - 1) })}
               onNext={() => setParams({ status, page: String(page + 1) })}
             />
-          )}
-        </Box>
-        {isRetrying && allIds.length > 0 ? (
-          <Box sx={{ px: 2, pb: 2 }}>
-            <Button size="small" onClick={() => setSelected(allIds)} disabled={busy}>
-              Select page
-            </Button>
           </Box>
-        ) : null}
+        )}
       </SectionCard>
 
       <Snackbar open={!!toast} autoHideDuration={3000} onClose={() => setToast(null)} message={toast} />

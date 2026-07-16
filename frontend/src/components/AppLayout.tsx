@@ -17,6 +17,8 @@ import Stack from '@mui/material/Stack'
 import useMediaQuery from '@mui/material/useMediaQuery'
 import { useTheme } from '@mui/material/styles'
 import MenuIcon from '@mui/icons-material/Menu'
+import ChevronLeftIcon from '@mui/icons-material/ChevronLeft'
+import ChevronRightIcon from '@mui/icons-material/ChevronRight'
 import ViewListOutlinedIcon from '@mui/icons-material/ViewListOutlined'
 import WarningAmberOutlinedIcon from '@mui/icons-material/WarningAmberOutlined'
 import ReportOutlinedIcon from '@mui/icons-material/ReportOutlined'
@@ -38,8 +40,18 @@ import type { Bootstrap } from '../api/client'
 import { BrandMark } from './BrandMark'
 
 const DRAWER_WIDTH = 256
+const DRAWER_WIDTH_COLLAPSED = 72
+const NAV_COLLAPSED_KEY = 'kafka_batch_nav_collapsed'
 
 type NavItem = { to: string; label: string; icon: React.ReactNode; auditOnly?: boolean }
+
+function readCollapsed(): boolean {
+  try {
+    return localStorage.getItem(NAV_COLLAPSED_KEY) === '1'
+  } catch {
+    return false
+  }
+}
 
 export function AppLayout({
   bootstrap,
@@ -57,7 +69,22 @@ export function AppLayout({
   const theme = useTheme()
   const mobile = useMediaQuery(theme.breakpoints.down('md'))
   const [open, setOpen] = useState(false)
+  const [collapsed, setCollapsed] = useState(() => readCollapsed())
   const location = useLocation()
+
+  const drawerWidth = collapsed && !mobile ? DRAWER_WIDTH_COLLAPSED : DRAWER_WIDTH
+
+  const toggleCollapsed = () => {
+    setCollapsed((prev) => {
+      const next = !prev
+      try {
+        localStorage.setItem(NAV_COLLAPSED_KEY, next ? '1' : '0')
+      } catch {
+        /* ignore */
+      }
+      return next
+    })
+  }
 
   const groups = useMemo(
     () => [
@@ -98,20 +125,26 @@ export function AppLayout({
     return location.pathname === to || location.pathname.startsWith(`${to}/`)
   }
 
+  const narrow = collapsed && !mobile
+
   const drawer = (
     <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-      <Box sx={{ px: 2, py: 1.5 }}>
-        <Stack direction="row" spacing={1.5} alignItems="center">
+      <Box sx={{ px: narrow ? 1 : 2, py: 1.5 }}>
+        <Stack direction="row" spacing={narrow ? 0 : 1.5} alignItems="center" justifyContent={narrow ? 'center' : 'flex-start'}>
           <Box sx={{ width: 32, height: 32, flexShrink: 0, lineHeight: 0 }}>
             <BrandMark size={32} />
           </Box>
-          <Typography variant="subtitle1" noWrap sx={{ lineHeight: 1.2 }}>
-            KafkaBatch
-          </Typography>
+          {!narrow ? (
+            <Typography variant="subtitle1" noWrap sx={{ lineHeight: 1.2 }}>
+              KafkaBatch
+            </Typography>
+          ) : null}
         </Stack>
-        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.75, pl: 0.25 }}>
-          v{bootstrap?.version || '—'}
-        </Typography>
+        {!narrow ? (
+          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.75, pl: 0.25 }}>
+            v{bootstrap?.version || '—'}
+          </Typography>
+        ) : null}
       </Box>
       <Divider />
       <Box sx={{ flex: 1, overflow: 'auto', py: 1 }}>
@@ -123,39 +156,75 @@ export function AppLayout({
               key={group.title}
               dense
               subheader={
-                <ListSubheader
-                  disableSticky
-                  sx={{
-                    bgcolor: 'transparent',
-                    lineHeight: '32px',
-                    typography: 'overline',
-                    color: 'text.secondary',
-                  }}
-                >
-                  {group.title}
-                </ListSubheader>
+                narrow ? undefined : (
+                  <ListSubheader
+                    disableSticky
+                    sx={{
+                      bgcolor: 'transparent',
+                      lineHeight: '32px',
+                      typography: 'overline',
+                      color: 'text.secondary',
+                    }}
+                  >
+                    {group.title}
+                  </ListSubheader>
+                )
               }
             >
-              {items.map((item) => (
-                <ListItemButton
-                  key={item.to}
-                  component={RouterLink}
-                  to={item.to}
-                  selected={isActive(item.to)}
-                  onClick={() => setOpen(false)}
-                  sx={{ mx: 1, mb: 0.25, borderRadius: 1, minHeight: 40 }}
-                >
-                  <ListItemIcon sx={{ minWidth: 36 }}>{item.icon}</ListItemIcon>
-                  <ListItemText
-                    primary={item.label}
-                    primaryTypographyProps={{ variant: 'body2', fontWeight: isActive(item.to) ? 500 : 400 }}
-                  />
-                </ListItemButton>
-              ))}
+              {items.map((item) => {
+                const button = (
+                  <ListItemButton
+                    key={item.to}
+                    component={RouterLink}
+                    to={item.to}
+                    selected={isActive(item.to)}
+                    onClick={() => setOpen(false)}
+                    sx={{
+                      mx: narrow ? 0.75 : 1,
+                      mb: 0.25,
+                      borderRadius: 1,
+                      minHeight: 40,
+                      justifyContent: narrow ? 'center' : 'flex-start',
+                      px: narrow ? 1 : 2,
+                    }}
+                  >
+                    <ListItemIcon sx={{ minWidth: narrow ? 0 : 36, justifyContent: 'center' }}>{item.icon}</ListItemIcon>
+                    {!narrow ? (
+                      <ListItemText
+                        primary={item.label}
+                        primaryTypographyProps={{ variant: 'body2', fontWeight: isActive(item.to) ? 500 : 400 }}
+                      />
+                    ) : null}
+                  </ListItemButton>
+                )
+                return narrow ? (
+                  <Tooltip key={item.to} title={item.label} placement="right">
+                    {button}
+                  </Tooltip>
+                ) : (
+                  button
+                )
+              })}
             </List>
           )
         })}
       </Box>
+      {!mobile ? (
+        <>
+          <Divider />
+          <Box sx={{ p: 1, display: 'flex', justifyContent: narrow ? 'center' : 'flex-end' }}>
+            <Tooltip title={collapsed ? 'Expand navigation' : 'Shrink navigation'} placement="right">
+              <IconButton
+                size="small"
+                onClick={toggleCollapsed}
+                aria-label={collapsed ? 'Expand navigation' : 'Shrink navigation'}
+              >
+                {collapsed ? <ChevronRightIcon fontSize="small" /> : <ChevronLeftIcon fontSize="small" />}
+              </IconButton>
+            </Tooltip>
+          </Box>
+        </>
+      ) : null}
     </Box>
   )
 
@@ -164,8 +233,12 @@ export function AppLayout({
       <AppBar
         position="fixed"
         sx={{
-          width: { md: `calc(100% - ${DRAWER_WIDTH}px)` },
-          ml: { md: `${DRAWER_WIDTH}px` },
+          width: { md: `calc(100% - ${drawerWidth}px)` },
+          ml: { md: `${drawerWidth}px` },
+          transition: theme.transitions.create(['width', 'margin'], {
+            easing: theme.transitions.easing.sharp,
+            duration: theme.transitions.duration.enteringScreen,
+          }),
         }}
       >
         <Toolbar>
@@ -194,7 +267,17 @@ export function AppLayout({
         </Toolbar>
       </AppBar>
 
-      <Box component="nav" sx={{ width: { md: DRAWER_WIDTH }, flexShrink: { md: 0 } }}>
+      <Box
+        component="nav"
+        sx={{
+          width: { md: drawerWidth },
+          flexShrink: { md: 0 },
+          transition: theme.transitions.create('width', {
+            easing: theme.transitions.easing.sharp,
+            duration: theme.transitions.duration.enteringScreen,
+          }),
+        }}
+      >
         {mobile ? (
           <Drawer open={open} onClose={() => setOpen(false)} ModalProps={{ keepMounted: true }} sx={{ '& .MuiDrawer-paper': { width: DRAWER_WIDTH } }}>
             {drawer}
@@ -205,8 +288,13 @@ export function AppLayout({
             open
             sx={{
               '& .MuiDrawer-paper': {
-                width: DRAWER_WIDTH,
+                width: drawerWidth,
                 boxSizing: 'border-box',
+                overflowX: 'hidden',
+                transition: theme.transitions.create('width', {
+                  easing: theme.transitions.easing.sharp,
+                  duration: theme.transitions.duration.enteringScreen,
+                }),
               },
             }}
           >
@@ -219,12 +307,16 @@ export function AppLayout({
         component="main"
         sx={{
           flexGrow: 1,
-          width: { md: `calc(100% - ${DRAWER_WIDTH}px)` },
+          width: { md: `calc(100% - ${drawerWidth}px)` },
           maxWidth: '100%',
           minWidth: 0,
           px: { xs: 2, md: 3 },
           py: { xs: 2, md: 3 },
           mt: 7,
+          transition: theme.transitions.create('width', {
+            easing: theme.transitions.easing.sharp,
+            duration: theme.transitions.duration.enteringScreen,
+          }),
         }}
       >
         <Outlet />
