@@ -147,16 +147,16 @@ export function AppLayout({
             <BrandMark size={32} />
           </Box>
           {!narrow ? (
-            <Typography variant="subtitle1" noWrap sx={{ lineHeight: 1.2 }}>
-              KafkaBatch
-            </Typography>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="subtitle1" noWrap sx={{ lineHeight: 1.2 }}>
+                KafkaBatch
+              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', lineHeight: 1.2, mt: 0.25 }}>
+                v{bootstrap?.version || '—'}
+              </Typography>
+            </Box>
           ) : null}
         </Stack>
-        {!narrow ? (
-          <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.75, pl: 0.25 }}>
-            v{bootstrap?.version || '—'}
-          </Typography>
-        ) : null}
       </Box>
       <Divider />
       <Box sx={{ flex: 1, overflow: 'auto', py: 1 }}>

@@ -13,6 +13,16 @@ module KafkaBatch
     #   - kafka_batch_failures          (dashboard failure log)
     #   - kafka_batch_consumption_pauses (/lag pause state when Redis is down)
     class MysqlStore < Base
+      class FailureRecord < ActiveRecord::Base
+        self.table_name         = "kafka_batch_failures"
+        self.inheritance_column = nil
+      end
+
+      class ConsumptionPauseRecord < ActiveRecord::Base
+        self.table_name         = "kafka_batch_consumption_pauses"
+        self.inheritance_column = nil
+      end
+
       attr_reader :ledger
 
       def initialize
@@ -224,30 +234,16 @@ module KafkaBatch
 
       def failure_class
         @failure_class ||= DatabaseConnection.bind(
-          failure_model_class,
+          FailureRecord,
           connection: KafkaBatch.config.store_database_connection
         )
       end
 
       def consumption_pause_class
         @consumption_pause_class ||= DatabaseConnection.bind(
-          consumption_pause_model_class,
+          ConsumptionPauseRecord,
           connection: KafkaBatch.config.store_database_connection
         )
-      end
-
-      def failure_model_class
-        klass = Class.new(ActiveRecord::Base)
-        klass.table_name         = "kafka_batch_failures"
-        klass.inheritance_column = nil
-        klass
-      end
-
-      def consumption_pause_model_class
-        klass = Class.new(ActiveRecord::Base)
-        klass.table_name         = "kafka_batch_consumption_pauses"
-        klass.inheritance_column = nil
-        klass
       end
 
       def failures_scope(scope, limit, offset, include_batch_id: false)

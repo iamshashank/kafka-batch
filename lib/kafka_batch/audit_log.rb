@@ -15,6 +15,13 @@ module KafkaBatch
   #
   # The table is created by the kafka_batch audit migration (see install_migrations).
   module AuditLog
+    # Named AR model — ActiveRecord forbids anonymous Class.new(Base) when
+    # establish_connection is used (e.g. audit_database_connection = :primary).
+    class Record < ActiveRecord::Base
+      self.table_name         = "kafka_batch_audit_logs"
+      self.inheritance_column = nil
+    end
+
     SENSITIVE_KEYS = %w[
       _csrf password secret token api_key authorization
     ].freeze
@@ -118,14 +125,7 @@ module KafkaBatch
       private
 
       def model
-        @model ||= DatabaseConnection.bind(audit_model_class, connection: connection_config)
-      end
-
-      def audit_model_class
-        klass = Class.new(ActiveRecord::Base)
-        klass.table_name         = "kafka_batch_audit_logs"
-        klass.inheritance_column = nil
-        klass
+        @model ||= DatabaseConnection.bind(Record, connection: connection_config)
       end
 
       def connection_config

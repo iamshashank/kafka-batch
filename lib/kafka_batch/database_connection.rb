@@ -3,13 +3,16 @@
 require "active_record"
 
 module KafkaBatch
-  # Bind anonymous ActiveRecord models to a host-app database connection.
+  # Bind ActiveRecord models to a host-app database connection.
   #
   # Supports:
   #   nil              — inherit ActiveRecord::Base's default connection
   #   Class            — copy connection from an AR model (e.g. connects_to :audit)
   #   Symbol / String  — Rails database.yml name (e.g. :kafka_batch_audit)
   #   Hash             — passed to establish_connection (url/adapter/host/…)
+  #
+  # +klass+ must be a *named* ActiveRecord::Base subclass — AR raises
+  # "Anonymous class is not allowed." on establish_connection otherwise.
   module DatabaseConnection
     module_function
 

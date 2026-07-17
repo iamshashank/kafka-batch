@@ -31,6 +31,11 @@ RSpec.describe KafkaBatch::AuditLog do
     expect(row["status"]).to eq("ok")
   end
 
+  it "uses a named AR model so audit_database_connection can call establish_connection" do
+    # AR raises "Anonymous class is not allowed." for Class.new(ActiveRecord::Base).
+    expect(described_class::Record.name).to eq("KafkaBatch::AuditLog::Record")
+  end
+
   it "is a no-op when audit_enabled is false" do
     KafkaBatch.config.audit_enabled = false
     described_class.record(action: "test", path: "/x", status: "ok")

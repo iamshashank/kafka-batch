@@ -259,6 +259,14 @@ RSpec.describe KafkaBatch::Stores::MysqlStore do
   end
 
   describe "failure tracking (#record_failure / #list_failures)" do
+    it "uses named AR models so store_database_connection can call establish_connection" do
+      # AR raises "Anonymous class is not allowed." when establish_connection is
+      # called on Class.new(ActiveRecord::Base) (e.g. store_database_connection = :primary).
+      expect(described_class::FailureRecord.name).to eq("KafkaBatch::Stores::MysqlStore::FailureRecord")
+      expect(described_class::ConsumptionPauseRecord.name)
+        .to eq("KafkaBatch::Stores::MysqlStore::ConsumptionPauseRecord")
+    end
+
     it "records and lists failures (newest first)" do
       id = new_batch
       store.record_failure(batch_id: id, job_id: "j1", worker_class: "W", error_class: "RuntimeError", error_message: "boom1")
