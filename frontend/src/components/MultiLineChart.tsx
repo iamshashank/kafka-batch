@@ -95,43 +95,66 @@ export function MultiLineChart({
       .join(' ')
 
   const hoverIndex = hover?.index ?? null
-  const hoverX = hoverIndex != null ? hoverIndex * stepX : null
+  const hoverXPct =
+    hoverIndex != null && pointCount > 1 ? (hoverIndex / (pointCount - 1)) * 100 : hoverIndex != null ? 0 : null
   const tipTime =
     hoverIndex != null && timestamps?.[hoverIndex] != null ? fmtHoverTime(timestamps[hoverIndex]) : null
 
   return (
     <Box sx={{ position: 'relative' }}>
-      <Box
-        component="svg"
-        viewBox={`0 0 ${VIEW_WIDTH} ${height}`}
-        preserveAspectRatio="none"
-        onMouseMove={onMove}
-        onMouseLeave={onLeave}
-        sx={{ width: '100%', height, display: 'block', color: 'divider', cursor: 'crosshair' }}
-      >
-        {[0.25, 0.5, 0.75].map((f) => (
-          <line key={f} x1={0} x2={VIEW_WIDTH} y1={height * f} y2={height * f} stroke="currentColor" strokeWidth={1} />
-        ))}
-        {series.map((s) => (
-          <path key={s.key} d={pathFor(s.values)} fill="none" stroke={s.color} strokeWidth={1.75} vectorEffect="non-scaling-stroke" />
-        ))}
-        {hoverX != null && (
-          <line
-            x1={hoverX}
-            x2={hoverX}
-            y1={0}
-            y2={height}
-            stroke="currentColor"
-            strokeWidth={1}
-            strokeDasharray="3 3"
-            opacity={0.7}
-          />
-        )}
+      <Box sx={{ position: 'relative', height, width: '100%' }}>
+        <Box
+          component="svg"
+          viewBox={`0 0 ${VIEW_WIDTH} ${height}`}
+          preserveAspectRatio="none"
+          onMouseMove={onMove}
+          onMouseLeave={onLeave}
+          sx={{ width: '100%', height, display: 'block', color: 'divider', cursor: 'crosshair' }}
+        >
+          {[0.25, 0.5, 0.75].map((f) => (
+            <line key={f} x1={0} x2={VIEW_WIDTH} y1={height * f} y2={height * f} stroke="currentColor" strokeWidth={1} />
+          ))}
+          {series.map((s) => (
+            <path key={s.key} d={pathFor(s.values)} fill="none" stroke={s.color} strokeWidth={1.75} vectorEffect="non-scaling-stroke" />
+          ))}
+          {hoverXPct != null && hoverIndex != null && (
+            <line
+              x1={(hoverIndex / Math.max(pointCount - 1, 1)) * VIEW_WIDTH}
+              x2={(hoverIndex / Math.max(pointCount - 1, 1)) * VIEW_WIDTH}
+              y1={0}
+              y2={height}
+              stroke="currentColor"
+              strokeWidth={1}
+              strokeDasharray="3 3"
+              opacity={0.7}
+              vectorEffect="non-scaling-stroke"
+            />
+          )}
+        </Box>
+        {/* HTML dots stay circular; SVG circles stretch under preserveAspectRatio="none". */}
         {hoverIndex != null &&
+          hoverXPct != null &&
           series.map((s) => {
             const v = s.values[hoverIndex] ?? 0
-            const y = height - pad - (v / maxValue) * (height - pad * 2)
-            return <circle key={s.key} cx={hoverX!} cy={y} r={3.5} fill={s.color} stroke="#fff" strokeWidth={1.25} />
+            const yPct = ((height - pad - (v / maxValue) * (height - pad * 2)) / height) * 100
+            return (
+              <Box
+                key={s.key}
+                sx={{
+                  position: 'absolute',
+                  left: `${hoverXPct}%`,
+                  top: `${yPct}%`,
+                  width: 8,
+                  height: 8,
+                  borderRadius: '50%',
+                  bgcolor: s.color,
+                  border: '1.5px solid #fff',
+                  boxShadow: '0 0 0 1px rgba(0,0,0,0.12)',
+                  transform: 'translate(-50%, -50%)',
+                  pointerEvents: 'none',
+                }}
+              />
+            )
           })}
       </Box>
 
@@ -140,13 +163,14 @@ export function MultiLineChart({
           elevation={4}
           sx={{
             position: 'fixed',
-            left: Math.min(hover.clientX + 12, typeof window !== 'undefined' ? window.innerWidth - 220 : hover.clientX + 12),
+            left: Math.min(hover.clientX + 12, typeof window !== 'undefined' ? window.innerWidth - 260 : hover.clientX + 12),
             top: Math.min(hover.clientY + 12, typeof window !== 'undefined' ? window.innerHeight - 140 : hover.clientY + 12),
             zIndex: 1300,
             px: 1.25,
             py: 1,
             pointerEvents: 'none',
-            minWidth: 160,
+            minWidth: 200,
+            whiteSpace: 'nowrap',
           }}
         >
           {tipTime && (
