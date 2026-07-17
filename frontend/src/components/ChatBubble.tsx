@@ -11,7 +11,6 @@ import Button from '@mui/material/Button'
 import Divider from '@mui/material/Divider'
 import CircularProgress from '@mui/material/CircularProgress'
 import Tooltip from '@mui/material/Tooltip'
-import Chip from '@mui/material/Chip'
 import Link from '@mui/material/Link'
 import ChatOutlinedIcon from '@mui/icons-material/ChatOutlined'
 import CloseIcon from '@mui/icons-material/Close'
@@ -20,13 +19,11 @@ import DeleteOutlinedIcon from '@mui/icons-material/DeleteOutlined'
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
 import { apiGet, apiMutate } from '../api/client'
 
-type Citation = { id: string; title?: string; source?: string; section?: string }
 type ChatMessage = {
   id?: string
   role: string
   content: string
   at?: string
-  citations?: Citation[]
 }
 
 type HistoryResponse = {
@@ -39,7 +36,6 @@ type HistoryResponse = {
 type ChatResponse = {
   ok: boolean
   reply: string
-  citations?: Citation[]
   model?: string
   history_size?: number
   error?: string
@@ -89,7 +85,6 @@ export function ChatBubble({ enabled }: { enabled: boolean }) {
         {
           role: 'assistant',
           content: res.reply,
-          citations: res.citations,
           at: new Date().toISOString(),
         },
       ])
@@ -206,25 +201,6 @@ export function ChatBubble({ enabled }: { enabled: boolean }) {
                   <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                     {m.content}
                   </Typography>
-                  {m.citations && m.citations.length > 0 ? (
-                    <Stack direction="row" spacing={0.5} flexWrap="wrap" useFlexGap sx={{ mt: 0.75 }}>
-                      {m.citations.slice(0, 4).map((c) => (
-                        <Chip
-                          key={c.id}
-                          size="small"
-                          variant="outlined"
-                          label={c.title || c.section || c.id}
-                          sx={{
-                            height: 22,
-                            bgcolor: m.role === 'user' ? 'transparent' : undefined,
-                            color: 'inherit',
-                            borderColor: 'currentColor',
-                            opacity: 0.85,
-                          }}
-                        />
-                      ))}
-                    </Stack>
-                  ) : null}
                 </Box>
               ))}
               {loading ? (

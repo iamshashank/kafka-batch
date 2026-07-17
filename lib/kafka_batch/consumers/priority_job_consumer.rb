@@ -30,6 +30,12 @@ module KafkaBatch
         spec = self.class.priority_spec
         rank = spec[:rank].to_i
 
+        executor = KafkaBatch.job_executor
+        # Flush any completions that became committable since the last poll
+        # (watermark; no-op for SuperFetch) so the prefix advances even when a
+        # yield returns early below.
+        executor.flush(self)
+
         # Per-message yield checks so weighted interleave is per job, not per
         # poll batch (Karafka may deliver many messages per consume call).
         messages.each do |message|
@@ -37,11 +43,13 @@ module KafkaBatch
             # Seek back to THIS (unprocessed) message — never messages.first,
             # which would redeliver and re-run messages already committed earlier
             # in this same batch.
+            executor.flush(self)
             yield_for_priority(spec, message)
             return
           end
-          KafkaBatch::SuperFetch.executor.dispatch_one(self, message)
+          executor.dispatch_one(self, message)
         end
+        executor.flush(self)
       end
 
       private

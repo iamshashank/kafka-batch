@@ -5,11 +5,11 @@ module KafkaBatch
   # manifest entry (Go-only handlers with no Worker class in the host app).
   class HandlerDefinition
     attr_reader :job_type, :runtime, :worker_class, :topic_base, :apply_topic_prefix,
-                :fairness_type, :retry_tier
+                :fairness_type, :retry_tier, :declared_worker_class_name
 
     def initialize(job_type:, runtime:, worker_class: nil, topic: nil, apply_topic_prefix: true,
                    max_retries: nil, fairness_type: nil,
-                   retry_tier: nil)
+                   retry_tier: nil, declared_worker_class_name: nil)
       @job_type                 = job_type.to_s
       @runtime                  = runtime.to_sym
       @worker_class             = worker_class
@@ -18,6 +18,12 @@ module KafkaBatch
       @max_retries              = max_retries
       @fairness_type            = fairness_type&.to_sym
       @retry_tier               = retry_tier&.to_sym
+      @declared_worker_class_name =
+        if declared_worker_class_name && !declared_worker_class_name.to_s.empty?
+          declared_worker_class_name.to_s
+        elsif worker_class&.name && !worker_class.name.to_s.empty?
+          worker_class.name
+        end
     end
 
     def self.from_worker(worker_class)
@@ -46,33 +52,46 @@ module KafkaBatch
       fairness = entry["fairness_type"] || entry["fairness"]
       fairness = fairness.to_sym if fairness && !fairness.is_a?(Symbol)
 
-      worker_class = resolve_manifest_worker_class(entry["worker_class"], job_type, runtime)
+      declared = entry["worker_class"].to_s.strip
+      declared = nil if declared.empty?
+      worker_class = resolve_manifest_worker_class(declared, job_type, runtime)
 
       new(
-        job_type:               job_type,
-        runtime:                runtime,
-        worker_class:           worker_class,
-        topic:                  entry["topic"],
-        apply_topic_prefix:     entry.fetch("apply_topic_prefix", true),
-        max_retries:            entry["max_retries"],
-        fairness_type:          fairness,
-        retry_tier:             entry["retry_tier"]
+        job_type:                   job_type,
+        runtime:                    runtime,
+        worker_class:               worker_class,
+        declared_worker_class_name: declared,
+        topic:                      entry["topic"],
+        apply_topic_prefix:         entry.fetch("apply_topic_prefix", true),
+        max_retries:                entry["max_retries"],
+        fairness_type:              fairness,
+        retry_tier:                 entry["retry_tier"]
       )
     end
 
+    # Soft-resolve so the manifest can load at boot before Zeitwerk eager-loads
+    # app/workers (e.g. rake kafka_batch:create_topics). Returns nil when the
+    # constant is not loaded yet — HandlerRegistry binds it later.
     def self.resolve_manifest_worker_class(name, job_type, runtime)
       return nil unless runtime == :ruby
 
       if name && !name.to_s.empty?
-        return Object.const_get(name.to_s)
+        klass = constantize_if_loaded(name.to_s)
+        return klass if klass
       end
 
-      handler = HandlerRegistry.send(:lookup_by_job_type, job_type)
-      handler&.worker_class
-    rescue NameError => e
-      raise ArgumentError, "worker_class #{name.inspect} not found: #{e.message}"
+      HandlerRegistry.send(:lookup_by_job_type, job_type)&.worker_class
     end
     private_class_method :resolve_manifest_worker_class
+
+    def self.constantize_if_loaded(name)
+      return name.safe_constantize if name.respond_to?(:safe_constantize)
+
+      Object.const_get(name)
+    rescue NameError
+      nil
+    end
+    private_class_method :constantize_if_loaded
 
     def kafka_topic
       if @topic_base && !@topic_base.empty?
@@ -83,7 +102,6 @@ module KafkaBatch
         KafkaBatch.config.jobs_topic
       end
     end
-
     def fairness?
       !@fairness_type.nil?
     end
@@ -96,6 +114,8 @@ module KafkaBatch
     def worker_class_name
       if @worker_class&.name && !@worker_class.name.to_s.empty?
         @worker_class.name
+      elsif @declared_worker_class_name && !@declared_worker_class_name.empty?
+        @declared_worker_class_name
       else
         "go:#{@job_type}"
       end

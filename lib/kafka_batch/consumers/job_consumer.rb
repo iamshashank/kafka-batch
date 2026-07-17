@@ -43,16 +43,27 @@ module KafkaBatch
       #
       # SuperFetch: Claim → mark_as_consumed! → thread-pool #perform so one
       # partition can run many concurrent jobs (see KafkaBatch::SuperFetch).
+      # Watermark (config.execution_mode = :watermark): Redis-free, commit the
+      # contiguous completed-offset prefix (see KafkaBatch::Watermark).
       def process_messages
-        KafkaBatch::SuperFetch.executor.dispatch(self, messages)
+        KafkaBatch.job_executor.dispatch(self, messages)
       end
 
       private
 
-      # Under SuperFetch the listener already marked the offset after Claim;
-      # pool threads must not call mark_as_consumed! again.
+      # Route the pipeline's terminal "done with this message" signal by mode:
+      #   • SuperFetch — the listener already marked the offset after Claim;
+      #     pool threads must not mark again (:kafka_batch_sf_acked set).
+      #   • Watermark  — record the completion; the listener thread marks the
+      #     contiguous prefix on flush (:kafka_batch_wm set on the pool thread).
+      #   • Sync       — mark immediately.
       def commit_offset!(message)
         return if Thread.current[:kafka_batch_sf_acked]
+
+        if (wm = Thread.current[:kafka_batch_wm])
+          wm.note_done(message)
+          return
+        end
 
         mark_as_consumed!(message)
       end

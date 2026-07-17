@@ -41,8 +41,14 @@ module KafkaBatch
         exec =
           case runtime
           when :ruby
-            raise ArgumentError, "ruby handler missing worker_class for #{job_type}" unless worker_class
-            executor || Executors::Ruby.new(worker_class)
+            if worker_class
+              executor || Executors::Ruby.new(worker_class)
+            elsif definition.declared_worker_class_name.to_s.empty?
+              raise ArgumentError, "ruby handler missing worker_class for #{job_type}"
+            else
+              # Manifest loaded before Zeitwerk resolved the class — bind later.
+              nil
+            end
           when :go
             nil
           else
@@ -60,23 +66,22 @@ module KafkaBatch
         @mutex.synchronize do
           existing = @by_job_type[job_type]
           if existing
-            same_worker = existing.worker_class == worker_class
-            same_worker ||= worker_class.nil? && existing.definition&.worker_class_name == definition.worker_class_name
-            unless same_worker
+            unless compatible_reregistration?(existing, handler)
               raise ArgumentError,
                     "job_type #{job_type.inspect} already registered to #{existing.worker_class || existing.definition&.worker_class_name}"
             end
           end
 
-          @by_job_type[job_type] = handler
-          if worker_class&.name && !worker_class.name.to_s.empty?
-            @by_worker_class[worker_class.name] = handler
+          bound = merge_handler(existing, handler)
+          @by_job_type[job_type] = bound
+          if bound.worker_class&.name && !bound.worker_class.name.to_s.empty?
+            @by_worker_class[bound.worker_class.name] = bound
+          elsif bound.definition&.declared_worker_class_name && !bound.definition.declared_worker_class_name.empty?
+            @by_worker_class[bound.definition.declared_worker_class_name] = bound
           end
+          bound
         end
-
-        handler
       end
-
       # @return [Handler]
       # @raise [UnknownHandler]
       def resolve!(data)
@@ -85,7 +90,7 @@ module KafkaBatch
 
         if job_type && !job_type.to_s.empty?
           handler = @mutex.synchronize { @by_job_type[job_type.to_s] }
-          return handler if handler
+          return ensure_ruby_bound!(handler) if handler
         end
 
         if worker_name && !worker_name.to_s.empty?
@@ -95,7 +100,7 @@ module KafkaBatch
                   "job_type #{job_type.inspect} does not match #{handler.job_type.inspect} " \
                   "for #{worker_name}"
           end
-          return handler
+          return ensure_ruby_bound!(handler)
         end
 
         raise UnknownHandler, "Unknown job_type: #{job_type}" if job_type && !job_type.to_s.empty?
@@ -107,7 +112,7 @@ module KafkaBatch
         handler = @mutex.synchronize { @by_job_type[job_type.to_s] }
         raise UnknownHandler, "Unknown job_type: #{job_type}" unless handler
 
-        handler.definition
+        ensure_ruby_bound!(handler).definition
       end
 
       def lookup_by_job_type(job_type)
@@ -148,6 +153,51 @@ module KafkaBatch
         raise UnknownHandler, "Unknown worker class: #{worker_name}"
       end
       private :resolve_by_worker_class!
+
+      def ensure_ruby_bound!(handler)
+        return handler unless handler
+        return handler unless handler.runtime == :ruby
+        return handler if handler.worker_class && handler.executor
+
+        name = handler.definition&.declared_worker_class_name || handler.definition&.worker_class_name
+        raise UnknownHandler, "ruby handler #{handler.job_type.inspect} has no worker_class" \
+          if name.nil? || name.to_s.empty? || name.to_s.start_with?("go:")
+
+        klass =
+          if name.respond_to?(:safe_constantize)
+            name.safe_constantize
+          else
+            Object.const_get(name)
+          end
+        raise UnknownHandler, "Unknown worker class: #{name}" unless klass
+        raise UnknownHandler, "#{name} does not include KafkaBatch::Worker" \
+          unless klass.include?(KafkaBatch::Worker)
+
+        register_ruby(klass)
+      rescue NameError
+        raise UnknownHandler, "Unknown worker class: #{name}"
+      end
+      private :ensure_ruby_bound!
+
+      def compatible_reregistration?(existing, incoming)
+        return true if existing.worker_class == incoming.worker_class
+        return true if existing.worker_class.nil? && incoming.worker_class
+        return true if incoming.worker_class.nil? && existing.worker_class
+
+        existing_name = existing.definition&.worker_class_name
+        incoming_name = incoming.definition&.worker_class_name
+        existing_name && incoming_name && existing_name == incoming_name
+      end
+      private :compatible_reregistration?
+
+      def merge_handler(existing, incoming)
+        return incoming unless existing
+        return incoming if incoming.worker_class
+        return existing if existing.worker_class
+
+        incoming
+      end
+      private :merge_handler
 
       def registered?(job_type)
         @mutex.synchronize { @by_job_type.key?(job_type.to_s) }

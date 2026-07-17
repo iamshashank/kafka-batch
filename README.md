@@ -697,6 +697,7 @@ All options live on `KafkaBatch.config`. The install generator ships enterprise-
 | `fairness_lease_ttl` | `1800` | Seconds; install template: `7200` |
 | `track_running_jobs` | `true` | Set `false` at very high throughput (keeps heartbeats) |
 | `uniq_enabled` | `true` | Master switch for `uniq true` workers |
+| `execution_mode` | `:superfetch` | Tier-3 execution engine: `:superfetch` (Redis working set) or `:watermark` (Redis-free, contiguous-prefix commit — advanced, opt-in). See [Execution mode: watermark](#execution-mode-watermark-advanced-opt-in). Env: `KAFKA_BATCH_EXECUTION_MODE` |
 | `super_fetch_concurrency` | `1` | Concurrent `#perform`s per consumer process (thread pool). Default `1` (MRI GVL); see [SuperFetch concurrency (Ruby)](#superfetch-concurrency-ruby) |
 | `super_fetch_claim_window` | `0` → `2×` SF | Max Claimed∨Queued∨Performing; Claim+ack gated here so the listener is not blocked on `#perform` |
 | `redis_pool_size` | `≥16` (auto) | Default scales with SF + claim window + Karafka floor; raise before raising SF |
@@ -1235,6 +1236,18 @@ Default partition targets (`KafkaBatch::Topics::DEFAULT_PARTITIONS`):
 | Retry | 12 | per tier |
 
 Autoscale execution Deployments on **consumer lag** (KEDA / HPA). Partitions are fixed — pods are elastic.
+
+### Execution mode: `watermark` (advanced, opt-in)
+
+By default the Ruby `JobConsumer` executes jobs with **SuperFetch**: Redis tracks every in-flight job in a working set, the Kafka offset is marked *before* `#perform`, and a control-plane reclaim loop re-produces a dead pod's in-flight jobs. That costs ~3 Redis round-trips per job (claim + still-owned + complete) plus renew, but lets one partition run many long jobs and survive a crash without re-running them.
+
+Set `config.execution_mode = :watermark` (or `KAFKA_BATCH_EXECUTION_MODE=watermark`) to run the execution path **Redis-free**. Instead of a working set, the consumer runs jobs concurrently out of order (same `super_fetch_concurrency` thread pool) and commits only the **contiguous completed-offset prefix** per partition — the "watermark" — via Karafka `mark_as_consumed`. On crash or rebalance, everything after the last committed watermark is redelivered and re-run. This removes the per-job working-set Redis (no claim/complete/renew, no reclaim loop, no `live:consumer` heartbeat), but it is **off by default** and correct only under all of the following:
+
+1. **Idempotent handlers are mandatory.** Watermark re-runs completed-but-uncommitted jobs on any crash or rebalance. A non-idempotent worker on a watermark topic *will* double-apply. (SuperFetch is also at-least-once, but watermark re-runs more — see #2.)
+2. **Jobs on a topic must have similar runtimes.** The watermark can't advance past a still-running job, so one long job holds back every faster job that finished behind it; on crash, that whole finished-but-uncommitted tail re-runs. Uniform durations keep the tail — and duplicate runs — small. Don't mix 1-second and 30-minute jobs on a watermark topic; keep those on SuperFetch.
+3. **One mode per topic — never mix.** Every consumer on a topic (across pods *and* runtimes — Ruby and Go) must use the same execution mode. A topic consumed by both a SuperFetch and a watermark consumer has undefined behavior (raced offsets → lost + duplicated jobs). Run watermark topics on their own deployment. **The operator enforces this** — there is no cross-pod check.
+
+MRI's GVL means watermark's raw-throughput gain in Ruby is the same modest, IO-bound band as the SuperFetch thread pool; the win is the **Redis-load reduction**, which is identical to Go's. `super_fetch_concurrency` sizes the `#perform` pool and `super_fetch_claim_window` bounds dispatched-but-uncommitted jobs (and thus crash re-run count), exactly as under SuperFetch. Everything downstream (events, batch counting, retries, DLT, callbacks) is unchanged — watermark only changes the durability/offset mechanism. On boot in watermark mode the process logs a banner with these requirements and **disables the workset reclaim loop** (Kafka offsets own durability). Wire-compatible with the Go `execution_mode: watermark` in [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go).
 
 ### High-volume checklist
 

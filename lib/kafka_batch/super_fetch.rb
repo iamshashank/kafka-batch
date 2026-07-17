@@ -132,6 +132,10 @@ module KafkaBatch
         @mutex.synchronize { @accepting }
       end
 
+      # No-op for interface parity with Watermark::Executor#flush. SuperFetch marks
+      # each offset at claim time, so there is no deferred prefix to flush.
+      def flush(_consumer); end
+
       def reset!
         drain(timeout: 5)
         @mutex.synchronize do

@@ -91,23 +91,34 @@ module KafkaBatch
 
           # SuperFetch orphan reclaim (parity with Go kbatch daemon). NX-locked
           # so multiple control/execution replicas can safely share the loop.
-          begin
-            KafkaBatch::Workset::ReclaimScheduler.ensure_running! if defined?(KafkaBatch::Workset::ReclaimScheduler)
-          rescue => e
-            KafkaBatch.logger.warn("[KafkaBatch] workset reclaim start skipped: #{e.message}")
+          # Watermark mode owns durability via Kafka offset commits and writes
+          # nothing to the working set, so reclaim has nothing to do — skip it to
+          # keep the "one execution mode per topic" contract unambiguous.
+          if KafkaBatch.config.watermark_mode?
+            KafkaBatch.logger.info(
+              "[KafkaBatch] EXECUTION MODE = watermark (Redis-free): workset reclaim DISABLED " \
+              "(durability is via Kafka offset watermarks). REQUIRED: idempotent handlers, " \
+              "similar per-topic runtimes, and one mode per topic (never mix with SuperFetch)."
+            )
+          else
+            begin
+              KafkaBatch::Workset::ReclaimScheduler.ensure_running! if defined?(KafkaBatch::Workset::ReclaimScheduler)
+            rescue => e
+              KafkaBatch.logger.warn("[KafkaBatch] workset reclaim start skipped: #{e.message}")
+            end
           end
         end
 
         Karafka::App.monitor.subscribe("app.stopped") do
-          # Drain SuperFetch pool before tearing down producer/heartbeats so
-          # in-flight #perform can Complete (or stay in the workset for reclaim).
+          # Drain the active execution pool (SuperFetch or Watermark) before
+          # tearing down producer/heartbeats so in-flight #perform can finish
+          # (SuperFetch: Complete or stay in workset for reclaim; Watermark:
+          # commit what it can, the rest re-runs on restart).
           remaining = 0
           begin
-            if defined?(KafkaBatch::SuperFetch)
-              remaining = KafkaBatch::SuperFetch.drain.to_i
-            end
+            remaining = KafkaBatch.job_executor_drain.to_i
           rescue => e
-            KafkaBatch.logger.warn("[KafkaBatch] SuperFetch drain: #{e.message}")
+            KafkaBatch.logger.warn("[KafkaBatch] execution drain: #{e.message}")
           end
 
           # Stop the background threads (if this process ran them) before closing

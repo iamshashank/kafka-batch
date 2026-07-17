@@ -2,6 +2,7 @@
 
 require "json"
 require "net/http"
+require "openssl"
 require "uri"
 require "oj"
 
@@ -35,6 +36,7 @@ module KafkaBatch
         http.use_ssl = (uri.scheme == "https")
         http.open_timeout = 10
         http.read_timeout = 60
+        configure_ssl!(http) if http.use_ssl?
 
         req = Net::HTTP::Post.new(uri.request_uri)
         req["Authorization"] = "Bearer #{@api_key}"
@@ -54,6 +56,33 @@ module KafkaBatch
         raise Error, "OpenRouter returned empty content" if content.nil? || content.to_s.strip.empty?
 
         content.to_s
+      rescue OpenSSL::SSL::SSLError => e
+        raise Error, ssl_error_message(e)
+      end
+
+      private
+
+      # Provide an explicit CA store so ruby/openssl does not apply
+      # V_FLAG_CRL_CHECK_ALL (OpenSSL 3.6 + macOS fails with "unable to get
+      # certificate CRL" when CRLs are not available locally). Peer verify stays on.
+      def configure_ssl!(http)
+        store = OpenSSL::X509::Store.new
+        store.set_default_paths
+        http.cert_store = store
+        http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+      end
+
+      def ssl_error_message(error)
+        msg = error.message.to_s
+        hint =
+          if msg.include?("CRL")
+            " Local OpenSSL/CRL quirk — kafka-batch already disables CRL checks on this client; " \
+              "if it persists, add `gem \"openssl\", \">= 3.3.1\"` to the app Gemfile " \
+              "or upgrade Ruby (3.3.11+ / 3.4.10+)."
+          else
+            ""
+          end
+        "OpenRouter SSL error: #{msg}.#{hint}"
       end
     end
   end

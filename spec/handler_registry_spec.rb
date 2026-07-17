@@ -126,6 +126,54 @@ RSpec.describe KafkaBatch::HandlerRegistry do
         described_class.resolve!("worker_class" => "NoSuchWorker")
       }.to raise_error(described_class::UnknownHandler, /Unknown worker class/)
     end
+
+    it "registers a ruby manifest entry when the worker class is not loaded yet" do
+      described_class.reset!
+      KafkaBatch::HandlerManifest.reset!
+
+      KafkaBatch::HandlerManifest.load_from_hash(
+        "handlers" => {
+          "hello.ruby" => {
+            "runtime" => "ruby",
+            "worker_class" => "NotYetLoadedHelloWorker",
+            "topic" => "kafka_batch.jobs.ruby",
+            "apply_topic_prefix" => false
+          }
+        }
+      )
+
+      expect(described_class.registered?("hello.ruby")).to eq(true)
+      expect(KafkaBatch::HandlerManifest["hello.ruby"].worker_class).to be_nil
+      expect(KafkaBatch::HandlerManifest["hello.ruby"].kafka_topic).to eq("kafka_batch.jobs.ruby")
+      expect(KafkaBatch::HandlerManifest["hello.ruby"].worker_class_name).to eq("NotYetLoadedHelloWorker")
+    end
+
+    it "upgrades a deferred manifest registration when the Worker class loads" do
+      described_class.reset!
+      KafkaBatch::HandlerManifest.reset!
+
+      definition = KafkaBatch::HandlerDefinition.from_manifest_entry(
+        "custom.deferred",
+        "runtime" => "ruby",
+        "worker_class" => "DeferredManifestWorker",
+        "topic" => "kafka_batch.jobs.deferred"
+      )
+      expect(definition.worker_class).to be_nil
+      described_class.register_definition(definition)
+
+      klass = Class.new do
+        def self.name
+          "DeferredManifestWorker"
+        end
+
+        include KafkaBatch::Worker
+        job_type "custom.deferred"
+        kafka_topic "kafka_batch.jobs.deferred"
+      end
+
+      handler = described_class.resolve!("job_type" => "custom.deferred")
+      expect(handler.worker_class).to eq(klass)
+    end
   end
 end
 

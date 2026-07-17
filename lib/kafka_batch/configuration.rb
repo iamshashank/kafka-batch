@@ -111,6 +111,14 @@ module KafkaBatch
     # Leftovers stay in the Redis workset for control-plane reclaim.
     attr_accessor :super_fetch_drain_timeout   # Integer – seconds; default 30
 
+    # Tier-3 (JobConsumer) execution mode: :superfetch (default — Redis working-set
+    # ownership, offset marked ahead of #perform) or :watermark (Redis-free — commit
+    # the contiguous completed-offset prefix; uncommitted work re-runs on crash/
+    # rebalance). Watermark REQUIRES idempotent handlers + similar per-topic runtimes,
+    # and every consumer on a topic must use the same mode. See the README
+    # "Execution mode" section. Set via KAFKA_BATCH_EXECUTION_MODE.
+    attr_accessor :execution_mode              # Symbol – :superfetch (default) | :watermark
+
     # ── Job uniqueness (per-worker `uniq true`) ───────────────────────────────
     # Redis-backed dedup of worker_class + payload while a job is queued or in
     # progress. Keys use 8-byte binary XXHash64 digests (not hex) to save RAM.
@@ -561,6 +569,7 @@ module KafkaBatch
       @super_fetch_reclaim_interval   = env_positive_int("KAFKA_BATCH_SUPER_FETCH_RECLAIM_INTERVAL", 30)
       @super_fetch_reclaim_limit      = env_positive_int("KAFKA_BATCH_SUPER_FETCH_RECLAIM_LIMIT", 100)
       @super_fetch_drain_timeout      = env_positive_int("KAFKA_BATCH_SUPER_FETCH_DRAIN_TIMEOUT", 30)
+      @execution_mode                 = normalize_execution_mode(ENV["KAFKA_BATCH_EXECUTION_MODE"])
       @uniq_enabled             = true
       @uniq_lock_ttl            = 7 * 24 * 3600  # 7 days — covers max_schedule_horizon + retries
       @uniq_on_duplicate        = :skip
@@ -706,6 +715,10 @@ module KafkaBatch
       end
       raise ConfigurationError, "brokers must not be empty"       if Array(@brokers).empty?
 
+      unless %i[superfetch watermark].include?(@execution_mode)
+        raise ConfigurationError, "execution_mode must be :superfetch or :watermark"
+      end
+
       unless %i[redis off].include?(@liveness_backend)
         raise ConfigurationError, "liveness_backend must be :redis or :off"
       end
@@ -821,7 +834,22 @@ module KafkaBatch
       [sf + win + 12, 16].max
     end
 
+    # True when tier-3 job execution should use the Redis-free watermark executor.
+    def watermark_mode?
+      @execution_mode == :watermark
+    end
+
     private
+
+    # Accepts a String/Symbol/nil and returns :superfetch (default) or :watermark.
+    # An unrecognized non-empty value is preserved so validate! can reject it with
+    # a clear message rather than silently defaulting.
+    def normalize_execution_mode(value)
+      s = value.to_s.strip.downcase
+      return :superfetch if s.empty?
+
+      s.to_sym
+    end
 
     def truthy_env?(key)
       %w[1 true yes].include?(ENV[key].to_s.strip.downcase)

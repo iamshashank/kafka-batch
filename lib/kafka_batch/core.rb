@@ -21,6 +21,29 @@ module KafkaBatch
       yield configuration
     end
 
+    # ── Job execution mode ─────────────────────────────────────────────────
+
+    # Returns the tier-3 execution engine for the configured mode:
+    # SuperFetch (default, Redis working set) or Watermark (Redis-free,
+    # contiguous-prefix commit). Both expose #dispatch / #dispatch_one / #flush /
+    # #drain, so JobConsumer and PriorityJobConsumer stay mode-agnostic.
+    def job_executor
+      if config.watermark_mode?
+        KafkaBatch::Watermark.executor
+      else
+        KafkaBatch::SuperFetch.executor
+      end
+    end
+
+    # Drains whichever execution engine is active (graceful shutdown).
+    def job_executor_drain(timeout: nil)
+      if config.watermark_mode?
+        KafkaBatch::Watermark.drain(timeout: timeout)
+      else
+        KafkaBatch::SuperFetch.drain(timeout: timeout)
+      end
+    end
+
     # ── Store ──────────────────────────────────────────────────────────────
 
     # Returns the configured store singleton. Thread-safe via double-checked locking.
