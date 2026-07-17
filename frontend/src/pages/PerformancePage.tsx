@@ -153,11 +153,22 @@ function PerformanceBody({ data }: { data: PerfData }) {
       />
 
       <SectionCard title="System throughput" subheader={rangeCaption || undefined}>
-        <MultiLineChart series={throughputSeries} emptyMessage="No processed/failed/retried events recorded in this range yet." />
+        <MultiLineChart
+          series={throughputSeries}
+          timestamps={points.map((p) => p.t)}
+          bucketSeconds={data.bucket_seconds}
+          emptyMessage="No processed/failed/retried events recorded in this range yet."
+        />
       </SectionCard>
 
       <SectionCard title="Reclaim rate" subheader="Orphaned SuperFetch jobs re-produced by the reclaim scheduler.">
-        <MultiLineChart series={reclaimSeries} height={100} emptyMessage="No reclaim sweeps found any orphans in this range." />
+        <MultiLineChart
+          series={reclaimSeries}
+          timestamps={points.map((p) => p.t)}
+          bucketSeconds={data.bucket_seconds}
+          height={100}
+          emptyMessage="No reclaim sweeps found any orphans in this range."
+        />
       </SectionCard>
 
       <SectionCard title="Top job types" noPadding>
