@@ -7,3 +7,11 @@ handlers:
     runtime: go
     topic: kafka_batch.jobs.p0
     max_retries: 3
+  fast.p0.go:
+    runtime: go
+    topic: kafka_batch.jobs.go_fast_p0
+    max_retries: 3
+  fast.p1.go:
+    runtime: go
+    topic: kafka_batch.jobs.go_fast_p1
+    max_retries: 3

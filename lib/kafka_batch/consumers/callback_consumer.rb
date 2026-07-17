@@ -93,6 +93,10 @@ module KafkaBatch
           end
         end
 
+        # Event Lua preclaims claim stamps without callback_dispatched_by;
+        # record the runner so the UI "Callback ran on" field is populated.
+        KafkaBatch.store.record_callback_runner(batch_id, KafkaBatch.node_id)
+
         KafkaBatch.logger.info(
           "[KafkaBatch][CallbackConsumer] batch_id=#{batch_id} outcome=#{outcome} " \
           "jobs=#{data['total_jobs']} ok=#{data['completed_count']} failed=#{data['failed_count']}"

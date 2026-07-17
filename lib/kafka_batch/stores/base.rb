@@ -86,6 +86,16 @@ module KafkaBatch
         raise NotImplementedError, "#{self.class}#claim_callback"
       end
 
+      # Record which pod/process actually ran (or enqueued) the callback.
+      # Needed when the ledger Lua already preclaimed claim stamps
+      # (+preclaimed: true+) so +claim_callback+ is skipped and would otherwise
+      # leave +callback_dispatched_by+ blank on the UI.
+      # @param id [String] batch ID
+      # @param node_id [String, nil] pod/process identifier (e.g. KafkaBatch.node_id)
+      def record_callback_runner(id, node_id)
+        raise NotImplementedError, "#{self.class}#record_callback_runner"
+      end
+
       # Whether the batch's callback has already been dispatched.
       # Used as a cheap pre-invocation duplicate check by the CallbackConsumer.
       # @param id [String] batch ID

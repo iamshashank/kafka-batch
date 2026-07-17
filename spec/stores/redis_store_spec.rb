@@ -122,6 +122,24 @@ RSpec.describe KafkaBatch::Stores::RedisStore do
     end
   end
 
+  describe "#record_callback_runner" do
+      it "sets callback_dispatched_by after a Lua preclaim left it blank" do
+      id = SecureRandom.uuid
+      store.create_batch(id: id, total_jobs: 0)
+      # Simulate event Lua preclaim (stamps only, no runner).
+      store.send(:with_redis) { |r| r.hset("kafka_batch:b:#{id}", "callback_dispatched_at", Time.now.utc.iso8601) }
+      expect(store.find_batch(id)[:callback_dispatched_by]).to be_nil
+
+      store.record_callback_runner(id, "control-pod#42")
+      expect(store.find_batch(id)[:callback_dispatched_by]).to eq("control-pod#42")
+    end
+
+    it "is a no-op for an empty node id or missing batch" do
+      expect { store.record_callback_runner("missing", "pod") }.not_to raise_error
+      expect { store.record_callback_runner(SecureRandom.uuid, "") }.not_to raise_error
+    end
+  end
+
   describe "#pending_jobs_total" do
     it "sums pending jobs across running batches only" do
       a = new_batch(total: 10)

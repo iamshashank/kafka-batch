@@ -218,6 +218,15 @@ module KafkaBatch
         return won
       LUA
 
+      # EXISTS-guarded write of callback_dispatched_by (UI "Callback ran on").
+      # Used when Lua already preclaimed claim stamps so claim_callback is skipped.
+      RECORD_CALLBACK_RUNNER_LUA = <<~LUA.freeze
+        if redis.call('EXISTS', KEYS[1]) == 0 then return 0 end
+        if ARGV[1] == nil or ARGV[1] == '' then return 0 end
+        redis.call('HSET', KEYS[1], 'callback_dispatched_by', ARGV[1])
+        return 1
+      LUA
+
       # Atomically create a batch record only if it does not already exist.
       # Uses HSETNX on the 'id' field as an existence sentinel.
       # Returns 1 if created, 0 if already existed.
@@ -557,6 +566,15 @@ module KafkaBatch
           )
         end
         result == 1
+      end
+
+      def record_callback_runner(id, node_id)
+        nid = node_id.to_s
+        return if nid.empty?
+
+        with_redis do |r|
+          r.eval(RECORD_CALLBACK_RUNNER_LUA, keys: [batch_key(id)], argv: [nid])
+        end
       end
 
       def callback_dispatched?(id)

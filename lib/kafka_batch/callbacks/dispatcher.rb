@@ -57,6 +57,8 @@ module KafkaBatch
                 return :none
               end
             end
+            # Preclaimed path skips claim_callback, so write the runner explicitly.
+            KafkaBatch.store.record_callback_runner(batch[:id], KafkaBatch.node_id)
 
             job_actions.each do |action|
               produce_job_callback!(action[:raw], summary, kind: action[:kind])

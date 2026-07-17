@@ -60,6 +60,44 @@ module KafkaBatch
                    .uniq
       end
 
+      # Plain (non-fair) topics for runtime :ruby handlers — Karafka -jobs group only.
+      def ruby_plain_topics
+        definitions.values
+                   .select { |d| d.runtime == :ruby && !d.fairness? }
+                   .map(&:kafka_topic)
+                   .compact
+                   .uniq
+      end
+
+      # True when the topic has a Go execution handler and no Ruby handler/worker.
+      # Used so shared handler+priority YAML can drive /lag for Go groups without
+      # Ruby Karafka also subscribing to those topics.
+      def go_only_topic?(topic)
+        topic = topic.to_s
+        return false if topic.empty? || !loaded?
+
+        has_go = definitions.values.any? do |d|
+          d.runtime == :go && !d.fairness? && d.kafka_topic == topic
+        end
+        return false unless has_go
+
+        has_ruby_manifest = definitions.values.any? do |d|
+          d.runtime == :ruby && !d.fairness? && d.kafka_topic == topic
+        end
+        return false if has_ruby_manifest
+
+        return false unless KafkaBatch.respond_to?(:workers)
+
+        has_ruby_worker = KafkaBatch.workers.any? do |w|
+          next false if w.respond_to?(:fairness?) && w.fairness?
+
+          w.kafka_topic.to_s == topic
+        rescue StandardError
+          false
+        end
+        !has_ruby_worker
+      end
+
       # Priority YAML topics that have at least one runtime :go handler on that topic.
       def go_priority_topics_by_group(registry)
         return {} unless registry

@@ -217,12 +217,14 @@ module KafkaBatch
       groups["#{prefix}-control"] =
         [cfg.events_topic, cfg.callbacks_topic].compact + Array(cfg.retry_topics)
 
-      # Priority groups — Ruby Karafka execution.
+      # Priority groups — Ruby Karafka execution only (Go-only topics belong to
+      # merge_go_worker_groups! under -go-worker-{suffix}).
       registry = KafkaBatch::Priority::Registry.load(
         cfg.resolved_priority_config_paths, cfg: cfg
       )
       registry.configs.each do |prio|
-        groups[prio.consumer_group] = prio.topics
+        ruby_topics = prio.topics.reject { |t| HandlerManifest.go_only_topic?(t) }
+        groups[prio.consumer_group] = ruby_topics if ruby_topics.any?
       end
 
       # Fair lanes — each lane has its OWN dispatch / jobs-fair groups.

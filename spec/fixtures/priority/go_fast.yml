@@ -1,0 +1,5 @@
+consumer_group_suffix: jobs-go-fast
+mode: strict
+topics:
+  - kafka_batch.jobs.go_fast_p0
+  - kafka_batch.jobs.go_fast_p1

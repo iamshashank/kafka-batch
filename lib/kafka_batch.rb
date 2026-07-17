@@ -168,12 +168,14 @@ module KafkaBatch
       all_workers  = KafkaBatch.workers
       fair_workers = all_workers.select(&:fairness?)
       plain_topics = all_workers.reject(&:fairness?).map(&:kafka_topic).uniq
-      manifest_topics = HandlerManifest.loaded? ? HandlerManifest.topics : []
+      # Ruby Karafka must not subscribe to Go execution topics even when the
+      # shared handler/priority YAML lists them (needed for /lag Go groups).
+      manifest_plain = HandlerManifest.loaded? ? HandlerManifest.ruby_plain_topics : []
       active_fair_types = active_fairness_types
 
       reserved           = registry.reserved_topics
       other_plain_topics = plain_topics.reject { |t| reserved.include?(t) }
-      manifest_plain     = manifest_topics.reject { |t| reserved.include?(t) }
+      manifest_plain     = manifest_plain.reject { |t| reserved.include?(t) }
       all_plain_topics   = (other_plain_topics + manifest_plain).uniq
       registry.validate_plain_topics!(other_plain_topics) unless registry.empty?
 
@@ -202,8 +204,12 @@ module KafkaBatch
         end
 
         registry.configs.each do |prio_cfg|
+          ruby_topics = prio_cfg.topics.reject { |t| HandlerManifest.go_only_topic?(t) }
+          next if ruby_topics.empty?
+
           consumer_group prio_cfg.consumer_group do
-            prio_cfg.topics.each_with_index do |topic_name, rank|
+            ruby_topics.each do |topic_name|
+              rank = prio_cfg.topics.index(topic_name)
               consumer_klass = KafkaBatch::Consumers::PriorityJobConsumer.build(
                 rank:                rank,
                 mode:                prio_cfg.mode,

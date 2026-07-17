@@ -55,8 +55,12 @@ module KafkaBatch
         ledger.record_completion_by_offset(**kwargs)
       end
 
-      def claim_callback(id, dispatched_by = nil)
-        ledger.claim_callback(id, dispatched_by)
+      def claim_callback(id, dispatched_by = nil, kind = nil)
+        ledger.claim_callback(id, dispatched_by, kind)
+      end
+
+      def record_callback_runner(id, node_id)
+        ledger.record_callback_runner(id, node_id)
       end
 
       def callback_dispatched?(id)

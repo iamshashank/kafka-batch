@@ -1,18 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
 import Alert from '@mui/material/Alert'
 import Box from '@mui/material/Box'
 import Button from '@mui/material/Button'
 import Chip from '@mui/material/Chip'
-import Stack from '@mui/material/Stack'
 import Table from '@mui/material/Table'
 import TableBody from '@mui/material/TableBody'
 import TableCell from '@mui/material/TableCell'
 import TableContainer from '@mui/material/TableContainer'
 import TableHead from '@mui/material/TableHead'
 import TableRow from '@mui/material/TableRow'
-import TextField from '@mui/material/TextField'
-import Typography from '@mui/material/Typography'
 import Tooltip from '@mui/material/Tooltip'
 import { apiGet, apiMutate } from '../api/client'
 import { EmptyState } from '../components/EmptyState'
@@ -36,22 +32,18 @@ function statusChip(status: string) {
 }
 
 export function LagPage() {
-  const [params, setParams] = useSearchParams()
-  const tenantId = params.get('tenant_id') || ''
-  const [tenantInput, setTenantInput] = useState(tenantId)
   const [data, setData] = useState<any>(null)
   const [error, setError] = useState<string | null>(null)
   const [toast, setToast] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     try {
-      const qs = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : ''
-      setData(await apiGet(`/api/lag${qs}`))
+      setData(await apiGet('/api/lag'))
       setError(null)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load')
     }
-  }, [tenantId])
+  }, [])
 
   useEffect(() => {
     void load()
@@ -84,23 +76,6 @@ export function LagPage() {
           {toast}
         </Alert>
       ) : null}
-
-      <SectionCard title="Ingest partition lookup" subheader="Resolve which ingest partition a tenant_id hashes to.">
-        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} alignItems={{ sm: 'center' }}>
-          <TextField label="Tenant ID" value={tenantInput} onChange={(e) => setTenantInput(e.target.value)} sx={{ minWidth: 240 }} />
-          <Button variant="contained" onClick={() => setParams(tenantInput ? { tenant_id: tenantInput } : {})}>
-            Lookup
-          </Button>
-        </Stack>
-        {data?.tenant_lookup?.partition != null ? (
-          <Typography variant="body2" sx={{ mt: 2 }}>
-            Tenant <code>{data.tenant_lookup.tenant_id}</code> → partition <strong>{data.tenant_lookup.partition}</strong> of{' '}
-            {data.tenant_lookup.partition_count} on <code>{data.tenant_lookup.topic}</code>
-            {data.tenant_lookup.source ? ` (${data.tenant_lookup.source})` : ''}
-            {data.tenant_lookup.lag != null ? ` — lag ${data.tenant_lookup.lag}` : ''}
-          </Typography>
-        ) : null}
-      </SectionCard>
 
       {!data.available ? (
         <EmptyState message={data.message} />
@@ -148,7 +123,6 @@ export function LagPage() {
                                   scope: 'topic',
                                   group: t.group,
                                   topic: t.topic,
-                                  tenant_id: tenantId || undefined,
                                 })
                               }
                             >
@@ -201,7 +175,6 @@ export function LagPage() {
                                 group: r.group,
                                 topic: r.topic,
                                 partition: r.partition,
-                                tenant_id: tenantId || undefined,
                               })
                             }
                           >
