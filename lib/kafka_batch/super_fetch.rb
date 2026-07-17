@@ -29,10 +29,21 @@ module KafkaBatch
 
       def dispatch(consumer, messages)
         messages.each { |message| dispatch_one(consumer, message) }
+        # Claims used to SET live:consumer to "1", wiping rss/cpu written by
+        # ConsumptionGate#heartbeat. Re-publish JSON stats after the batch
+        # (Go TouchConsumer parity) so /live always shows Ruby process metrics.
+        begin
+          Liveness.heartbeat(topic: messages.first&.topic)
+        rescue StandardError => e
+          KafkaBatch.logger.debug("[KafkaBatch][SuperFetch] post-dispatch heartbeat: #{e.message}")
+        end
       end
 
       # Claim → mark → pool. Blocks on claim_window when full (not perform pool).
       def dispatch_one(consumer, message)
+        # Graceful shutdown: refuse new claims immediately (leave Kafka unacked).
+        return unless accepting?
+
         acquire_claim_window!
         job_id = extract_job_id(message)
 
@@ -95,6 +106,8 @@ module KafkaBatch
         end
       end
 
+      # Stop accepting new claims and wait for in-flight #perform.
+      # @return [Integer] remaining in-flight count (0 = drained cleanly)
       def drain(timeout: 30)
         deadline = monotonic_now + timeout.to_f
         @mutex.synchronize { @accepting = false }
@@ -111,6 +124,12 @@ module KafkaBatch
             "[KafkaBatch][SuperFetch] drain timed out with #{remaining} in-flight job(s)"
           )
         end
+        KafkaBatch::Instrumentation.super_fetch_drained(remaining: remaining, timeout: timeout)
+        remaining
+      end
+
+      def accepting?
+        @mutex.synchronize { @accepting }
       end
 
       def reset!
@@ -313,7 +332,8 @@ module KafkaBatch
         end
       end
 
-      def drain(timeout: 30)
+      def drain(timeout: nil)
+        timeout = KafkaBatch.config.super_fetch_drain_timeout if timeout.nil?
         executor.drain(timeout: timeout)
       end
     end

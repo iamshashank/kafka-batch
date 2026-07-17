@@ -351,6 +351,7 @@ module KafkaBatch
       SchedulePoller.stop! if defined?(SchedulePoller)
       AuditLog.reset! if defined?(AuditLog)
       Metrics.reset!  if defined?(Metrics)
+      PerformanceMetrics.reset! if defined?(PerformanceMetrics)
       HandlerRegistry.reset! if defined?(HandlerRegistry)
       HandlerManifest.reset! if defined?(HandlerManifest)
     end

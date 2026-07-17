@@ -293,6 +293,10 @@ module KafkaBatch
       Fairness::TenantPartitions.reset! if defined?(Fairness::TenantPartitions)
       AuditLog.reset! if defined?(AuditLog)
       Metrics.reset!  if defined?(Metrics)
+      PerformanceMetrics.reset! if defined?(PerformanceMetrics)
+      Ai::KnowledgeIndex.reset_pool! if defined?(Ai::KnowledgeIndex)
+      Ai::Settings.reset_pool! if defined?(Ai::Settings)
+      Ai::ChatHistory.reset_pool! if defined?(Ai::ChatHistory)
     end
 
     private

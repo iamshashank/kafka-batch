@@ -93,6 +93,15 @@ RSpec.describe "JobConsumer SuperFetch" do
     expect(KafkaBatchSpec::WorkerRuns.runs.map { |r| r[:name] }).to eq([:success])
   end
 
+  it "emits super_fetch.drained with the remaining in-flight count" do
+    msg = job_message(worker: SuccessfulWorker, batch_id: "b1", job_id: "sf-drain-1")
+    allow(consumer).to receive(:messages).and_return([msg])
+    consumer.send(:process_messages)
+
+    expect(KafkaBatch::Instrumentation).to receive(:super_fetch_drained).with(remaining: 0, timeout: 10)
+    KafkaBatch::SuperFetch.drain(timeout: 10)
+  end
+
   it "Completes the workset after a successful SuperFetch perform" do
     msg = job_message(worker: SuccessfulWorker, batch_id: "b1", job_id: "sf-done-1")
     allow(consumer).to receive(:messages).and_return([msg])

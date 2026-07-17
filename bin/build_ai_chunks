@@ -1,0 +1,26 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Rebuild lib/kafka_batch/ai/knowledge_chunks.json from ai/README.md + ai/FAQ.md.
+# Run from the gem repo root:  bin/build_ai_chunks
+
+require "bundler/setup"
+require_relative "../lib/kafka_batch/ai/chunker"
+
+gem_root = File.expand_path("..", __dir__)
+readme   = File.join(gem_root, "ai/README.md")
+faq      = File.join(gem_root, "ai/FAQ.md")
+out      = File.join(gem_root, "lib/kafka_batch/ai/knowledge_chunks.json")
+
+abort "missing #{readme}" unless File.file?(readme)
+abort "missing #{faq}" unless File.file?(faq)
+
+payload = KafkaBatch::Ai::Chunker.write!(
+  output_path: out,
+  readme_path: readme,
+  faq_path: faq
+)
+
+puts "wrote #{out}"
+puts "  chunks=#{payload['chunk_count']} corpus=#{payload['corpus_version']}"
+puts "  readme_sha=#{payload['readme_sha256'][0, 12]}… faq_sha=#{payload['faq_sha256'][0, 12]}…"

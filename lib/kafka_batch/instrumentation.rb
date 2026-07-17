@@ -37,6 +37,8 @@ module KafkaBatch
   #   dlt.published.kafka_batch             – message forwarded to dead-letter topic
   #   consumer.priority_yielded.kafka_batch   – priority consumer paused for higher lag
   #   reconciler.ran.kafka_batch              – reconciler sweep completed
+  #   workset.reclaimed.kafka_batch           – SuperFetch orphan-reclaim sweep completed
+  #   super_fetch.drained.kafka_batch         – SuperFetch graceful shutdown drain completed
   #
   module Instrumentation
     NAMESPACE = "kafka_batch"
@@ -271,6 +273,32 @@ module KafkaBatch
           lost_count:   lost_count,
           duration:     duration,
           triggered_by: triggered_by
+        })
+      end
+
+      # ── SuperFetch / Workset events ─────────────────────────────────────
+
+      # Fired once per SuperFetch orphan-reclaim sweep (control-plane
+      # ReclaimScheduler), whether or not it found any orphans — mirrors
+      # reconciler_ran so sweep frequency/duration is visible even at zero
+      # counts. checked/reclaimed/failed/skipped mirror Workset::ReclaimResult.
+      def workset_reclaimed(checked:, reclaimed:, failed:, skipped:, duration: nil)
+        instrument("workset.reclaimed", {
+          checked:   checked,
+          reclaimed: reclaimed,
+          failed:    failed,
+          skipped:   skipped,
+          duration:  duration
+        })
+      end
+
+      # Fired once per graceful shutdown drain (SuperFetch.drain), whether it
+      # finished cleanly (remaining: 0) or timed out with in-flight #perform
+      # left in the Redis workset for control-plane reclaim.
+      def super_fetch_drained(remaining:, timeout: nil)
+        instrument("super_fetch.drained", {
+          remaining: remaining,
+          timeout:   timeout
         })
       end
 

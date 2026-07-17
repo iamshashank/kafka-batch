@@ -203,5 +203,46 @@ RSpec.describe KafkaBatch::Configuration do
       config.liveness_backend = :store   # :store was removed — Redis is mandatory
       expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /liveness_backend/)
     end
+
+    context "performance_metrics (disabled by default)" do
+      it "does not validate performance_metrics_* when disabled" do
+        config.store   = :mysql
+        config.brokers = ["localhost:9092"]
+        config.performance_metrics_enabled  = false
+        config.performance_metrics_retention = -1
+        expect { config.validate! }.not_to raise_error
+      end
+
+      it "rejects a non-positive retention when enabled" do
+        config.store   = :mysql
+        config.brokers = ["localhost:9092"]
+        config.performance_metrics_enabled   = true
+        config.performance_metrics_retention = 0
+        expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /retention/)
+      end
+
+      it "rejects a non-positive max_job_types when enabled" do
+        config.store   = :mysql
+        config.brokers = ["localhost:9092"]
+        config.performance_metrics_enabled       = true
+        config.performance_metrics_max_job_types = 0
+        expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /max_job_types/)
+      end
+
+      it "rejects a sample_rate outside (0, 1.0]" do
+        config.store   = :mysql
+        config.brokers = ["localhost:9092"]
+        config.performance_metrics_enabled     = true
+        config.performance_metrics_sample_rate = 1.5
+        expect { config.validate! }.to raise_error(KafkaBatch::ConfigurationError, /sample_rate/)
+      end
+
+      it "accepts sane performance_metrics defaults when enabled" do
+        config.store   = :mysql
+        config.brokers = ["localhost:9092"]
+        config.performance_metrics_enabled = true
+        expect { config.validate! }.not_to raise_error
+      end
+    end
   end
 end

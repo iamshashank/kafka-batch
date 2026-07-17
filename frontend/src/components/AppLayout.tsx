@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { Link as RouterLink, Outlet, useLocation } from 'react-router-dom'
 import AppBar from '@mui/material/AppBar'
 import Box from '@mui/material/Box'
@@ -27,10 +27,12 @@ import SpeedOutlinedIcon from '@mui/icons-material/SpeedOutlined'
 import ScheduleOutlinedIcon from '@mui/icons-material/ScheduleOutlined'
 import SyncOutlinedIcon from '@mui/icons-material/SyncOutlined'
 import HistoryOutlinedIcon from '@mui/icons-material/HistoryOutlined'
+import InsightsOutlinedIcon from '@mui/icons-material/InsightsOutlined'
 import TimerOutlinedIcon from '@mui/icons-material/TimerOutlined'
 import BoltOutlinedIcon from '@mui/icons-material/BoltOutlined'
 import TuneOutlinedIcon from '@mui/icons-material/TuneOutlined'
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
+import SmartToyOutlinedIcon from '@mui/icons-material/SmartToyOutlined'
 import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord'
 import DarkModeOutlinedIcon from '@mui/icons-material/DarkModeOutlined'
 import LightModeOutlinedIcon from '@mui/icons-material/LightModeOutlined'
@@ -38,12 +40,20 @@ import Tooltip from '@mui/material/Tooltip'
 import type { PaletteMode } from '@mui/material/styles'
 import type { Bootstrap } from '../api/client'
 import { BrandMark } from './BrandMark'
+import { ChatBubble } from './ChatBubble'
 
 const DRAWER_WIDTH = 256
 const DRAWER_WIDTH_COLLAPSED = 72
 const NAV_COLLAPSED_KEY = 'kafka_batch_nav_collapsed'
 
-type NavItem = { to: string; label: string; icon: React.ReactNode; auditOnly?: boolean }
+type NavItem = {
+  to: string
+  label: string
+  icon: ReactNode
+  auditOnly?: boolean
+  performanceOnly?: boolean
+  aiOnly?: boolean
+}
 
 function readCollapsed(): boolean {
   try {
@@ -97,6 +107,7 @@ export function AppLayout({
           { to: '/live', label: 'Consumers', icon: <SensorsOutlinedIcon fontSize="small" /> },
           { to: '/lag', label: 'Kafka lag', icon: <SpeedOutlinedIcon fontSize="small" /> },
           { to: '/scheduled', label: 'Scheduled', icon: <ScheduleOutlinedIcon fontSize="small" /> },
+          { to: '/performance', label: 'Performance', icon: <InsightsOutlinedIcon fontSize="small" />, performanceOnly: true },
         ] as NavItem[],
       },
       {
@@ -113,6 +124,7 @@ export function AppLayout({
         items: [
           { to: '/reconciler', label: 'Reconciler', icon: <SyncOutlinedIcon fontSize="small" /> },
           { to: '/audit', label: 'Audit log', icon: <HistoryOutlinedIcon fontSize="small" />, auditOnly: true },
+          { to: '/ai', label: 'AI Settings', icon: <SmartToyOutlinedIcon fontSize="small" />, aiOnly: true },
           { to: '/system', label: 'System', icon: <SettingsOutlinedIcon fontSize="small" /> },
         ] as NavItem[],
       },
@@ -149,7 +161,12 @@ export function AppLayout({
       <Divider />
       <Box sx={{ flex: 1, overflow: 'auto', py: 1 }}>
         {groups.map((group) => {
-          const items = group.items.filter((n) => !n.auditOnly || bootstrap?.audit_enabled)
+          const items = group.items.filter(
+            (n) =>
+              (!n.auditOnly || bootstrap?.audit_enabled) &&
+              (!n.performanceOnly || bootstrap?.performance_metrics_enabled) &&
+              (!n.aiOnly || bootstrap?.ai_enabled),
+          )
           if (!items.length) return null
           return (
             <List
@@ -321,6 +338,7 @@ export function AppLayout({
       >
         <Outlet />
       </Box>
+      <ChatBubble enabled={!!bootstrap?.ai_enabled} />
     </Box>
   )
 }

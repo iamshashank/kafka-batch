@@ -73,6 +73,22 @@ RSpec.describe KafkaBatch::Liveness do
       expect(c["rss_bytes"]).to eq(128_000_000)
       expect(c["cpu_pct"]).to eq(12.5)
     end
+
+    it "coerces SuperFetch claim markers into stub consumer hashes" do
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      redis.set("kafka_batch:live:consumer:sf-host:99:abc", "1", ex: 30)
+      consumers = described_class.consumers
+      stub = consumers.find { |c| c["consumer_id"] == "sf-host:99:abc" }
+      expect(stub).to eq("consumer_id" => "sf-host:99:abc")
+    end
+
+    it "includes runtime ruby and rss on heartbeat_payload" do
+      allow(KafkaBatch::ProcessStats).to receive(:sample).and_return("rss_bytes" => 99_000_000, "cpu_pct" => 3.0)
+      payload = described_class.heartbeat_payload(topic: "jobs")
+      expect(payload["runtime"]).to eq("ruby")
+      expect(payload["rss_bytes"]).to eq(99_000_000)
+      expect(payload["cpu_pct"]).to eq(3.0)
+    end
   end
 
   describe "when the backend is :off" do

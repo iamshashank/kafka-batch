@@ -94,22 +94,35 @@ module KafkaBatch
         lim = 100 if lim < 1
         g   = grace.nil? ? KafkaBatch.config.super_fetch_orphan_grace : grace
 
+        started = monotonic_now
         res = (@store || Workset.store).reclaim_orphans(
           producer: method(:produce),
           limit:    lim,
           lock_ttl: Workset::DEFAULT_RECLAIM_LOCK,
           grace:    g
         )
+        duration = monotonic_now - started
         if res.reclaimed.positive? || res.failed.positive?
           KafkaBatch.logger.info(
             "[KafkaBatch][Workset] reclaim sweep checked=#{res.checked} " \
             "reclaimed=#{res.reclaimed} failed=#{res.failed} skipped=#{res.skipped}"
           )
         end
+        KafkaBatch::Instrumentation.workset_reclaimed(
+          checked:   res.checked,
+          reclaimed: res.reclaimed,
+          failed:    res.failed,
+          skipped:   res.skipped,
+          duration:  duration
+        )
         res
       end
 
       private
+
+      def monotonic_now
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
 
       def produce(topic, key, body)
         KafkaBatch::Producer.produce_sync(topic: topic, payload: body, key: key)

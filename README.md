@@ -32,6 +32,7 @@ Built on [Karafka](https://karafka.io) (WaterDrop + consumers). **Go runtime:** 
 - [Reference](#reference)
 - [TCO vs Sidekiq at scale](#tco-vs-sidekiq-at-scale)
 - [Contributing](#contributing)
+  - [AI knowledge base chunks](#ai-knowledge-base-chunks)
 
 ---
 
@@ -1421,10 +1422,30 @@ For Go metrics, see [kafka-batch-go](https://github.com/y-shashank/kafka-batch-g
 
 Example series: `kafka_batch.job_processed.count`, `kafka_batch.job_processed.duration`, `kafka_batch.job_failed.count`, `kafka_batch.batch_completed.count` (`outcome:` tag), `kafka_batch.dlt_published.count` (`dlt_type:` tag).
 
+### Performance dashboard (opt-in, Redis-backed)
+
+For teams without a Grafana/Datadog pipeline, kafka-batch can keep its own short-lived throughput history in Redis and render it on a **Performance** page inside the Web UI — no metrics gem or external dashboard required.
+
+```ruby
+KafkaBatch.configure do |config|
+  config.performance_metrics_enabled          = true
+  config.performance_metrics_retention        = 86_400  # seconds; default 24h (bounds the longest UI range)
+  config.performance_metrics_max_job_types    = 50       # cap distinct job_type fields per bucket; overflow -> "_other"
+  config.performance_metrics_bucket_seconds   = 60       # advanced; default 1 min
+  config.performance_metrics_sample_rate      = 1.0       # (0, 1.0]; lower to cut Redis write volume at very high throughput
+end
+```
+
+Env equivalents: `KAFKA_BATCH_PERFORMANCE_METRICS_ENABLED`, `_RETENTION`, `_MAX_JOB_TYPES`, `_BUCKET_SECONDS`, `_SAMPLE_RATE`.
+
+Disabled by default — zero Redis cost until enabled. When on, it subscribes to the same `job.processed` / `job.retried` / `job.failed` / `workset.reclaimed` events as the metrics bridge above and writes best-effort `HINCRBY` counters into one Redis hash per (minute, status), keyed by `job_type` (never raises into the hot path — same circuit-breaker as `KafkaBatch::Liveness`). The Web UI's **Performance** nav item (gated by `performance_metrics_enabled`, mirroring `/audit`) reads `GET /api/performance?range=5m|1h|3h|24h` for system throughput, per-job-type top-N, and reclaim-rate panels; wide ranges are downsampled server-side before hitting the browser. `kafka-batch-go` writes into the exact same Redis key layout (`config.PerformanceMetricsEnabled` / `KAFKA_BATCH_PERFORMANCE_METRICS_*`), so a mixed Ruby+Go deployment shares one dashboard.
+
+**Wiring:** in Rails the railtie calls `KafkaBatch::PerformanceMetrics.install!` on boot when `performance_metrics_enabled` is true. In a non-Rails process, call `KafkaBatch::PerformanceMetrics.install!` yourself after `configure` — in every tier-3 Ruby execution process (`karafka server` job consumers).
+
 ### Where to visualize
 
-- **Live operational state** — mount `KafkaBatch::Web` (batches, `/failures`, `/dead_letter`, `/live`, `/lag`, `/fairness`, `/audit`). This is current state, not time-series.
-- **The metrics above** render wherever your client's pipeline terminates — **Grafana** (Prometheus via `statsd_exporter`, or Graphite) or **Datadog** (via the Agent). The gem ships no dashboard; build panels on the `kafka_batch.*` series, paired with Kafka consumer-lag from your broker's exporter.
+- **Live operational state** — mount `KafkaBatch::Web` (batches, `/failures`, `/dead_letter`, `/live`, `/lag`, `/fairness`, `/audit`, `/performance`). This is current state (plus, on `/performance`, a short Redis-backed history) — not a general-purpose time-series store.
+- **The metrics above** render wherever your client's pipeline terminates — **Grafana** (Prometheus via `statsd_exporter`, or Graphite) or **Datadog** (via the Agent). Build panels on the `kafka_batch.*` series, paired with Kafka consumer-lag from your broker's exporter, for anything beyond what `/performance` covers (long retention, alerting, cross-service correlation).
 
 ### DIY (no bridge)
 
@@ -1579,3 +1600,18 @@ At 200M pending with Enterprise-equivalent features and ~1,500 Sidekiq threads, 
 ## Contributing
 
 Issues and PRs welcome at [github.com/y-shashank/kafka-batch](https://github.com/y-shashank/kafka-batch).
+
+### AI knowledge base chunks
+
+The Web UI assistant corpus is edited as markdown under `ai/` (`README.md`, `FAQ.md`). Pods do **not** parse those files at boot — they load the packaged artifact `lib/kafka_batch/ai/knowledge_chunks.json`.
+
+After changing the docs (and before releasing the gem), rebuild chunks from the **gem repo root**:
+
+```bash
+bin/build_ai_chunks
+# equivalent: bundle exec rake kafka_batch:build_ai_chunks
+```
+
+Commit both the markdown and `knowledge_chunks.json` (the script refreshes `corpus_version` from content hashes). On deploy, Redis is rewritten only when that version changes; the live config snapshot refreshes separately (at most every 24h on boot).
+
+Full checklist: [`lib/kafka_batch/ai/README.md`](lib/kafka_batch/ai/README.md).

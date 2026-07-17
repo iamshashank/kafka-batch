@@ -54,6 +54,35 @@ RSpec.describe KafkaBatch::Workset::Store do
     expect(n.to_i).to be >= 1
   end
 
+  it "writes JSON (not the bare 1 marker) from touch_consumer" do
+    store.touch_consumer("c-touch", ttl: 30)
+    raw = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+               .get("#{KafkaBatch::Workset::LIVE_CONSUMER_PREFIX}c-touch")
+    expect(raw).not_to eq("1")
+    body = Oj.load(raw)
+    expect(body).to be_a(Hash)
+    expect(body["consumer_id"]).to eq("c-touch")
+    expect(body["runtime"]).to eq("ruby")
+  end
+
+  it "deletes live:consumer via delete_consumer" do
+    store.touch_consumer("c-del", ttl: 30)
+    store.delete_consumer("c-del")
+    n = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+             .exists("#{KafkaBatch::Workset::LIVE_CONSUMER_PREFIX}c-del")
+    expect(n.to_i).to eq(0)
+  end
+
+  it "does not stomp existing heartbeat JSON on claim" do
+    redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+    key = "#{KafkaBatch::Workset::LIVE_CONSUMER_PREFIX}c-keep"
+    want = { "consumer_id" => "c-keep", "rss_bytes" => 12_345, "cpu_pct" => 1.5 }
+    redis.set(key, Oj.dump(want, mode: :compat))
+    claim!(job_id: "j-keep", consumer_id: "c-keep")
+    got = Oj.load(redis.get(key))
+    expect(got).to eq(want)
+  end
+
   it "loses claim when another consumer is still live" do
     claim!(job_id: "j2", consumer_id: "alive")
     res = claim!(job_id: "j2", consumer_id: "other")

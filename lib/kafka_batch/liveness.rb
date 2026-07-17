@@ -71,6 +71,20 @@ module KafkaBatch
         redis_heartbeat(topic: last_topic)
       end
 
+      # JSON hash written to live:consumer:* (used by Workset#touch_consumer too).
+      def heartbeat_payload(topic: nil, consumer_id: self.consumer_id)
+        payload = {
+          "consumer_id" => consumer_id.to_s,
+          "hostname"    => Socket.gethostname,
+          "pid"         => Process.pid,
+          "topic"       => topic,
+          "last_seen"   => Time.now.utc.iso8601,
+          "runtime"     => "ruby"
+        }
+        payload.merge!(current_stats) if consumer_id.to_s == self.consumer_id
+        payload
+      end
+
       # Start the fixed-interval Redis heartbeat thread (idempotent).
       def start_heartbeat_loop!
         return unless backend == :redis
@@ -164,16 +178,7 @@ module KafkaBatch
       end
 
       def redis_heartbeat(topic:)
-        payload = {
-          "consumer_id" => consumer_id,
-          "hostname"    => Socket.gethostname,
-          "pid"         => Process.pid,
-          "topic"       => topic,
-          "last_seen"   => Time.now.utc.iso8601
-        }
-        payload.merge!(current_stats)
-
-        redis_with { |r| r.set("#{CONSUMER_PREFIX}#{consumer_id}", dump(payload), ex: ttl) }
+        redis_with { |r| r.set("#{CONSUMER_PREFIX}#{consumer_id}", dump(heartbeat_payload(topic: topic)), ex: ttl) }
       end
 
       # Throttled process stats (RSS + CPU) for the /live page.
@@ -183,9 +188,12 @@ module KafkaBatch
 
         now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         stats_mutex.synchronize do
-          if @stats_cache.nil? || (now - @stats_sampled_at.to_f) >= interval
-            @stats_cache       = ProcessStats.sample
-            @stats_sampled_at  = now
+          stale = @stats_cache.nil? || (now - @stats_sampled_at.to_f) >= interval
+          # Re-sample early when RSS never landed (transient `ps` failure).
+          missing_rss = @stats_cache.is_a?(Hash) && !@stats_cache.key?("rss_bytes")
+          if stale || missing_rss
+            @stats_cache = ProcessStats.sample
+            @stats_sampled_at = now if stale || @stats_sampled_at.nil?
           end
           @stats_cache || {}
         end
@@ -204,12 +212,31 @@ module KafkaBatch
           loop do
             cursor, keys = r.scan(cursor, match: "#{prefix}*", count: 100)
             unless keys.empty?
-              r.mget(*keys).each { |v| (h = load(v)) && result << h }
+              values = r.mget(*keys)
+              keys.zip(values).each do |key, v|
+                next if v.nil?
+
+                h = coerce_live_payload(v, key, prefix)
+                result << h if h
+              end
             end
             break if cursor == "0" || result.size >= limit
           end
         end
         result.first(limit)
+      end
+
+      # SuperFetch claim Lua may seed live:consumer:* with a non-JSON marker
+      # ("1") for EXISTS checks. Coerce those into a stub hash so /live never
+      # crashes; real heartbeats overwrite with full JSON (rss/cpu/topic).
+      def coerce_live_payload(raw, key, prefix)
+        h = load(raw)
+        return h if h.is_a?(Hash)
+
+        id = key.to_s.delete_prefix(prefix)
+        return nil if id.empty?
+
+        { "consumer_id" => id }
       end
 
       def redis_with

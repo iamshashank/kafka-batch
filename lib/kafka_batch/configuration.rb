@@ -107,6 +107,9 @@ module KafkaBatch
     attr_accessor :super_fetch_reclaim_enabled # Boolean – default true
     attr_accessor :super_fetch_reclaim_interval # Integer – seconds; default 30
     attr_accessor :super_fetch_reclaim_limit   # Integer – per sweep; default 100
+    # Seconds to wait for in-flight SuperFetch #perform on SIGTERM (default 30).
+    # Leftovers stay in the Redis workset for control-plane reclaim.
+    attr_accessor :super_fetch_drain_timeout   # Integer – seconds; default 30
 
     # ── Job uniqueness (per-worker `uniq true`) ───────────────────────────────
     # Redis-backed dedup of worker_class + payload while a job is queued or in
@@ -458,6 +461,29 @@ module KafkaBatch
     attr_accessor :metrics_proc      # alias hook for :proc adapter
     attr_accessor :metrics_prefix    # metric name prefix; default "kafka_batch"
 
+    # ── Performance dashboard metrics (optional; Redis-backed) ───────────────
+    # Opt-in throughput/error-rate history for the Web UI's Performance page.
+    # Subscribes to the existing job.processed / job.retried / job.failed /
+    # workset.reclaimed instrumentation events and writes best-effort HINCRBY
+    # counters into per-minute Redis hashes (never raises into the hot path —
+    # same circuit-breaker pattern as Liveness). See KafkaBatch::PerformanceMetrics.
+    attr_accessor :performance_metrics_enabled        # Boolean – default false
+    # How long (seconds) each per-minute bucket lives before Redis expires it.
+    # Also bounds the longest UI range (24h → 86400). Env: KAFKA_BATCH_PERFORMANCE_METRICS_RETENTION.
+    attr_accessor :performance_metrics_retention
+    # Cap on distinct job_type fields tracked per bucket; overflow is folded
+    # into the "_other" field so a runaway number of job types can't bloat a
+    # single Redis hash. Env: KAFKA_BATCH_PERFORMANCE_METRICS_MAX_JOB_TYPES.
+    attr_accessor :performance_metrics_max_job_types
+    # Bucket width in seconds (advanced — changing this after buckets already
+    # exist mixes granularities until the old ones expire). Default 60 (1 min).
+    # Env: KAFKA_BATCH_PERFORMANCE_METRICS_BUCKET_SECONDS.
+    attr_accessor :performance_metrics_bucket_seconds
+    # Fraction (0 < x <= 1.0) of events actually written to Redis, for very
+    # high-throughput deployments that want to cut write volume. Default 1.0
+    # (every event recorded). Env: KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE.
+    attr_accessor :performance_metrics_sample_rate
+
     # ── Handler manifest (Go + Ruby routing) ─────────────────────────────────
     # Optional YAML listing handlers (runtime/topic/retries). Loaded at boot
     # when set. Also via ENV KAFKA_BATCH_HANDLER_MANIFEST.
@@ -491,6 +517,26 @@ module KafkaBatch
     #   }
     attr_accessor :web_authenticator
 
+    # ── AI knowledge index (RAG corpus in Redis) ─────────────────────────────
+    # Prebuilt chunks from ai/README.md + ai/FAQ.md are loaded into Redis at
+    # boot (see KafkaBatch::Ai::KnowledgeIndex). Many UI pods may call sync!;
+    # only one writer wins a short NX lock.
+    #   - Knowledge chunks: rewritten only when packaged corpus_version changes
+    #   - Config snapshot: refreshed at most every 24h on boot (config knobs change
+    #     without a docs release). See lib/kafka_batch/ai/README.md.
+    # Assistant must never touch operational ledger/fairness/workset keys — only
+    # kafka_batch:ai:knowledge:* / ai:settings / ai:chat:*.
+    attr_accessor :ai_knowledge_enabled          # Boolean – default true
+    # Salt for AES-GCM encryption of OpenRouter API keys in Redis (AI Settings).
+    # Required to save secrets. Prefer ENV KAFKA_BATCH_AI_ENCRYPTION_SALT.
+    attr_accessor :ai_encryption_salt
+    # Global shared chat history cap (Redis LIST entries). Default 500.
+    attr_accessor :ai_chat_history_max_lines
+    # How many knowledge chunks to inject into the OpenRouter prompt. Default 6.
+    attr_accessor :ai_chat_context_chunks
+    # Default OpenRouter model id when UI has not overridden it.
+    attr_accessor :ai_openrouter_default_model
+
     # ── Logging ──────────────────────────────────────────────────────────────
     attr_accessor :logger
 
@@ -514,6 +560,7 @@ module KafkaBatch
       @super_fetch_reclaim_enabled    = !truthy_env?("KAFKA_BATCH_SUPER_FETCH_RECLAIM_DISABLED")
       @super_fetch_reclaim_interval   = env_positive_int("KAFKA_BATCH_SUPER_FETCH_RECLAIM_INTERVAL", 30)
       @super_fetch_reclaim_limit      = env_positive_int("KAFKA_BATCH_SUPER_FETCH_RECLAIM_LIMIT", 100)
+      @super_fetch_drain_timeout      = env_positive_int("KAFKA_BATCH_SUPER_FETCH_DRAIN_TIMEOUT", 30)
       @uniq_enabled             = true
       @uniq_lock_ttl            = 7 * 24 * 3600  # 7 days — covers max_schedule_horizon + retries
       @uniq_on_duplicate        = :skip
@@ -593,6 +640,11 @@ module KafkaBatch
       @metrics_client                       = nil
       @metrics_proc                         = nil
       @metrics_prefix                       = "kafka_batch"
+      @performance_metrics_enabled          = truthy_env?("KAFKA_BATCH_PERFORMANCE_METRICS_ENABLED")
+      @performance_metrics_retention        = env_positive_int("KAFKA_BATCH_PERFORMANCE_METRICS_RETENTION", 24 * 3600)
+      @performance_metrics_max_job_types    = env_positive_int("KAFKA_BATCH_PERFORMANCE_METRICS_MAX_JOB_TYPES", 50)
+      @performance_metrics_bucket_seconds   = env_positive_int("KAFKA_BATCH_PERFORMANCE_METRICS_BUCKET_SECONDS", 60)
+      @performance_metrics_sample_rate      = env_positive_float("KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE", 1.0)
       @producer_config          = {}
       @consumer_config          = {}
       @validate_topics_on_boot  = false
@@ -601,6 +653,16 @@ module KafkaBatch
       @daemon_mode              = truthy_env?("KAFKA_BATCH_DAEMON_MODE")
       @handler_manifest_path    = ENV["KAFKA_BATCH_HANDLER_MANIFEST"].to_s.strip
       @jobs_topics              = []
+      @ai_knowledge_enabled =
+        if ENV.key?("KAFKA_BATCH_AI_KNOWLEDGE_ENABLED")
+          truthy_env?("KAFKA_BATCH_AI_KNOWLEDGE_ENABLED")
+        else
+          true
+        end
+      @ai_encryption_salt         = ENV["KAFKA_BATCH_AI_ENCRYPTION_SALT"].to_s
+      @ai_chat_history_max_lines  = env_positive_int("KAFKA_BATCH_AI_CHAT_HISTORY_MAX_LINES", 500)
+      @ai_chat_context_chunks     = env_positive_int("KAFKA_BATCH_AI_CHAT_CONTEXT_CHUNKS", 6)
+      @ai_openrouter_default_model = ENV["KAFKA_BATCH_AI_OPENROUTER_DEFAULT_MODEL"].to_s.strip
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 
@@ -686,6 +748,22 @@ module KafkaBatch
           raise ConfigurationError, "metrics_client required when metrics_enabled is true"
         end
       end
+
+      if @performance_metrics_enabled
+        if @performance_metrics_retention.to_i <= 0
+          raise ConfigurationError, "performance_metrics_retention must be > 0"
+        end
+        if @performance_metrics_max_job_types.to_i <= 0
+          raise ConfigurationError, "performance_metrics_max_job_types must be > 0"
+        end
+        if @performance_metrics_bucket_seconds.to_i <= 0
+          raise ConfigurationError, "performance_metrics_bucket_seconds must be > 0"
+        end
+        rate = @performance_metrics_sample_rate.to_f
+        if rate <= 0 || rate > 1.0
+          raise ConfigurationError, "performance_metrics_sample_rate must be in (0, 1.0]"
+        end
+      end
     end
 
     # Apply topic_prefix to a topic name from a priority YAML file.
@@ -754,6 +832,16 @@ module KafkaBatch
       return default if v.empty?
 
       n = Integer(v, 10)
+      n.positive? ? n : default
+    rescue ArgumentError, TypeError
+      default
+    end
+
+    def env_positive_float(key, default)
+      v = ENV[key].to_s.strip
+      return default if v.empty?
+
+      n = Float(v)
       n.positive? ? n : default
     rescue ArgumentError, TypeError
       default

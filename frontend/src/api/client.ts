@@ -3,6 +3,8 @@ export type Bootstrap = {
   csrf_token: string
   mount: string
   audit_enabled: boolean
+  performance_metrics_enabled: boolean
+  ai_enabled: boolean
   fairness_types: string[]
   version: string
 }

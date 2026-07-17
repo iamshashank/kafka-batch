@@ -20,6 +20,8 @@ import { SystemPage } from './pages/SystemPage'
 import { ReconcilerPage } from './pages/ReconcilerPage'
 import { DeadLetterPage } from './pages/DeadLetterPage'
 import { AuditPage } from './pages/AuditPage'
+import { PerformancePage } from './pages/PerformancePage'
+import { AiSettingsPage } from './pages/AiSettingsPage'
 
 const LIVE_KEY = 'kafka_batch_live'
 
@@ -63,6 +65,8 @@ function AppRoutes({
         <Route path="reconciler" element={<ReconcilerPage />} />
         <Route path="dead_letter" element={<DeadLetterPage />} />
         <Route path="audit" element={<AuditPage />} />
+        <Route path="performance" element={<PerformancePage />} />
+        <Route path="ai" element={<AiSettingsPage />} />
         <Route path="fairness/:type" element={<FairnessPage />} />
         <Route path="fairness" element={<Navigate to="/fairness/time" replace />} />
         <Route path="weights/:type" element={<WeightsPage />} />

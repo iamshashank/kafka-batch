@@ -4,6 +4,7 @@ require "base64"
 require "connection_pool"
 require "oj"
 require "securerandom"
+require "socket"
 require "stringio"
 require "time"
 require "zlib"
@@ -60,7 +61,13 @@ module KafkaBatch
             redis.call('SREM', 'kafka_batch:work:by_consumer:' .. owner, jobID)
           elseif owner == consumerID then
             redis.call('EXPIRE', jobKey, ttl)
-            redis.call('SET', livePrefix .. consumerID, '1', 'EX', hbTTL)
+            local liveKey = livePrefix .. consumerID
+            -- Seed only when missing so we do not stomp heartbeat JSON ("1" broke /live).
+            if redis.call('EXISTS', liveKey) == 0 then
+              redis.call('SET', liveKey, '{"consumer_id":"' .. consumerID .. '"}', 'EX', hbTTL)
+            else
+              redis.call('EXPIRE', liveKey, hbTTL)
+            end
             local claimedUnix = tonumber(obj['claimed_at_unix'] or 0) or now
             redis.call('ZADD', index, claimedUnix, jobID)
             return 2
@@ -71,7 +78,12 @@ module KafkaBatch
       redis.call('SET', jobKey, payload, 'EX', ttl)
       redis.call('SADD', byCons, jobID)
       redis.call('ZADD', index, now, jobID)
-      redis.call('SET', livePrefix .. consumerID, '1', 'EX', hbTTL)
+      local liveKey = livePrefix .. consumerID
+      if redis.call('EXISTS', liveKey) == 0 then
+        redis.call('SET', liveKey, '{"consumer_id":"' .. consumerID .. '"}', 'EX', hbTTL)
+      else
+        redis.call('EXPIRE', liveKey, hbTTL)
+      end
       return 1
     LUA
 
@@ -226,11 +238,34 @@ module KafkaBatch
         nil
       end
 
+      # Drop live:consumer:{id} so reclaim can start immediately after a drain
+      # that still has workset leftovers (skip waiting for liveness TTL).
+      def delete_consumer(consumer_id)
+        return if consumer_id.to_s.empty?
+
+        redis_with { |r| r.del(live_key(consumer_id)) }
+        nil
+      end
+
+      # Refresh live:consumer:{id} with JSON (rss/cpu) — Go TouchConsumer parity.
+      # Never write the bare "1" marker; that broke the /live dashboard parser.
       def touch_consumer(consumer_id, ttl: nil)
         return if consumer_id.to_s.empty?
 
         hb = positive_or(ttl, DEFAULT_HEARTBEAT_TTL)
-        redis_with { |r| r.set(live_key(consumer_id), "1", ex: hb) }
+        payload =
+          if defined?(KafkaBatch::Liveness) && consumer_id.to_s == KafkaBatch::Liveness.consumer_id
+            KafkaBatch::Liveness.heartbeat_payload(topic: nil)
+          else
+            {
+              "consumer_id" => consumer_id.to_s,
+              "hostname"    => Socket.gethostname,
+              "pid"         => Process.pid,
+              "last_seen"   => Time.now.utc.iso8601,
+              "runtime"     => "ruby"
+            }
+          end
+        redis_with { |r| r.set(live_key(consumer_id), Oj.dump(payload, mode: :compat), ex: hb) }
         nil
       end
 

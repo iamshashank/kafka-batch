@@ -176,6 +176,14 @@ KafkaBatch.configure do |config|
   # config.audit_database_connection = :kafka_batch_audit
   # config.audit_actor = ->(env) { env["HTTP_X_FORWARDED_USER"] }
 
+  # ── AI assistant (OpenRouter + RAG over packaged docs) ───────────────────────
+  # Dashboard chat bubble + /ai settings. Knowledge chunks sync to Redis on boot.
+  # config.ai_knowledge_enabled = true
+  # Required to store OpenRouter API keys (AES-GCM). Prefer a long random secret:
+  # config.ai_encryption_salt = ENV.fetch("KAFKA_BATCH_AI_ENCRYPTION_SALT")
+  # config.ai_chat_history_max_lines = 500   # global shared history (Redis LIST)
+  # config.ai_openrouter_default_model = "openai/gpt-4o-mini"
+
   # ── Metrics (StatsD / Datadog / custom proc) ────────────────────────────────
   # config.metrics_enabled = true
   # config.metrics_adapter = :statsd   # :datadog or :proc

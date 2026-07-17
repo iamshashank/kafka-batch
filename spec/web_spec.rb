@@ -96,7 +96,21 @@ RSpec.describe KafkaBatch::Web do
       expect(payload["csrf_token"]).to match(/\A[a-f0-9]{32}\z/)
       expect(payload["mount"]).to eq("/kafka_batch")
       expect(payload).to have_key("audit_enabled")
+      expect(payload).to have_key("performance_metrics_enabled")
+      expect(payload).to have_key("ai_enabled")
       expect(payload["version"]).to eq(KafkaBatch::VERSION)
+    end
+
+    it "reflects performance_metrics_enabled from config" do
+      allow(KafkaBatch.config).to receive(:performance_metrics_enabled).and_return(true)
+      payload = json_body(get("/api/bootstrap"))
+      expect(payload["performance_metrics_enabled"]).to eq(true)
+    end
+
+    it "reflects ai_enabled from config" do
+      allow(KafkaBatch.config).to receive(:ai_knowledge_enabled).and_return(false)
+      payload = json_body(get("/api/bootstrap"))
+      expect(payload["ai_enabled"]).to eq(false)
     end
   end
 
@@ -293,6 +307,17 @@ RSpec.describe KafkaBatch::Web do
       expect(payload).to have_key("consumers")
       expect(payload).to have_key("running_jobs")
     end
+
+    it "tolerates non-hash consumer payloads from Redis claim markers" do
+      allow(KafkaBatch::Liveness).to receive(:available?).and_return(true)
+      allow(KafkaBatch::Liveness).to receive(:consumers).and_return(
+        [1, { "consumer_id" => "ok", "hostname" => "h", "pid" => 1, "last_seen" => "2026-01-01T00:00:00Z" }]
+      )
+      allow(KafkaBatch::Liveness).to receive(:running_jobs).and_return([])
+      payload = json_body(get("/api/live"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["consumers"].map { |c| c["consumer_id"] }).to eq(["ok"])
+    end
   end
 
   describe "GET /api/failures" do
@@ -356,6 +381,109 @@ RSpec.describe KafkaBatch::Web do
       allow(KafkaBatch.config).to receive(:audit_enabled).and_return(false)
       payload = json_body(get("/api/audit"))
       expect(payload["enabled"]).to eq(false)
+    end
+  end
+
+  describe "GET /api/performance" do
+    it "reports disabled by default without touching Redis" do
+      payload = json_body(get("/api/performance"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["enabled"]).to eq(false)
+      expect(payload["available"]).to eq(false)
+      expect(payload["points"]).to eq([])
+      expect(payload["job_types"]).to eq([])
+    end
+
+    it "reports unavailable when enabled but Redis is unreachable" do
+      allow(KafkaBatch.config).to receive(:performance_metrics_enabled).and_return(true)
+      allow(KafkaBatch::PerformanceMetrics).to receive(:available?).and_return(false)
+      payload = json_body(get("/api/performance"))
+      expect(payload["enabled"]).to eq(true)
+      expect(payload["available"]).to eq(false)
+      expect(payload["message"]).to include("Redis")
+    end
+
+    it "returns bucketed points and totals when enabled and available" do
+      skip "Redis unavailable" unless KafkaBatchSpec::RedisHelper.available?
+      KafkaBatch.config.performance_metrics_enabled = true
+      KafkaBatch::PerformanceMetrics.reset!
+      KafkaBatch::PerformanceMetrics.record(:processed, job_type: "FooWorker")
+      KafkaBatch::PerformanceMetrics.record(:failed, job_type: "FooWorker")
+
+      payload = json_body(get("/api/performance", query: "range=5m"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["enabled"]).to eq(true)
+      expect(payload["available"]).to eq(true)
+      expect(payload["range"]).to eq("5m")
+      expect(payload["totals"]["processed"]).to eq(1)
+      expect(payload["totals"]["failed"]).to eq(1)
+      expect(payload["job_types"].first["job_type"]).to eq("FooWorker")
+    end
+
+    it "restricts job_types via the query param" do
+      skip "Redis unavailable" unless KafkaBatchSpec::RedisHelper.available?
+      KafkaBatch.config.performance_metrics_enabled = true
+      KafkaBatch::PerformanceMetrics.reset!
+      KafkaBatch::PerformanceMetrics.record(:processed, job_type: "Alpha")
+      KafkaBatch::PerformanceMetrics.record(:processed, job_type: "Beta")
+
+      payload = json_body(get("/api/performance", query: "job_types=Beta"))
+      expect(payload["job_types"].map { |r| r["job_type"] }).to eq(["Beta"])
+    end
+  end
+
+  describe "AI assistant API" do
+    it "GET /api/ai/settings reports disabled when ai_knowledge_enabled is false" do
+      allow(KafkaBatch.config).to receive(:ai_knowledge_enabled).and_return(false)
+      payload = json_body(get("/api/ai/settings"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["enabled"]).to eq(false)
+    end
+
+    it "rejects chat when AI is disabled" do
+      allow(KafkaBatch.config).to receive(:ai_knowledge_enabled).and_return(false)
+      status, = post("/api/ai/chat", json: { message: "hi" })
+      expect(status).to eq(403)
+    end
+
+    it "saves settings, chat, and shared history when Redis is available" do
+      skip "Redis unavailable" unless KafkaBatchSpec::RedisHelper.available?
+      KafkaBatch.config.ai_knowledge_enabled = true
+      KafkaBatch.config.ai_encryption_salt = "web-ai-salt"
+      KafkaBatch::Ai::Settings.reset_pool!
+      KafkaBatch::Ai::ChatHistory.reset_pool!
+      KafkaBatch::Ai::KnowledgeIndex.reset_pool!
+      KafkaBatchSpec::RedisHelper.flush!
+      KafkaBatch::Ai::KnowledgeIndex.sync!
+
+      shown = json_body(put("/api/ai/settings", json: {
+        api_key: "sk-or-webtest",
+        model: "openai/gpt-4o-mini"
+      }))
+      expect(shown["ok"]).to eq(true)
+      expect(shown["settings"]["api_key_set"]).to eq(true)
+      expect(shown["settings"]["api_key_masked"]).to include("test")
+
+      fake = instance_double(KafkaBatch::Ai::OpenRouter)
+      allow(KafkaBatch::Ai::OpenRouter).to receive(:new).and_return(fake)
+      allow(fake).to receive(:chat).and_return("Docs say SuperFetch leases work.")
+
+      chat = json_body(post("/api/ai/chat", json: { message: "What is SuperFetch?" }))
+      expect(chat["ok"]).to eq(true)
+      expect(chat["reply"]).to include("SuperFetch")
+
+      hist = json_body(get("/api/ai/history"))
+      expect(hist["messages"].map { |m| m["role"] }).to eq(%w[user assistant])
+      expect(hist["max_lines"]).to eq(KafkaBatch::Ai::ChatHistory.max_lines)
+
+      cleared = json_body(delete_req("/api/ai/history", json: {}))
+      expect(cleared["cleared"]).to eq(true)
+      expect(json_body(get("/api/ai/history"))["messages"]).to eq([])
+    ensure
+      KafkaBatch::Ai::Settings.reset_pool! if defined?(KafkaBatch::Ai::Settings)
+      KafkaBatch::Ai::ChatHistory.reset_pool! if defined?(KafkaBatch::Ai::ChatHistory)
+      KafkaBatch::Ai::KnowledgeIndex.reset_pool! if defined?(KafkaBatch::Ai::KnowledgeIndex)
+      KafkaBatch.config.ai_encryption_salt = ""
     end
   end
 

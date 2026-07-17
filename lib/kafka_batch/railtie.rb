@@ -24,6 +24,22 @@ module KafkaBatch
       KafkaBatch::Metrics.install! if KafkaBatch.config.metrics_enabled
     end
 
+    initializer "kafka_batch.performance_metrics", after: "kafka_batch.validate_config" do
+      KafkaBatch::PerformanceMetrics.install! if KafkaBatch.config.performance_metrics_enabled
+    end
+
+    # Load prebuilt AI knowledge chunks into Redis; refresh config snapshot
+    # at most every 24h. Safe for many UI pods: one writer, version-gated corpus.
+    initializer "kafka_batch.ai_knowledge", after: "kafka_batch.validate_config" do
+      config.after_initialize do
+        begin
+          KafkaBatch::Ai::KnowledgeIndex.sync! if defined?(KafkaBatch::Ai::KnowledgeIndex)
+        rescue => e
+          KafkaBatch.logger.warn("[KafkaBatch] AI knowledge sync skipped: #{e.message}")
+        end
+      end
+    end
+
     # Validate that all required Kafka topics exist at boot time.
     # Opt-in via: config.validate_topics_on_boot = true in the initializer.
     # Skipped when WaterDrop is not yet configured or the broker is unreachable.
@@ -85,8 +101,11 @@ module KafkaBatch
         Karafka::App.monitor.subscribe("app.stopped") do
           # Drain SuperFetch pool before tearing down producer/heartbeats so
           # in-flight #perform can Complete (or stay in the workset for reclaim).
+          remaining = 0
           begin
-            KafkaBatch::SuperFetch.drain(timeout: 30) if defined?(KafkaBatch::SuperFetch)
+            if defined?(KafkaBatch::SuperFetch)
+              remaining = KafkaBatch::SuperFetch.drain.to_i
+            end
           rescue => e
             KafkaBatch.logger.warn("[KafkaBatch] SuperFetch drain: #{e.message}")
           end
@@ -95,6 +114,17 @@ module KafkaBatch
           # the producer, so no in-flight work is cut off mid-produce.
           KafkaBatch::Workset::ReclaimScheduler.stop! if defined?(KafkaBatch::Workset::ReclaimScheduler)
           KafkaBatch::Liveness.stop_heartbeat_loop! if defined?(KafkaBatch::Liveness)
+
+          # If drain timed out with leftovers, drop the live key so reclaim does
+          # not wait for liveness_ttl (~180s).
+          if remaining.positive? && defined?(KafkaBatch::Workset) && defined?(KafkaBatch::Liveness)
+            begin
+              KafkaBatch::Workset.store.delete_consumer(KafkaBatch::Liveness.consumer_id)
+            rescue => e
+              KafkaBatch.logger.warn("[KafkaBatch] delete live consumer: #{e.message}")
+            end
+          end
+
           KafkaBatch::Fairness::Forwarder.stop! if defined?(KafkaBatch::Fairness::Forwarder)
           KafkaBatch::SchedulePoller.stop!       if defined?(KafkaBatch::SchedulePoller)
           KafkaBatch::Producer.reset!            if defined?(KafkaBatch::Producer)
@@ -236,6 +266,44 @@ module KafkaBatch
             puts "[KafkaBatch] #{job_id} was not pending (already dispatched, unknown, or " \
                  "schedule_store=:redis — cancel the batch instead)."
           end
+        end
+
+        desc "Rebuild packaged AI knowledge chunks from ai/README.md + ai/FAQ.md " \
+             "(run in the gem repo before release). Writes lib/kafka_batch/ai/knowledge_chunks.json"
+        task :build_ai_chunks do
+          require "kafka_batch/ai/chunker"
+          gem_root = File.expand_path("../../..", __dir__)
+          ai_dir = File.join(gem_root, "ai")
+          readme = File.join(ai_dir, "README.md")
+          faq    = File.join(ai_dir, "FAQ.md")
+          abort "[KafkaBatch] missing #{readme}" unless File.file?(readme)
+          abort "[KafkaBatch] missing #{faq}" unless File.file?(faq)
+
+          out = File.join(gem_root, "lib/kafka_batch/ai/knowledge_chunks.json")
+          payload = KafkaBatch::Ai::Chunker.write!(
+            output_path: out,
+            readme_path: readme,
+            faq_path: faq
+          )
+          puts "[KafkaBatch] wrote #{out}"
+          puts "  chunks=#{payload['chunk_count']} corpus=#{payload['corpus_version']}"
+        end
+
+        desc "Force-sync AI knowledge into Redis. FORCE=1 clears meta (full corpus rewrite). " \
+             "Without FORCE, sync follows normal rules: corpus on version change, config every 24h."
+        task sync_ai_knowledge: :environment do
+          if ENV["FORCE"].to_s == "1" && KafkaBatch.config.redis_configured?
+            begin
+              client = KafkaBatch::RedisClient.new(KafkaBatch.config)
+              client.del(KafkaBatch::Ai::KnowledgeIndex::META_KEY) if client
+            rescue StandardError => e
+              warn "[KafkaBatch] FORCE meta clear failed: #{e.message}"
+            end
+          end
+          result = KafkaBatch::Ai::KnowledgeIndex.sync!
+          puts "[KafkaBatch] AI knowledge sync => #{result}"
+          meta = KafkaBatch::Ai::KnowledgeIndex.meta
+          puts "  meta=#{meta.inspect}" unless meta.empty?
         end
       end
     end

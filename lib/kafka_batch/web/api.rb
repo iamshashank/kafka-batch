@@ -64,6 +64,20 @@ module KafkaBatch
           dead_letter(params)
         elsif method == "GET" && path == "/api/audit"
           audit(params)
+        elsif method == "GET" && path == "/api/performance"
+          performance(params)
+        elsif method == "GET" && path == "/api/ai/settings"
+          ai_settings_show
+        elsif method == "PUT" && path == "/api/ai/settings"
+          ai_settings_update(env)
+        elsif method == "DELETE" && path == "/api/ai/settings"
+          ai_settings_clear_key
+        elsif method == "GET" && path == "/api/ai/history"
+          ai_history
+        elsif method == "DELETE" && path == "/api/ai/history"
+          ai_history_clear
+        elsif method == "POST" && path == "/api/ai/chat"
+          ai_chat(env)
         else
           Json.error(404, "Not found")
         end
@@ -83,6 +97,8 @@ module KafkaBatch
           csrf_token: @web.csrf_token,
           mount: @web.script_name,
           audit_enabled: defined?(KafkaBatch::AuditLog) && KafkaBatch::AuditLog.enabled?,
+          performance_metrics_enabled: defined?(KafkaBatch::PerformanceMetrics) && KafkaBatch::PerformanceMetrics.enabled?,
+          ai_enabled: KafkaBatch.config.ai_knowledge_enabled,
           fairness_types: fairness_types,
           version: KafkaBatch::VERSION
         )
@@ -285,8 +301,8 @@ module KafkaBatch
           available: true,
           backend: KafkaBatch::Liveness.backend,
           stats_interval: KafkaBatch.config.liveness_stats_interval,
-          consumers: consumers.map { |c| serialize_consumer(c) },
-          running_jobs: jobs.map { |j| serialize_running_job(j) }
+          consumers: consumers.map { |c| serialize_consumer(c) }.compact,
+          running_jobs: jobs.map { |j| serialize_running_job(j) }.compact,
         )
       end
 
@@ -635,6 +651,32 @@ module KafkaBatch
         )
       end
 
+      def performance(params)
+        unless defined?(KafkaBatch::PerformanceMetrics) && KafkaBatch::PerformanceMetrics.enabled?
+          return Json.ok(
+            ok: true, enabled: false, available: false,
+            message: "Performance metrics are disabled. Enable with config.performance_metrics_enabled = true.",
+            range: performance_range(params), bucket_seconds: nil,
+            points: [], job_types: [], totals: {}
+          )
+        end
+
+        unless KafkaBatch::PerformanceMetrics.available?
+          return Json.ok(
+            ok: true, enabled: true, available: false,
+            message: "Redis is required for performance metrics and it is not currently reachable.",
+            range: performance_range(params), bucket_seconds: nil,
+            points: [], job_types: [], totals: {}
+          )
+        end
+
+        data = KafkaBatch::PerformanceMetrics::Reader.new.fetch(
+          range: performance_range(params),
+          job_types: performance_job_types(params)
+        )
+        Json.ok(ok: true, enabled: true, available: true, **data)
+      end
+
       # ── serializers / helpers ─────────────────────────────────────────────
 
       def serialize_batch(b, detail: false)
@@ -719,30 +761,41 @@ module KafkaBatch
       end
 
       def serialize_consumer(c)
+        return nil unless c.is_a?(Hash)
+
+        rss = live_field(c, "rss_bytes")
+        last_seen = live_field(c, "last_seen")
         {
-          consumer_id: c[:consumer_id] || c["consumer_id"],
-          hostname: c[:hostname] || c["hostname"],
-          pid: c[:pid] || c["pid"],
-          rss_bytes: c[:rss_bytes] || c["rss_bytes"],
-          rss_label: @web.fmt_mem_text(c[:rss_bytes] || c["rss_bytes"]),
-          cpu_pct: c[:cpu_pct] || c["cpu_pct"],
-          topic: c[:topic] || c["topic"],
-          last_seen: c[:last_seen] || c["last_seen"],
-          last_seen_label: @web.fmt_time(c[:last_seen] || c["last_seen"])
+          consumer_id: live_field(c, "consumer_id"),
+          hostname: live_field(c, "hostname"),
+          pid: live_field(c, "pid"),
+          rss_bytes: rss,
+          rss_label: @web.fmt_mem_text(rss),
+          cpu_pct: live_field(c, "cpu_pct"),
+          topic: live_field(c, "topic"),
+          last_seen: last_seen,
+          last_seen_label: @web.fmt_time(last_seen)
         }
       end
 
       def serialize_running_job(j)
+        return nil unless j.is_a?(Hash)
+
+        started_at = live_field(j, "started_at")
         {
-          job_id: j[:job_id] || j["job_id"],
-          batch_id: j[:batch_id] || j["batch_id"],
-          worker_class: j[:worker_class] || j["worker_class"],
-          consumer_id: j[:consumer_id] || j["consumer_id"],
-          topic: j[:topic] || j["topic"],
-          partition: j[:partition] || j["partition"],
-          started_at: j[:started_at] || j["started_at"],
-          started_at_label: @web.fmt_time(j[:started_at] || j["started_at"])
+          job_id: live_field(j, "job_id"),
+          batch_id: live_field(j, "batch_id"),
+          worker_class: live_field(j, "worker_class"),
+          consumer_id: live_field(j, "consumer_id"),
+          topic: live_field(j, "topic"),
+          partition: live_field(j, "partition"),
+          started_at: started_at,
+          started_at_label: @web.fmt_time(started_at)
         }
+      end
+
+      def live_field(hash, key)
+        hash[key] || hash[key.to_sym]
       end
 
       def serialize_lag_topic(t, paused)
@@ -871,6 +924,93 @@ module KafkaBatch
           lag: lag_row&.dig(:lag),
           never_consumed: lag_row&.dig(:never_consumed)
         }
+      end
+
+      def ai_settings_show
+        unless KafkaBatch.config.ai_knowledge_enabled
+          return Json.ok(ok: true, enabled: false, message: "AI assistant disabled (config.ai_knowledge_enabled = false).")
+        end
+
+        Json.ok(ok: true, enabled: true, settings: KafkaBatch::Ai::Settings.show)
+      end
+
+      def ai_settings_update(env)
+        return Json.error(403, "AI assistant disabled") unless KafkaBatch.config.ai_knowledge_enabled
+
+        body = json_body(env).merge(@web.body_params(env))
+        begin
+          settings = KafkaBatch::Ai::Settings.update!(
+            api_key: body["api_key"],
+            model: body.key?("model") ? body["model"] : nil,
+            base_url: body.key?("base_url") ? body["base_url"] : nil,
+            clear_api_key: %w[1 true yes on].include?(body["clear_api_key"].to_s.strip.downcase)
+          )
+          Json.ok(ok: true, settings: settings)
+        rescue KafkaBatch::ConfigurationError => e
+          Json.error(400, e.message)
+        rescue StandardError => e
+          KafkaBatch.logger.error("[KafkaBatch::Web] ai_settings_update: #{e.class}: #{e.message}")
+          Json.error(500, e.message)
+        end
+      end
+
+      def ai_settings_clear_key
+        return Json.error(403, "AI assistant disabled") unless KafkaBatch.config.ai_knowledge_enabled
+
+        settings = KafkaBatch::Ai::Settings.update!(clear_api_key: true)
+        Json.ok(ok: true, settings: settings)
+      end
+
+      def ai_history
+        return Json.error(403, "AI assistant disabled") unless KafkaBatch.config.ai_knowledge_enabled
+
+        msgs = KafkaBatch::Ai::ChatHistory.list
+        Json.ok(
+          ok: true,
+          messages: msgs.reverse, # chronological for UI
+          size: KafkaBatch::Ai::ChatHistory.size,
+          max_lines: KafkaBatch::Ai::ChatHistory.max_lines
+        )
+      end
+
+      def ai_history_clear
+        return Json.error(403, "AI assistant disabled") unless KafkaBatch.config.ai_knowledge_enabled
+
+        KafkaBatch::Ai::ChatHistory.clear!
+        Json.ok(ok: true, cleared: true)
+      end
+
+      def ai_chat(env)
+        return Json.error(403, "AI assistant disabled") unless KafkaBatch.config.ai_knowledge_enabled
+
+        body = json_body(env).merge(@web.body_params(env))
+        message = @web.non_empty(body["message"])
+        return Json.error(400, "message required") if message.nil?
+
+        begin
+          result = KafkaBatch::Ai::Chat.ask(message)
+          Json.ok(result.merge("ok" => true))
+        rescue ArgumentError => e
+          Json.error(400, e.message)
+        rescue KafkaBatch::Ai::OpenRouter::Error => e
+          Json.error(502, e.message)
+        rescue StandardError => e
+          KafkaBatch.logger.error("[KafkaBatch::Web] ai_chat: #{e.class}: #{e.message}")
+          Json.error(500, e.message)
+        end
+      end
+
+      def performance_range(params)
+        r = @web.non_empty(params["range"])
+        r && KafkaBatch::PerformanceMetrics::Reader::RANGES.key?(r) ? r : KafkaBatch::PerformanceMetrics::Reader::DEFAULT_RANGE
+      end
+
+      def performance_job_types(params)
+        raw = @web.non_empty(params["job_types"])
+        return nil unless raw
+
+        list = raw.split(",").map(&:strip).reject(&:empty?)
+        list.empty? ? nil : list
       end
 
       def json_body(env)
