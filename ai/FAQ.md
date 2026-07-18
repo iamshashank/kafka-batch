@@ -1,6 +1,6 @@
 # kafka-batch curated FAQ
 
-> Companion to [`ai/README.md`](./README.md). Large Q&A corpus for RAG. Stay consistent with the knowledge base. The Web UI assistant answers from **docs only** — never query or mutate live operational Redis (ledger, fairness, workset, uniq, schedule, liveness, pause, retry-cancel, reconciler, perf).
+> Companion to [`ai/README.md`](./README.md). Large Q&A corpus for RAG. Stay consistent with the knowledge base. The Web UI assistant answers from **docs only** — never query or mutate live operational Redis (ledger, fairness, workset, uniq, schedule, **cron leader lock**, liveness, pause, retry-cancel, reconciler, perf).
 
 ---
 
@@ -16,7 +16,7 @@ Jobs travel on Kafka topics (durable, partition-scalable). Batch counting and fa
 Yes. Redis is mandatory. Kafka holds payloads/offsets; Redis holds batch counters/bitmaps, WFQ state, uniq locks, SuperFetch claims, schedule pointers (unless MySQL), heartbeats, pause state.
 
 ### Can I run without MySQL?
-Yes. Defaults `store: :redis` and `schedule_store: :redis` need no MySQL. Use MySQL for durable failure logs/pauses and/or a disk-backed schedule index.
+Yes. Defaults `store: :redis` and `schedule_store: :redis` need no MySQL. Use MySQL for durable failure logs/pauses, a disk-backed schedule index, and/or **recurring cron tables**.
 
 ### Does `store: :mysql` move the batch ledger to MySQL?
 No. Hot ledger and bitmaps stay in Redis. MySQL adds failure log / pause fallback tables.
@@ -32,13 +32,13 @@ Either or both. Client can enqueue both. Control must be **one** runtime per sha
 ## B. Architecture and tiers
 
 ### What are the three tiers?
-1. **Client** — enqueue batches/jobs. 2. **Control** — fair forward, events, retry, callback produce, schedule poller, workset reclaim, reconciler. 3. **Execution** — run handlers and emit completion events.
+1. **Client** — enqueue batches/jobs. 2. **Control** — fair forward, events, retry, callback produce, schedule poller, **recurring ticker**, workset reclaim, reconciler. 3. **Execution** — run handlers and emit completion events.
 
 ### Do tiers talk over HTTP or gRPC?
 No. Only Kafka + Redis.
 
 ### What runs in Ruby control vs Go daemon?
-Both can run events, retry, fair dispatch/forward, schedule poller, reclaim, reconciler. **Do not run both** on the same events/retry/ingest topics.
+Both can run events, retry, fair dispatch/forward, schedule poller, **recurring ticker**, reclaim, reconciler. **Do not run both control planes** on the same events/retry/ingest topics. Ruby + Go **recurring** tickers **may** share one cluster (ledger + leader lock prevent double-fire).
 
 ### What does `kbatch worker` run?
 Go execution only: plain Go topics, fair-ready `.go`, priority Go groups — all via SuperFetch. It does not run control consumers.
@@ -50,7 +50,7 @@ Control plane only. It does **not** execute job handlers.
 API/client pods skip Karafka (`draw_routes` skipped). Enqueue only; run control/execution elsewhere.
 
 ### Does `KB_ROLE` select which Karafka groups run?
-Not by itself. It mainly gates schedule poller in generated initializer patterns. Filter groups with `--include-consumer-groups`.
+Not by itself. It mainly gates schedule poller in generated initializer patterns. Filter groups with `--include-consumer-groups`. Recurring is separate: set `recurring_scheduler_enabled` / `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED` on those same scheduler pods.
 
 ### What is `CG`?
 `consumer_group` base (default `kafka-batch`). With `topic_prefix=myapp` → `myapp.kafka-batch`. Groups are `{CG}-control`, `{CG}-jobs`, etc.
@@ -285,6 +285,40 @@ Yes — poller skips jobs whose batch is cancelled.
 
 ### What is `schedule_lease_seconds`?
 TTL on a claimed due pointer so a crashed poller does not strand the job forever.
+
+### Is recurring cron the same as delayed jobs?
+**No.** Delayed jobs (§16 / FAQ H) are one-shot `perform_in`/`perform_at` via `scheduled_topic` + pointer index. Recurring cron (FAQ H2 / README §17) stores schedules in MySQL and fires via normal `enqueue_job`.
+
+---
+
+## H2. Recurring (cron) scheduler
+
+### What is the recurring scheduler?
+Whenever-style repeating cron that enqueues a **manifest `job_type`** on a schedule. Ruby `Recurring::Ticker` and Go `pkg/cron` share MySQL tables + Redis leader lock.
+
+### How do I install the tables?
+Ruby: `rails g kafka_batch:install --recurring && rails db:migrate`. Go-only: copy SQL block C from kafka-batch-go README (or rely on `EnsureSchema` on first daemon boot — prefer explicit SQL in prod).
+
+### How do I enable it?
+Ruby: `config.recurring_scheduler_enabled = true` or `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED=true`. Go: `recurring_scheduler_enabled: true` in `daemon.yml` (**no** Go env override today). Enable on few scheduler/control pods only.
+
+### Can Ruby and Go tickers run together?
+Yes. Correctness is the fire ledger PK `(schedule_id, fire_at)` + deterministic `job_id` `sched-{id}-{unix}`. Leader lock `kafka_batch:cron:leader_lock` is an optimization.
+
+### What are misfire policies?
+`fire_once` (default) — one catch-up fire then jump to next after now. `skip` — fire only if within `misfire_grace`, else skip. `backfill` — every missed instant capped by `recurring_max_backfill` per tick.
+
+### Where is the UI?
+`/kafka_batch/recurring`. APIs: `GET/POST /api/recurring`, `POST/PATCH/DELETE /api/recurring/:name`, `POST /api/recurring/:name/run` (run-now has **no** ledger row).
+
+### What DB connection does recurring use?
+Ruby: `schedule_store_database_connection`. Go: `recurring_mysql_dsn` falling back to `schedule_mysql_dsn`.
+
+### Why is a schedule “stale”?
+Enabled and idle longer than `recurring_stale_factor × cron_interval` (default factor 2). Idle measured from `last_fire_at` or `next_run_at`.
+
+### Dedicated Ruby process?
+`rake kafka_batch:recurring:run` (loop) or `kafka_batch:recurring:tick` (one pass). Requires fugit for cron parsing / staleness interval.
 
 ---
 
@@ -608,7 +642,7 @@ Default 1 MiB guard; oversized payloads raise before Kafka reject. Set 0 to disa
 ## Y. Cross-runtime parity FAQ
 
 ### Which defaults intentionally differ?
-SF concurrency (1 vs 10), fairness_ready_window (500 vs 100), schedule_poll_jitter (0.1 vs 0).
+SF concurrency (1 vs 10), fairness_ready_window (500 vs 100), schedule_poll_jitter (0.1 vs 0). Recurring: Ruby has `KAFKA_BATCH_RECURRING_*` env overrides; Go is YAML-only. Cron parsers differ (Fugit vs Go 5-field).
 
 ### Which contracts must not differ?
 Workset keys/Lua semantics, batch ledger/bitmaps, fair namespaces, uniq fingerprint, pause key format, retry tier topic naming, event/callback envelopes, perf Redis layout.
@@ -828,6 +862,9 @@ SPA shell config + CSRF token for mutating calls.
 
 ### Fairness UI endpoints?
 `GET /api/fairness/:type`, weights `GET/PUT/DELETE /api/weights/:type[/:tenant_id]`.
+
+### Recurring API?
+`GET/POST /api/recurring`, `POST|PATCH /api/recurring/:name` (enabled), `DELETE /api/recurring/:name`, `POST /api/recurring/:name/run`. Requires migrated tables; see FAQ H2.
 
 ### Lag pause/resume?
 `POST /api/lag/pause`, `POST /api/lag/resume`.

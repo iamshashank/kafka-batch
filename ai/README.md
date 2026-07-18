@@ -1,8 +1,8 @@
 # kafka-batch AI knowledge base
 
-> **Purpose.** Canonical corpus for the kafka-batch Web UI assistant (RAG). Covers architecture, every major subsystem, Redis/Kafka contracts, configuration knobs (Ruby gem + Go companion), SuperFetch, fairness, batches, retries, delayed jobs, and how each piece preserves **atomicity** and **idempotency**.
+> **Purpose.** Canonical corpus for the kafka-batch Web UI assistant (RAG). Covers architecture, every major subsystem, Redis/Kafka contracts, configuration knobs (Ruby gem + Go companion), SuperFetch, fairness, batches, retries, delayed jobs, **recurring cron**, and how each piece preserves **atomicity** and **idempotency**.
 >
-> **Assistant safety rule.** Answers must be derived from this knowledge base, `ai/FAQ.md`, and the **live configuration snapshot** (`config:live` / `topic_inventory`) when present. The assistant must **never** read, write, or mutate live Redis keys used by the batch ledger, fairness scheduler, workset, uniqueness locks, schedule index, liveness, consumption pause, retry-cancel, reconciler, or performance counters. Separate assistant Redis keys (API-key ciphertext, knowledge chunks, chat history) are not operational kafka-batch state. For live partition counts use `live_broker_partitions` from the snapshot — not DEFAULT_PARTITIONS documentation.
+> **Assistant safety rule.** Answers must be derived from this knowledge base, `ai/FAQ.md`, and the **live configuration snapshot** (`config:live` / `topic_inventory`) when present. The assistant must **never** read, write, or mutate live Redis keys used by the batch ledger, fairness scheduler, workset, uniqueness locks, schedule index, **recurring leader lock**, liveness, consumption pause, retry-cancel, reconciler, or performance counters. Separate assistant Redis keys (API-key ciphertext, knowledge chunks, chat history) are not operational kafka-batch state. For live partition counts use `live_broker_partitions` from the snapshot — not DEFAULT_PARTITIONS documentation.
 
 Companion repos:
 
@@ -35,26 +35,27 @@ Both runtimes share **Kafka topics** and **Redis** contracts. Pick one language 
 14. [Uniqueness](#14-uniqueness)
 15. [Job expiry (`valid_till`)](#15-job-expiry-valid_till)
 16. [Delayed jobs — SchedulePoller](#16-delayed-jobs--schedulepoller)
-17. [Retries, RetryCancel, dead letter](#17-retries-retrycancel-dead-letter)
-18. [Priority queues](#18-priority-queues)
-19. [Cancellation and CancellationCache](#19-cancellation-and-cancellationcache)
-20. [Consumption pause / resume](#20-consumption-pause--resume)
-21. [Liveness](#21-liveness)
-22. [Reconciler](#22-reconciler)
-23. [Instrumentation, Metrics, PerformanceMetrics](#23-instrumentation-metrics-performancemetrics)
-24. [Stores — Redis vs MySQL](#24-stores--redis-vs-mysql)
-25. [Topics, partitions, create_all](#25-topics-partitions-create_all)
-26. [Deployment, consumer groups, KB_ROLE, daemon_mode](#26-deployment-consumer-groups-kb_role-daemon_mode)
-27. [Web UI and JSON API](#27-web-ui-and-json-api)
-28. [Redis key namespace catalog](#28-redis-key-namespace-catalog)
-29. [Kafka topic catalog](#29-kafka-topic-catalog)
-30. [Ruby configuration reference](#30-ruby-configuration-reference)
-31. [Go configuration reference](#31-go-configuration-reference)
-32. [Ruby ↔ Go parity gaps](#32-ruby--go-parity-gaps)
-33. [Atomicity and idempotency matrix](#33-atomicity-and-idempotency-matrix)
-34. [Scaling and tuning](#34-scaling-and-tuning)
-35. [Operator cheat sheet](#35-operator-cheat-sheet)
-36. [Document maintenance](#36-document-maintenance)
+17. [Recurring (cron) scheduler](#17-recurring-cron-scheduler)
+18. [Retries, RetryCancel, dead letter](#18-retries-retrycancel-dead-letter)
+19. [Priority queues](#19-priority-queues)
+20. [Cancellation and CancellationCache](#20-cancellation-and-cancellationcache)
+21. [Consumption pause / resume](#21-consumption-pause--resume)
+22. [Liveness](#22-liveness)
+23. [Reconciler](#23-reconciler)
+24. [Instrumentation, Metrics, PerformanceMetrics](#24-instrumentation-metrics-performancemetrics)
+25. [Stores — Redis vs MySQL](#25-stores--redis-vs-mysql)
+26. [Topics, partitions, create_all](#26-topics-partitions-create_all)
+27. [Deployment, consumer groups, KB_ROLE, daemon_mode](#27-deployment-consumer-groups-kb_role-daemon_mode)
+28. [Web UI and JSON API](#28-web-ui-and-json-api)
+29. [Redis key namespace catalog](#29-redis-key-namespace-catalog)
+30. [Kafka topic catalog](#30-kafka-topic-catalog)
+31. [Ruby configuration reference](#31-ruby-configuration-reference)
+32. [Go configuration reference](#32-go-configuration-reference)
+33. [Ruby ↔ Go parity gaps](#33-ruby--go-parity-gaps)
+34. [Atomicity and idempotency matrix](#34-atomicity-and-idempotency-matrix)
+35. [Scaling and tuning](#35-scaling-and-tuning)
+36. [Operator cheat sheet](#36-operator-cheat-sheet)
+37. [Document maintenance](#37-document-maintenance)
 
 ---
 
@@ -70,6 +71,7 @@ Both runtimes share **Kafka topics** and **Redis** contracts. Pick one language 
 | Batch state | Redis hash + bitmaps | Counters, status, callback claim |
 | Fairness ordering | Kafka ingest → Redis WFQ → Kafka ready | Dispatcher + Forwarder |
 | Delayed jobs | Kafka scheduled + Redis/MySQL index | SchedulePoller |
+| Recurring cron | MySQL schedules + fire ledger | Ruby `Recurring::Ticker` / Go `pkg/cron` |
 | In-flight execution ledger | Redis workset | SuperFetch claim / renew / complete / reclaim |
 
 **Redis is always required.** There is no Redis-free mode.
@@ -120,9 +122,9 @@ Default `true` maps weights to in-flight share.
 
 Expired leases free slots while jobs may still run → soft concurrency overshoot.
 
-### 2.11 Schedule poller off by default
+### 2.11 Schedule poller and recurring ticker off by default
 
-Enable only on a few scheduler/control pods.
+Enable only on a few scheduler/control pods. Both `schedule_poller_enabled` and `recurring_scheduler_enabled` default **false**. Recurring also needs MySQL tables (§17) and Redis `kafka_batch:cron:leader_lock`.
 
 ### 2.12 Cancellation is eventually consistent
 
@@ -155,7 +157,7 @@ Go daemon **produces** legacy callback messages to `callbacks_topic` but does **
 | Tier | Responsibility | Ruby | Go |
 |------|----------------|------|-----|
 | **1 — Client** | Produce jobs & batches | `KafkaBatch::Batch` | `pkg/client` |
-| **2 — Control** | Fair forward, events, retry, callbacks produce, schedule, reclaim, reconcile | Karafka `-control`, `-dispatch-*` | `kbatch daemon` |
+| **2 — Control** | Fair forward, events, retry, callbacks produce, schedule, **recurring cron**, reclaim, reconcile | Karafka `-control`, `-dispatch-*` (+ optional Ruby recurring ticker) | `kbatch daemon` |
 | **3 — Execution** | Run handlers, emit events | Karafka `JobConsumer` | `kbatch worker` |
 
 ```
@@ -171,7 +173,8 @@ Go daemon **produces** legacy callback messages to `callbacks_topic` but does **
 ┌───────────────────────────┐   ┌──────────────┐  ┌──────────────┐
 │ Tier 2 — Control          │   │ Tier 3 Ruby  │  │ Tier 3 Go    │
 │ fair forward, events,     │   │ JobConsumer  │  │ kbatch worker│
-│ retry, schedule, reclaim  │   │ SuperFetch   │  │ SuperFetch   │
+│ retry, schedule, cron,    │   │ SuperFetch   │  │ SuperFetch   │
+│ reclaim                   │   │              │  │              │
 └───────────────────────────┘   └──────────────┘  └──────────────┘
 ```
 
@@ -198,6 +201,8 @@ App  →  Redis batch record FIRST (when batched)
                ├─ failure (retries left) → touch "executed" once → retry.{tier}
                ├─ exhausted → DLT + failed event
                └─ cancelled / expired → skip or DLT (+ failed event when batched)
+Recurring cron (MySQL) → enqueue_job → same plain/fair/priority paths as above
+SchedulePoller (delayed) → claim pointer → produce real topic → ack
 ```
 
 | Worker kind | Client produces to | Executed from |
@@ -719,9 +724,167 @@ MySQL: `kafka_batch_scheduled_jobs` when `schedule_store: :mysql`.
 
 Enable only on few pods (`KB_ROLE=scheduler` / control with poller on).
 
+**Not the same as recurring cron (§17).** Delayed jobs are one-shot `perform_in` / `perform_at` via `scheduled_topic` + pointer index. Recurring schedules live in MySQL cron tables and fire through the normal `enqueue_job` path.
+
 ---
 
-## 17. Retries, RetryCancel, dead letter
+## 17. Recurring (cron) scheduler
+
+Whenever-style **repeating cron** that enqueues a **manifest `job_type`** on a schedule. Shared by Ruby (`KafkaBatch::Recurring::*`) and Go (`pkg/cron`) against the same MySQL tables and Redis leader lock.
+
+### What it is / is not
+
+| | Recurring (§17) | Delayed jobs (§16) |
+|--|-----------------|-------------------|
+| Trigger | Cron expression + timezone | Absolute `run_at` / relative delay |
+| Storage | `kafka_batch_recurring_schedules` + `_fires` | `scheduled_topic` + Redis/MySQL pointer index |
+| Dispatch | `Batch.enqueue_job` / Go `EnqueueJob` | Poller reads Kafka payload by offset |
+| Idempotency | PK `(schedule_id, fire_at)` + deterministic `job_id` | Lease + reclaim on schedule index |
+| Accuracy | Within one `recurring_window` (default 30s) | Poll interval + lease |
+
+Does **not** run arbitrary code — only registered handlers (plain / fair / priority / uniq / retries / DLT all apply).
+
+### Architecture
+
+```
+Dashboard Recurring::Store ──upsert──► kafka_batch_recurring_schedules
+                                              ▲
+Ruby Recurring::Ticker ──┐                    │
+                         ├── Redis leader ──► Ledger claim_and_advance ──► enqueue_job
+Go pkg/cron.Ticker ──────┘   lock             kafka_batch_recurring_fires
+```
+
+| Piece | Ruby | Go |
+|-------|------|-----|
+| Loop | `Recurring::Ticker` | `pkg/cron.Ticker` |
+| Misfire plan | `Recurring::Planner` | `cron.PlanFires` |
+| Claim + ledger | `Recurring::Ledger` | `Store.ClaimAndAdvance` |
+| Leader lock | `Recurring::Lock` | `cron.Lock` |
+| List / stale health | `Recurring::Reader` | `Store.List` + heartbeat |
+| Dashboard CRUD | `Recurring::Store` + Web API | (UI is Ruby; Go daemon only fires) |
+| Boot | Railtie when `recurring_scheduler_enabled` | `StartRecurringScheduler` when YAML true |
+
+### Double-fire prevention (Go + Ruby together)
+
+Safe to run **both** tickers against one cluster:
+
+1. **Leader lock (optimization):** Redis `kafka_batch:cron:leader_lock` — SET NX EX + token-checked release. TTL = `recurring_lock_ttl` (default **60s**). Brief split-brain is OK.
+2. **Fire ledger (correctness):** `kafka_batch_recurring_fires` PRIMARY KEY `(schedule_id, fire_at)`. `INSERT IGNORE` → second emit of the same instant is a no-op. Status: `pending` → `dispatched`.
+3. **Deterministic job id:** `sched-{schedule_id}-{fire_at_unix_utc}` — recovery re-enqueue + uniq handlers stay idempotent. Go treats uniq-skip (`ErrJobSkipped`) as successful dispatch.
+
+Enable on **few scheduler/control pods**, not every execution replica.
+
+### Tick lifecycle (leader only, each `recurring_window`)
+
+1. **`dispatch_due`** — `claim_and_advance(now, batch_size, planner)`:
+   - `SELECT … WHERE enabled=1 AND next_run_at <= now FOR UPDATE SKIP LOCKED LIMIT recurring_batch_size` (default **100**)
+   - Planner → `{fires[], new_next}` per schedule
+   - INSERT IGNORE each fire; enqueue only **newly inserted** rows; update `next_run_at` / `last_fire_at`
+   - **Poison** cron/tz: disable schedule (`enabled=0`), log error
+2. **`recover`** (every `recurring_recover_every`, default **300s**): re-enqueue `pending` rows older than `recurring_recover_grace` (default **120s**) with the same `job_id`
+3. **`prune`** (every `recurring_prune_every`, default **3600s**): delete `dispatched` rows older than `recurring_prune_retention` (default **7 days**)
+4. **`heartbeat`** (every `recurring_heartbeat_every`, default **60s**): emit `cron.stale` / `cron.heartbeat` for enabled schedules past the stale threshold
+
+Enqueue failure → row stays `pending` → recover retries. Uniq duplicate on enqueue → treat as dispatched.
+
+### Misfire policies
+
+| Policy | Behavior |
+|--------|----------|
+| **`fire_once`** (default) | Fire one instant at `next_run_at`, then advance to first instant **strictly after now** |
+| **`skip`** | If lag ≤ `misfire_grace` → fire; else no fires; always advance past now |
+| **`backfill`** | Fire every missed instant while `≤ now`, capped `recurring_max_backfill` per tick (default **1000**); remainder drains later (ledger dedups) |
+
+`misfire_grace` default **60s**. Go `applyDefaults`: if grace ≤ 0 at runtime, uses `2 × window`.
+
+### Stale detection / health
+
+- Interval = gap between next two cron instants
+- Threshold = `recurring_stale_factor × interval` (default factor **2.0**)
+- Reference = `last_fire_at` else `next_run_at`; idle = `now - reference`
+- **Stale** = enabled AND idle > threshold → UI health `stale`; else `ok` / `paused`
+- Ruby interval needs **fugit**; without it, staleness is not computed (health ok/paused only)
+- Go uses built-in 5-field cron parser
+
+### Cron expressions
+
+| Runtime | Parser |
+|---------|--------|
+| Ruby | **Fugit** (`Fugit::Cron.parse`, timezone appended) |
+| Go | **5-field** min hour dom month dow + `@hourly` / `@daily` / `@weekly` / `@monthly` / `@yearly` |
+
+Invalid cron on register → API 400; poison on tick → schedule disabled.
+
+### MySQL schema
+
+**Install:** `rails g kafka_batch:install --recurring && rails db:migrate`  
+Migration: `db/migrate/20240101000005_create_kafka_batch_recurring_schedules.rb`  
+Connection: `config.schedule_store_database_connection` (Ruby) / `recurring_mysql_dsn` falling back to `schedule_mysql_dsn` (Go).
+
+Go `Store.EnsureSchema` can auto-create on boot; prefer explicit SQL in production (Go README appendix **block C**).
+
+**`kafka_batch_recurring_schedules`:** `name` (unique upsert key, `\A[a-zA-Z0-9_.:-]{1,191}\z`), `cron_expr`, `timezone` (default UTC), `job_type` (manifest key), `args_json`, `tenant_id`, `enabled`, `misfire_policy`, `next_run_at`, `last_fire_at`, indexes `uq_name`, `idx_due(enabled, next_run_at)`.
+
+**`kafka_batch_recurring_fires`:** PK `(schedule_id, fire_at)`, `status` (`pending`|`dispatched`), `job_id`, `created_at`, `dispatched_at`, index `idx_pending(status, created_at)`.
+
+### Ruby config + env
+
+| Knob | Default | Env |
+|------|---------|-----|
+| `recurring_scheduler_enabled` | false | `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED` (`1`/`true`/`yes`) |
+| `recurring_window` | 30.0 s | `KAFKA_BATCH_RECURRING_WINDOW` |
+| `recurring_lock_ttl` | 60 | `KAFKA_BATCH_RECURRING_LOCK_TTL` |
+| `recurring_batch_size` | 100 | `KAFKA_BATCH_RECURRING_BATCH_SIZE` |
+| `recurring_misfire_grace` | 60.0 | `KAFKA_BATCH_RECURRING_MISFIRE_GRACE` |
+| `recurring_max_backfill` | 1000 | `KAFKA_BATCH_RECURRING_MAX_BACKFILL` |
+| `recurring_recover_every` | 300.0 | `KAFKA_BATCH_RECURRING_RECOVER_EVERY` |
+| `recurring_recover_grace` | 120.0 | `KAFKA_BATCH_RECURRING_RECOVER_GRACE` |
+| `recurring_prune_every` | 3600.0 | `KAFKA_BATCH_RECURRING_PRUNE_EVERY` |
+| `recurring_prune_retention` | 604800 (7d) | `KAFKA_BATCH_RECURRING_PRUNE_RETENTION` |
+| `recurring_heartbeat_every` | 60.0 | `KAFKA_BATCH_RECURRING_HEARTBEAT_EVERY` |
+| `recurring_stale_factor` | 2.0 | `KAFKA_BATCH_RECURRING_STALE_FACTOR` |
+
+**Boot:** Karafka railtie starts an embedded thread when enabled. **Dedicated pod:** `rake kafka_batch:recurring:run` (loop) or `rake kafka_batch:recurring:tick` (one leader-gated pass).
+
+### Go config
+
+Same YAML key names and defaults. Extra: `recurring_mysql_dsn` (falls back to `schedule_mysql_dsn`). **No `KAFKA_BATCH_RECURRING_*` env overrides in Go `applyEnv` today** — YAML only. Enable with `recurring_scheduler_enabled: true` on the daemon.
+
+### Web UI + API
+
+Page: `/kafka_batch/recurring` (nav “Recurring”). Without migrated tables → `available: false`.
+
+| Method | Path | Action |
+|--------|------|--------|
+| GET | `/api/recurring` | List + summary `{total,enabled,stale}` + health |
+| POST | `/api/recurring` | Upsert by `name`: cron, job_type, timezone, args, tenant_id, misfire_policy, enabled |
+| PATCH/POST | `/api/recurring/:name` | `{enabled: true\|false}` |
+| DELETE | `/api/recurring/:name` | Delete |
+| POST | `/api/recurring/:name/run` | Immediate one-shot enqueue (**no** ledger row) |
+
+`job_type` accepts manifest key **or** Ruby worker class → canonicalized via `Manifest.ResolveJobType` / Go equivalent. Dashboard writes only mutate MySQL; ticker picks up within ≤ one window.
+
+### Instrumentation
+
+| Event | When |
+|-------|------|
+| `cron.fired` | Successful enqueue |
+| `cron.enqueue_failed` | Enqueue error; left pending |
+| `cron.stale` | Enabled schedule past stale threshold |
+| `cron.heartbeat` | Sweep pulse `{enabled_count, stale_count, max_stale_seconds}` |
+
+Mirrored in Go `pkg/instrument` for Datadog parity.
+
+### Deployment
+
+- Enable on 1–few control/scheduler pods (same pattern as §16 schedule poller)
+- Needs **Redis** (leader lock) + **MySQL** (tables)
+- Go-control clusters typically enable only the Go ticker; Ruby-control without Go enables the Ruby ticker; both together are safe
+- Handlers must exist in the shared manifest on the workers that will execute them
+
+---
+
+## 18. Retries, RetryCancel, dead letter
 
 ### Tiers
 
@@ -757,7 +920,7 @@ Central `Dlt.publish` → `dead_letter_topic` (30-day retention at creation). Ty
 
 ---
 
-## 18. Priority queues
+## 19. Priority queues
 
 YAML groups (Sidekiq-style):
 
@@ -782,7 +945,7 @@ Go groups: `{CG}-go-worker-{suffix}` with `priority_consumer_concurrency` member
 
 ---
 
-## 19. Cancellation and CancellationCache
+## 20. Cancellation and CancellationCache
 
 `Batch.cancel(id)` → status cancelled + cancelled index. Consumers with `skip_cancelled_jobs` (default true) skip when ID is in process-local cache.
 
@@ -798,7 +961,7 @@ Eventually consistent across pods up to TTL.
 
 ---
 
-## 20. Consumption pause / resume
+## 21. Consumption pause / resume
 
 Redis:
 
@@ -811,7 +974,7 @@ Consumers (`ConsumptionGate`) refresh every `consumption_control_refresh_interva
 
 ---
 
-## 21. Liveness
+## 22. Liveness
 
 | Key | Role |
 |-----|------|
@@ -832,7 +995,7 @@ Go: SuperFetch forces Redis heartbeats even if `liveness_enabled: false`; HTTP `
 
 ---
 
-## 22. Reconciler
+## 23. Reconciler
 
 Recovers:
 
@@ -851,7 +1014,7 @@ Triggers: EventConsumer/daemon background; `rake kafka_batch:reconcile`; `kbatch
 
 ---
 
-## 23. Instrumentation, Metrics, PerformanceMetrics
+## 24. Instrumentation, Metrics, PerformanceMetrics
 
 ### Instrumentation
 
@@ -881,7 +1044,7 @@ Best-effort; never raises into hot path.
 
 ---
 
-## 24. Stores — Redis vs MySQL
+## 25. Stores — Redis vs MySQL
 
 ### `config.store`
 
@@ -898,11 +1061,20 @@ Best-effort; never raises into hot path.
 |----------|----------|
 | ZSET index | `kafka_batch_scheduled_jobs` |
 
+### Recurring cron tables (independent of `store`; MySQL required)
+
+| Table | Role |
+|-------|------|
+| `kafka_batch_recurring_schedules` | Cron definitions (see §17) |
+| `kafka_batch_recurring_fires` | Fire ledger PK `(schedule_id, fire_at)` |
+
+Ruby binds via `schedule_store_database_connection`. Go uses `recurring_mysql_dsn` (fallback `schedule_mysql_dsn`). Install: `rails g kafka_batch:install --recurring` or Go README SQL block C / `EnsureSchema`.
+
 Hot batch counters are **never** in SQL by design.
 
 ---
 
-## 25. Topics, partitions, create_all
+## 26. Topics, partitions, create_all
 
 Ruby `KafkaBatch::Topics` / rake `kafka_batch:create_topics` / `kafka_batch:topics` (dry-run).
 
@@ -945,7 +1117,7 @@ Always includes both fairness lanes’ ingest + ready (`.ruby` / `.go`) even whe
 
 ---
 
-## 26. Deployment, consumer groups, KB_ROLE, daemon_mode
+## 27. Deployment, consumer groups, KB_ROLE, daemon_mode
 
 `CG` = `consumer_group` (default `kafka-batch`; with prefix `myapp` → `myapp.kafka-batch`).
 
@@ -970,12 +1142,12 @@ Always includes both fairness lanes’ ingest + ready (`.ruby` / `.go`) even whe
 | `{CG}-go-worker-fair-ready-{lane}` | Fair Go ready |
 | `{CG}-go-worker-{priority-suffix}` | Priority Go |
 
-### KB_ROLE (schedule poller helper — does not filter Karafka groups by itself)
+### KB_ROLE (schedule poller / recurring helper — does not filter Karafka groups by itself)
 
-| Role | Poller |
-|------|--------|
-| `all`, `scheduler` | on (generated initializer patterns) |
-| other | off unless `KB_SCHEDULE_POLLER=true` |
+| Role | Poller / recurring pattern |
+|------|----------------------------|
+| `all`, `scheduler` | schedule poller on (generated initializer); also set `recurring_scheduler_enabled` on those pods when using cron |
+| other | poller off unless `KB_SCHEDULE_POLLER=true`; recurring off unless `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED=true` / YAML |
 
 Filter groups explicitly: `karafka server --include-consumer-groups ...`.
 
@@ -985,13 +1157,13 @@ All-in-one (dev), standalone (small prod), split (scale). Mixed: Ruby or Go cont
 
 ---
 
-## 27. Web UI and JSON API
+## 28. Web UI and JSON API
 
 Mount `KafkaBatch::Web` at `/kafka_batch` behind host auth.
 
 ### Pages
 
-`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/reconciler`, `/system`, `/audit`, `/performance`, `/ai`
+`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/recurring`, `/reconciler`, `/system`, `/audit`, `/performance`, `/ai`
 
 Live refresh: localStorage `kafka_batch_live`, 5s.
 
@@ -1008,21 +1180,21 @@ Do not conflate `pending_jobs` (batch ledger) with `topic_pending` (Kafka lag). 
 
 ### System page
 
-Read-only `KafkaBatch::SystemInfo` sections: Overview, Kafka, Redis, MySQL (if store), SuperFetch, Uniqueness, Liveness, Fairness, Scheduled jobs, Retry, Reconciliation, Cancellation, Priority, Retention, Performance metrics, Instrumentation metrics, Audit, AI, optional rdkafka overrides. Secrets masked.
+Read-only `KafkaBatch::SystemInfo` sections: Overview, Kafka, Redis, MySQL (if store), SuperFetch, Uniqueness, Liveness, Fairness, Scheduled jobs, Retry, Reconciliation, Cancellation, Priority, Retention, Performance metrics, Instrumentation metrics, Audit, AI, optional rdkafka overrides. Secrets masked. Recurring schedules are managed on `/recurring` (not a dedicated SystemInfo block today).
 
 ### AI assistant
 
-Settings + shared chat at `/ai`. RAG over packaged `knowledge_chunks.json` + live config snapshot (`config:live`). OpenRouter key encrypted in Redis (`kafka_batch:ai:settings`). Never touches operational ledger/fairness/workset keys.
+Settings + shared chat at `/ai`. RAG over packaged `knowledge_chunks.json` + live config snapshot (`config:live`). OpenRouter key encrypted in Redis (`kafka_batch:ai:settings`). Never touches operational ledger/fairness/workset/cron-lock keys.
 
 ### Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)
 
-Batch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; AI settings/chat/history.
+Batch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; recurring upsert/pause/resume/delete/run-now (§17); AI settings/chat/history.
 
 Optional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.
 
 ---
 
-## 28. Redis key namespace catalog
+## 29. Redis key namespace catalog
 
 | Prefix / pattern | Subsystem |
 |------------------|-----------|
@@ -1041,6 +1213,7 @@ Optional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets maske
 | `kafka_batch:sched:pending` | Schedule index |
 | `kafka_batch:sched:inflight` | Schedule leases |
 | `kafka_batch:sched:read_miss` | Schedule read failures |
+| `kafka_batch:cron:leader_lock` | Recurring ticker leader lease (§17) |
 | `kafka_batch:fair_time:*` / `fair_throughput:*` | WFQ per lane |
 | `kafka_batch:tenant_partitions:{lane}` (+ `:free`, `:partition_count`) | Dynamic partitions |
 | `kafka_batch:work:job:*` | SuperFetch workset |
@@ -1059,7 +1232,7 @@ Assistant must not touch these operational keys.
 
 ---
 
-## 29. Kafka topic catalog
+## 30. Kafka topic catalog
 
 Defaults with empty prefix:
 
@@ -1078,7 +1251,7 @@ Defaults with empty prefix:
 
 ---
 
-## 30. Ruby configuration reference
+## 31. Ruby configuration reference
 
 All on `KafkaBatch.config`. Library `initialize` defaults below; install generator may ship larger production values.
 
@@ -1092,7 +1265,7 @@ All on `KafkaBatch.config`. Library `initialize` defaults below; install generat
 
 ### SuperFetch / uniq / cancel / liveness / consumption
 
-See sections 10, 14, 19, 21, 20.
+See sections 10, 14, 20, 22, 21.
 
 ### Retry
 
@@ -1106,47 +1279,228 @@ See sections 10, 14, 19, 21, 20.
 | `event_emit_retries` | 3 |
 | `event_emit_backoff` | 1 |
 
-### Schedule / fairness / priority / reconciler / producer / audit / metrics
+### Schedule / fairness / priority / reconciler / producer / audit / metrics / recurring
 
 See respective sections. Notable fairness defaults: `fairness_global_concurrency=50`, `fairness_ready_window=500`, `fairness_lease_ttl=1800`, `fairness_weighted_concurrency=true`, `fairness_dynamic_tenant_partitions=true`, `fairness_min_ingest_partitions=2`, `fairness_dispatcher_batch_size=50`, `fairness_dispatcher_concurrency=5`, `fairness_forwarder_idle_sleep=0.05`, `fairness_forwarding_recovery_grace=5.0`, `fairness_slot_dedup_ttl=0`, `fairness_active_count_ttl=5`, `fairness_active_count_source=:inflight_plus_ready`, `fairness_weight_cache_ttl=60`, `fairness_default_weight=1.0`, `fairness_max_inflight_per_tenant=0`.
 
+### Recurring cron (full table in §17)
+
+| Option | Default |
+|--------|---------|
+| `recurring_scheduler_enabled` | false (env `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED`) |
+| `recurring_window` | 30.0 |
+| `recurring_lock_ttl` | 60 |
+| `recurring_batch_size` | 100 |
+| `recurring_misfire_grace` | 60.0 |
+| `recurring_max_backfill` | 1000 |
+| `recurring_recover_every` | 300.0 |
+| `recurring_recover_grace` | 120.0 |
+| `recurring_prune_every` | 3600.0 |
+| `recurring_prune_retention` | 604800 |
+| `recurring_heartbeat_every` | 60.0 |
+| `recurring_stale_factor` | 2.0 |
+
+Also: `schedule_store_database_connection` (shared with MySQL delayed-job index + recurring tables).
+
 ### Env overrides (selected)
 
-`KAFKA_BATCH_SUPER_FETCH_*`, `KAFKA_BATCH_LIVENESS_*`, `KAFKA_BATCH_REDIS_POOL_SIZE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_PERFORMANCE_METRICS_*`, `KB_ROLE`, `KB_SCHEDULE_POLLER`.
+`KAFKA_BATCH_SUPER_FETCH_*`, `KAFKA_BATCH_LIVENESS_*`, `KAFKA_BATCH_REDIS_POOL_SIZE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_PERFORMANCE_METRICS_*`, `KAFKA_BATCH_RECURRING_*` (all twelve knobs in §17), `KB_ROLE`, `KB_SCHEDULE_POLLER`.
 
 ---
 
-## 31. Go configuration reference
+## 32. Go configuration reference
 
-Load `daemon.yml` → `DefaultDaemon` → YAML → `applyEnv` → `prefixTopics`. Values support `${VAR}` / `${VAR:-default}`.
+Aligned with [kafka-batch-go README appendix](https://github.com/y-shashank/kafka-batch-go) and `DefaultDaemon()` / `LoadDaemon` / `applyEnv`.
 
-### Shared env
+### Load order
 
-`KAFKA_BROKERS`, `REDIS_URL`, `KAFKA_PREFIX`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_SCHEDULE_MYSQL_DSN`, `KAFKA_BATCH_STORE_MYSQL_DSN`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, metrics/liveness/performance env vars, consumer fetch/acks/stall, SF concurrency/claim window, cancellation TTL, jobs/fair/priority consumer concurrency.
+`DefaultDaemon()` → YAML file → `${VAR}` / `${VAR:-default}` expansion → field merge → `applyEnv()` → `prefixTopics()`.
 
-MySQL DSNs accept go-sql-driver form or `mysql2://` / `mysql://` URLs.
+Most numeric YAML values only override when **positive** (zeros often mean “keep default”).
 
-### Go-only knobs
+### Kafka & identity
 
-| Knob | Default | Purpose |
-|------|---------|---------|
-| `jobs_consumer_concurrency` | 8 | In-process members plain jobs |
-| `fair_ready_consumer_concurrency` | 8 | Members per fair-ready lane |
-| `priority_consumer_concurrency` | 4 | Members per priority group |
-| `producer_required_acks` | `all_isr` | or `leader` |
-| `consumer_fetch_max_bytes` | 1 MiB | |
-| `consumer_fetch_max_partition_bytes` | 128 KiB | |
-| `consumer_fetch_max_wait_ms` | 200 | |
-| `consumer_stall_timeout` | 90s | Force reconnect on stall |
-| `fairness_enabled` | false | Daemon gate for fair dispatch |
-| `liveness_enabled` | false | HTTP health (Redis HB still on for SF) |
-| `liveness_http_addr` | `:8080` | |
+| Key | Default |
+|-----|---------|
+| `brokers` | `["localhost:9092"]` |
+| `topic_prefix` | `""` |
+| `consumer_group` | `kafka-batch` |
+| `node_id` | hostname#pid |
+| `handler_manifest` | path string |
+| `jobs_topics` | derived from manifest if empty |
+| `redis_url` | `redis://localhost:6379/0` |
+
+### Core topics
+
+| Key | Default |
+|-----|---------|
+| `events_topic` | `kafka_batch.events` |
+| `callbacks_topic` | `kafka_batch.callbacks` |
+| `dead_letter_topic` | `kafka_batch.dead_letter` |
+| `retry_topic` | `kafka_batch.jobs.retry` (base; tiers append `.short`/`.medium`/`.large`) |
+
+### Retry / producer / fetch
+
+| Key | Default |
+|-----|---------|
+| `max_retries` | 7 |
+| `retry_tiers` | short 30 / medium 420 / large 1200 (seconds) |
+| `retry_max_pause` | 30 s |
+| `producer_required_acks` | `all_isr` (`leader` allowed) |
+| `consumer_fetch_max_bytes` | 1048576 (1 MiB) |
+| `consumer_fetch_max_partition_bytes` | 131072 (128 KiB) |
+| `consumer_fetch_max_wait_ms` | 200 |
+| `consumer_stall_timeout` | 90 s |
+
+**Code-only (not YAML today):** `retry_jitter` 0.1, `event_emit_retries` 3, `event_emit_backoff` 1s, `batch_ttl` 7d, `retry_progression` short→medium→large.
+
+### Worker throughput (`kbatch worker`)
+
+| Key | Default |
+|-----|---------|
+| `jobs_consumer_concurrency` | 8 |
+| `fair_ready_consumer_concurrency` | 8 |
+| `priority_consumer_concurrency` | 4 |
+| `super_fetch_concurrency` | 10 |
+| `super_fetch_claim_window` | 0 → **2×** concurrency |
+| `super_fetch_lease_ttl` | 120 s |
+| `super_fetch_reclaim_interval` | 30 s |
+| `super_fetch_reclaim_limit` | 100 |
+| `super_fetch_orphan_grace` | 40 s |
+| `super_fetch_drain_timeout` | 30 s |
+| `execution_mode` | `superfetch` (`watermark` advanced — Redis-free offset watermark; requires idempotent handlers; one mode per topic) |
+
+### Delayed jobs (SchedulePoller)
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `schedule_poller_enabled` | false | Scheduler/control pods only |
+| `scheduled_topic` | `kafka_batch.scheduled` | |
+| `schedule_store` | empty → **redis** | `mysql` needs SQL block A |
+| `schedule_mysql_dsn` | | env `KAFKA_BATCH_SCHEDULE_MYSQL_DSN` |
+| `schedule_poll_interval` | 5 s | |
+| `schedule_poll_max_interval` | 60 s | |
+| `schedule_poll_jitter` | **0** | ⚠️ set `0.1` for Ruby parity |
+| `schedule_batch_size` | 100 | |
+| `schedule_lease_seconds` | 60 | |
+| `schedule_reclaim_interval` | 30 s | |
+
+### Recurring cron (see §17)
+
+| Key | Default |
+|-----|---------|
+| `recurring_scheduler_enabled` | false |
+| `recurring_mysql_dsn` | falls back to `schedule_mysql_dsn` |
+| `recurring_window` | 30 s |
+| `recurring_lock_ttl` | 60 s |
+| `recurring_batch_size` | 100 |
+| `recurring_misfire_grace` | 60 s |
+| `recurring_max_backfill` | 1000 |
+| `recurring_recover_every` | 300 s |
+| `recurring_recover_grace` | 120 s |
+| `recurring_prune_every` | 3600 s |
+| `recurring_prune_retention` | 604800 s (7d) |
+| `recurring_heartbeat_every` | 60 s |
+| `recurring_stale_factor` | 2.0 |
+
+No `KAFKA_BATCH_RECURRING_*` env vars in Go today — YAML only.
+
+### Priority
+
+| Key | Default |
+|-----|---------|
+| `priority_config_paths` | `[]` |
+| `priority_lag_check_interval` | 2 s |
+| `priority_weighted_interleave` | 4 |
+
+### Fairness
+
+| Key | Default | Notes |
+|-----|---------|-------|
+| `fairness_enabled` | **false** | Must set true for fair dispatch |
+| `fairness_time_ingest` / `_ready` / `_ready_go` / `_ready_ruby` | `kafka_batch.fair_time_*` | |
+| `fairness_throughput_ingest` / `_ready` / `_ready_go` / `_ready_ruby` | `kafka_batch.fair_throughput_*` | |
+| `fairness_ready_window` | **100** | ⚠️ Ruby 500 — set 500 for parity |
+| `fairness_global_concurrency` | 50 | |
+| `fairness_max_inflight_per_tenant` | 0 | 0 = dynamic share |
+| `fairness_lease_ttl` | 1800 s | |
+| `fairness_default_weight` | 1.0 | |
+| `fairness_weighted_concurrency` | true | |
+| `fairness_active_count_ttl` | 5 s | |
+| `fairness_active_count_source` | `inflight_plus_ready` | or `inflight` |
+| `fairness_dynamic_tenant_partitions` | true | |
+| `fairness_tenant_partition_cache_ttl` | 30 s | |
+| `fairness_tenant_partitions` | map | static pins win |
+
+### Store / cancel / consumption / reconciler
+
+| Key | Default |
+|-----|---------|
+| `store` | redis (`mysql` → SQL block B) |
+| `store_mysql_dsn` | env `KAFKA_BATCH_STORE_MYSQL_DSN` |
+| `skip_cancelled_jobs` | true |
+| `cancellation_cache_ttl` | 120 s |
+| `consumption_control_refresh_interval` | 30 s |
+| `reconciliation_interval` | 300 s |
+| `reconciler_lock_ttl` | 600 s |
+| `max_reconcile_per_run` | 100 |
+
+### Liveness / metrics / performance
+
+| Key | Default |
+|-----|---------|
+| `liveness_enabled` | false |
+| `liveness_http_addr` | `:8080` |
+| `liveness_ttl` | 180 s |
+| `liveness_heartbeat_interval` | 20 s |
+| `track_running_jobs` | true |
+| `metrics_enabled` | false |
+| `metrics_prefix` | `kafka_batch` |
+| `metrics_statsd_addr` | |
+| `performance_metrics_enabled` | false |
+| `performance_metrics_retention` | 86400 s |
+| `performance_metrics_max_job_types` | 50 |
+| `performance_metrics_bucket_seconds` | 60 |
+| `performance_metrics_sample_rate` | 1.0 |
+| `redis_rtt_probe_interval` | 15 s |
+| `redis_rtt_probe_timeout` | 0.2 s |
+
+### Env overrides (`applyEnv` — complete list)
+
+`KAFKA_BROKERS`, `KAFKA_PREFIX`, `REDIS_URL`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_SCHEDULE_MYSQL_DSN`, `KAFKA_BATCH_STORE_MYSQL_DSN`, `KAFKA_BATCH_PRIORITY_CONFIG`, `KAFKA_BATCH_PRIORITY_CONFIGS`, `KAFKA_BATCH_METRICS_ENABLED`, `KAFKA_BATCH_METRICS_PREFIX`, `KAFKA_BATCH_METRICS_STATSD_ADDR`, `KAFKA_BATCH_LIVENESS_ENABLED`, `KAFKA_BATCH_LIVENESS_HTTP_ADDR`, `KAFKA_BATCH_LIVENESS_TTL`, `KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL`, `KAFKA_BATCH_PERFORMANCE_METRICS_ENABLED`, `KAFKA_BATCH_PERFORMANCE_METRICS_RETENTION`, `KAFKA_BATCH_PERFORMANCE_METRICS_MAX_JOB_TYPES`, `KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE`, `KAFKA_BATCH_REDIS_RTT_PROBE_INTERVAL`, `KAFKA_BATCH_REDIS_RTT_PROBE_TIMEOUT`, `KAFKA_BATCH_RETRY_MAX_PAUSE`, `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS`, `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_SKIP_CANCELLED_JOBS`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_CANCELLATION_CACHE_TTL`, `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY`, `KAFKA_BATCH_SUPER_FETCH_CLAIM_WINDOW`, `KAFKA_BATCH_EXECUTION_MODE`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS`, `KAFKA_BATCH_CONSUMER_STALL_TIMEOUT`.
+
+MySQL DSNs: go-sql-driver form **or** `mysql2://` / `mysql://` URLs.
+
+### Handler manifest (`kafka_batch_handlers.yml`)
+
+| Field | Purpose |
+|-------|---------|
+| `runtime` | `go` \| `ruby` (required) |
+| `worker_class` | Ruby constant (required if ruby) |
+| `topic` | Plain job topic (default jobs topic) |
+| `apply_topic_prefix` | Prepend `topic_prefix` |
+| `max_retries` | Override daemon default |
+| `retry_tier` | `short` \| `medium` \| `large` |
+| `fairness_type` | `time` \| `throughput` (no plain topic) |
+| `uniq` | Fingerprint dedupe |
+
+YAML map key = wire `job_type`. Recurring schedules must reference these keys (or a resolvable worker class name).
+
+### MySQL DDL (Go-only bootstrap)
+
+| Block | Tables | When |
+|-------|--------|------|
+| **A** | `kafka_batch_scheduled_jobs` | `schedule_store: mysql` |
+| **B** | `kafka_batch_failures`, `kafka_batch_consumption_pauses` | `store: mysql` |
+| **C** | `kafka_batch_recurring_schedules`, `kafka_batch_recurring_fires` | recurring enabled |
+
+Full SQL + annotated `daemon.yml` live in the Go README appendix. Batch ledger / uniq / fair weights **always Redis**.
 
 Control plane scales by **pods + partitions** (one franz-go client per group per pod; events fan out per partition).
 
 ---
 
-## 32. Ruby ↔ Go parity gaps
+## 33. Ruby ↔ Go parity gaps
 
 | Setting | Ruby | Go | Action |
 |---------|------|-----|--------|
@@ -1158,10 +1512,14 @@ Control plane scales by **pods + partitions** (one franz-go client per group per
 | SF lease/grace/reclaim env | many `KAFKA_BATCH_SUPER_FETCH_*` | often YAML-only | Set in daemon.yml |
 | `fairness_min_ingest_partitions` | 2 (warn) | internal | Ops often size ingest to 300 |
 | `max_retries` docs | README table may say 3 | both library 7 | Prefer Configuration / YAML |
+| Recurring env overrides | all `KAFKA_BATCH_RECURRING_*` | **YAML only** | Set daemon.yml for Go |
+| Cron parser | Fugit (needs gem) | built-in 5-field + macros | Prefer portable 5-field exprs |
+| Recurring UI writes | Ruby Web API | — | Dashboard is Ruby even under Go control |
+| Recurring auto-schema | migrate `--recurring` | `EnsureSchema` on boot | Prefer explicit SQL in prod |
 
 ---
 
-## 33. Atomicity and idempotency matrix
+## 34. Atomicity and idempotency matrix
 
 | Feature | Atomic primitive | Idempotency expectation |
 |---------|------------------|-------------------------|
@@ -1177,19 +1535,20 @@ Control plane scales by **pods + partitions** (one franz-go client per group per
 | Fairness forward | Forwarding HASH | Crash-safe pop→produce |
 | Uniqueness | SETNX + compare-del | Duplicate enqueue skipped/raised; fail-open on Redis error |
 | Schedule dispatch | Lease + reclaim | At-least-once due dispatch |
+| Recurring fire | `(schedule_id, fire_at)` INSERT IGNORE + `sched-{id}-{unix}` job id | At-most-once emit per instant; at-least-once perform (Kafka) |
 | Reconciler | `SET NX EX` | Single sweeper |
 | Job `#perform` | — | **Always application-idempotent** |
 | Job callbacks | Deterministic `job_id` | **Always application-idempotent** |
 
 ---
 
-## 34. Scaling and tuning
+## 35. Scaling and tuning
 
 1. Partitions ≥ peak_pods × (Karafka concurrency or Go members) × SuperFetch concurrency.
 2. Ruby: prefer pods over huge SF for CPU; keep product ≤ 10 in prod unless tested.
 3. Go: members ≈ partitions; SF ~50×cores for IO; 1–2×cores for CPU.
 4. `fairness_lease_ttl` and `super_fetch_lease_ttl` above longest job (+ renew margin).
-5. Schedule poller only on few control/scheduler pods.
+5. Schedule poller **and** recurring ticker only on few control/scheduler pods.
 6. Workset reclaim on ≥1 control plane sharing Redis.
 7. Autoscale on lag; partitions fixed.
 8. Cap/shard mega-batches.
@@ -1215,13 +1574,22 @@ schedule_poll_jitter: 0.1
 
 ---
 
-## 35. Operator cheat sheet
+## 36. Operator cheat sheet
 
 ```bash
 # Topics
 REPLICATION_FACTOR=1 PARTITIONS=12 bundle exec rake kafka_batch:create_topics
 bundle exec rake kafka_batch:topics
-kbatch topics create --brokers ... --manifest ...
+kbatch topics create --brokers ... --manifest ... --include-control
+
+# Recurring MySQL (pick one)
+bundle exec rails generate kafka_batch:install --recurring && rails db:migrate
+# or copy SQL block C from kafka-batch-go README appendix
+
+# Recurring ticker (Ruby dedicated pod)
+KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED=true bundle exec rake kafka_batch:recurring:run
+# one-shot leader-gated pass:
+bundle exec rake kafka_batch:recurring:tick
 
 # Reconciler
 bundle exec rake kafka_batch:reconcile
@@ -1233,16 +1601,16 @@ KB_ROLE=all bundle exec karafka server
 # API only
 KAFKA_BATCH_DAEMON_MODE=1 bundle exec puma
 
-# Go control + worker
+# Go control + worker (enable recurring in daemon.yml)
 kbatch daemon --config config/daemon.yml
 kbatch worker --config config/daemon.yml
 ```
 
-Typical env: `KAFKA_BROKERS`, `REDIS_URL`, `KAFKA_PREFIX`, `KB_ROLE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`.
+Typical env: `KAFKA_BROKERS`, `REDIS_URL`, `KAFKA_PREFIX`, `KB_ROLE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED`, `KAFKA_BATCH_SCHEDULE_MYSQL_DSN` / `KAFKA_BATCH_STORE_MYSQL_DSN`.
 
 ---
 
-## 36. Document maintenance
+## 37. Document maintenance
 
 When adding a feature or knob:
 
@@ -1289,7 +1657,7 @@ This file intentionally expands beyond the root README so the assistant has a se
 
 ---
 
-## 37. Batch hash fields (Redis)
+## 38. Batch hash fields (Redis)
 
 Typical fields on `kafka_batch:b:{id}` (names may evolve; treat as operational contract mirrored in Go store):
 
@@ -1314,7 +1682,7 @@ Indexes: `index:running`, `index:done`, `index:all`, `index:cancelled`; aggregat
 
 ---
 
-## 38. Instrumentation event catalog (Ruby)
+## 39. Instrumentation event catalog (Ruby)
 
 Subscribe via ActiveSupport::Notifications (`*.kafka_batch`) or Metrics bridge. Notable events:
 
@@ -1334,12 +1702,13 @@ Subscribe via ActiveSupport::Notifications (`*.kafka_batch`) or Metrics bridge. 
 | `workset.reclaimed` | Orphan reclaim sweep |
 | `super_fetch.drained` | Graceful shutdown drain |
 | `scheduled.claimed` / related | Schedule poller |
+| `cron.fired` / `cron.enqueue_failed` / `cron.stale` / `cron.heartbeat` | Recurring ticker (§17) |
 
-Go `pkg/instrument` mirrors the cross-runtime subset (including `workset.reclaimed`, `super_fetch.drained`).
+Go `pkg/instrument` mirrors the cross-runtime subset (including `workset.reclaimed`, `super_fetch.drained`, `cron.*`).
 
 ---
 
-## 39. Client produce safety and partial failure
+## 40. Client produce safety and partial failure
 
 ### Ordering invariant
 Redis batch mutations that reserve `batch_seq` happen **before** or tightly around Kafka produce. On produce failure, client attempts:
@@ -1358,7 +1727,7 @@ Chunks preserve contiguous `batch_seq` while pipelining `produce_many_sync`.
 
 ---
 
-## 40. Fairness Lua responsibilities (summary)
+## 41. Fairness Lua responsibilities (summary)
 
 | Script | Role |
 |--------|------|
@@ -1372,7 +1741,7 @@ In-flight is **derived from lease ZSETs**, not a brittle counter — expired lea
 
 ---
 
-## 41. ConsumptionGate and PriorityGate interaction
+## 42. ConsumptionGate and PriorityGate interaction
 
 1. **ConsumptionGate** — if topic/partition paused in Redis snapshot, consumer does not process (refresh ≤30s).
 2. **PriorityGate** — lower ranks check higher-topic lag; paused higher topics count as inactive so lower ranks proceed.
@@ -1380,7 +1749,7 @@ In-flight is **derived from lease ZSETs**, not a brittle counter — expired lea
 
 ---
 
-## 42. Empty and edge batches
+## 43. Empty and edge batches
 
 | Case | Behavior |
 |------|----------|
@@ -1391,7 +1760,7 @@ In-flight is **derived from lease ZSETs**, not a brittle counter — expired lea
 
 ---
 
-## 43. Go client API mirror
+## 44. Go client API mirror
 
 | Go API | Ruby analogue |
 |--------|----------------|
@@ -1406,7 +1775,7 @@ BatchOptions: OnSuccess, OnComplete, Meta, CallbackArgs, Description, TenantID. 
 
 ---
 
-## 44. README drift vs library defaults (operators)
+## 45. README drift vs library defaults (operators)
 
 | Topic | Library default | Often documented / install |
 |-------|-----------------|----------------------------|

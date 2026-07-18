@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "built_at": "2026-07-17T12:18:21Z",
+  "built_at": "2026-07-18T08:59:21Z",
   "max_chars": 2800,
-  "readme_sha256": "65e51ec8e6c66b901e374073b1c3cd24fa2969b0fe906c1a6f027517d924d457",
-  "faq_sha256": "46cd5c2055c834e23c1bc63b4eb9c76cb5ba782ab963f46d6580e3b1e3d2acce",
-  "chunk_count": 387,
+  "readme_sha256": "f828a098d9f99b0761b5980e7d0be561f14bbafadcfa714b54edd72cba67f036",
+  "faq_sha256": "2a045381ed0e653091e6678681706dba77b784b9e6013487b0b3eac69f4f4104",
+  "chunk_count": 426,
   "chunks": [
     {
       "id": "readme-introduction-939750e33df47b89",
@@ -14,8 +14,8 @@
         "Introduction"
       ],
       "section": "Introduction",
-      "text": "Introduction\n\n# kafka-batch AI knowledge base\n\n> **Purpose.** Canonical corpus for the kafka-batch Web UI assistant (RAG). Covers architecture, every major subsystem, Redis/Kafka contracts, configuration knobs (Ruby gem + Go companion), SuperFetch, fairness, batches, retries, delayed jobs, and how each piece preserves **atomicity** and **idempotency**.\n>\n> **Assistant safety rule.** Answers must be derived from this knowledge base, `ai/FAQ.md`, and the **live configuration snapshot** (`config:live` / `topic_inventory`) when present. The assistant must **never** read, write, or mutate live Redis keys used by the batch ledger, fairness scheduler, workset, uniqueness locks, schedule index, liveness, consumption pause, retry-cancel, reconciler, or performance counters. Separate assistant Redis keys (API-key ciphertext, knowledge chunks, chat history) are not operational kafka-batch state. For live partition counts use `live_broker_partitions` from the snapshot — not DEFAULT_PARTITIONS documentation.\n\nCompanion repos:\n\n| Repo | Role |\n|------|------|\n| [kafka-batch](https://github.com/y-shashank/kafka-batch) | Ruby client, Karafka control + Ruby execution, Web UI |\n| [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) | Go client, `kbatch daemon` (control), `kbatch worker` (Go execution) |\n\nBoth runtimes share **Kafka topics** and **Redis** contracts. Pick one language per tier; tiers talk only through Kafka + Redis.\n\n**Critical deployment rule:** never run Go `kbatch daemon` and Ruby `{CG}-control` / `{CG}-dispatch-*` on the **same** events/retry/fair-ingest topics — that double-consumes. One control plane per cluster (or carefully partitioned topic sets).\n\n---",
-      "char_count": 1696
+      "text": "Introduction\n\n# kafka-batch AI knowledge base\n\n> **Purpose.** Canonical corpus for the kafka-batch Web UI assistant (RAG). Covers architecture, every major subsystem, Redis/Kafka contracts, configuration knobs (Ruby gem + Go companion), SuperFetch, fairness, batches, retries, delayed jobs, **recurring cron**, and how each piece preserves **atomicity** and **idempotency**.\n>\n> **Assistant safety rule.** Answers must be derived from this knowledge base, `ai/FAQ.md`, and the **live configuration snapshot** (`config:live` / `topic_inventory`) when present. The assistant must **never** read, write, or mutate live Redis keys used by the batch ledger, fairness scheduler, workset, uniqueness locks, schedule index, **recurring leader lock**, liveness, consumption pause, retry-cancel, reconciler, or performance counters. Separate assistant Redis keys (API-key ciphertext, knowledge chunks, chat history) are not operational kafka-batch state. For live partition counts use `live_broker_partitions` from the snapshot — not DEFAULT_PARTITIONS documentation.\n\nCompanion repos:\n\n| Repo | Role |\n|------|------|\n| [kafka-batch](https://github.com/y-shashank/kafka-batch) | Ruby client, Karafka control + Ruby execution, Web UI |\n| [kafka-batch-go](https://github.com/y-shashank/kafka-batch-go) | Go client, `kbatch daemon` (control), `kbatch worker` (Go execution) |\n\nBoth runtimes share **Kafka topics** and **Redis** contracts. Pick one language per tier; tiers talk only through Kafka + Redis.\n\n**Critical deployment rule:** never run Go `kbatch daemon` and Ruby `{CG}-control` / `{CG}-dispatch-*` on the **same** events/retry/fair-ingest topics — that double-consumes. One control plane per cluster (or carefully partitioned topic sets).\n\n---",
+      "char_count": 1743
     },
     {
       "id": "readme-1-what-kafka-batch-is-84a4ce9d6fcc4a58",
@@ -25,8 +25,8 @@
         "1. What kafka-batch is"
       ],
       "section": "1. What kafka-batch is",
-      "text": "1. What kafka-batch is\n\n**Sidekiq Pro Batches on Kafka.** Same `on_success` / `on_complete` callback model, per-job retries, and batch completion counting — with Kafka as the durable job transport and Redis for coordination.\n\n| Layer | Transport | Role |\n|---|---|---|\n| Job execution | Kafka worker topics | Ruby `JobConsumer` / Go `kbatch worker` |\n| Completion counting | Kafka events + Redis bitmaps | `EventConsumer` / Go events processor |\n| Callbacks | Kafka callbacks or app callback topics | `CallbackConsumer` or job callbacks |\n| Batch state | Redis hash + bitmaps | Counters, status, callback claim |\n| Fairness ordering | Kafka ingest → Redis WFQ → Kafka ready | Dispatcher + Forwarder |\n| Delayed jobs | Kafka scheduled + Redis/MySQL index | SchedulePoller |\n| In-flight execution ledger | Redis workset | SuperFetch claim / renew / complete / reclaim |\n\n**Redis is always required.** There is no Redis-free mode.\n\n**Guarantee slogan:** the framework makes **coordination** atomic and **counting** idempotent; the application makes **business effects** idempotent under at-least-once delivery.\n\n---",
-      "char_count": 1112
+      "text": "1. What kafka-batch is\n\n**Sidekiq Pro Batches on Kafka.** Same `on_success` / `on_complete` callback model, per-job retries, and batch completion counting — with Kafka as the durable job transport and Redis for coordination.\n\n| Layer | Transport | Role |\n|---|---|---|\n| Job execution | Kafka worker topics | Ruby `JobConsumer` / Go `kbatch worker` |\n| Completion counting | Kafka events + Redis bitmaps | `EventConsumer` / Go events processor |\n| Callbacks | Kafka callbacks or app callback topics | `CallbackConsumer` or job callbacks |\n| Batch state | Redis hash + bitmaps | Counters, status, callback claim |\n| Fairness ordering | Kafka ingest → Redis WFQ → Kafka ready | Dispatcher + Forwarder |\n| Delayed jobs | Kafka scheduled + Redis/MySQL index | SchedulePoller |\n| Recurring cron | MySQL schedules + fire ledger | Ruby `Recurring::Ticker` / Go `pkg/cron` |\n| In-flight execution ledger | Redis workset | SuperFetch claim / renew / complete / reclaim |\n\n**Redis is always required.** There is no Redis-free mode.\n\n**Guarantee slogan:** the framework makes **coordination** atomic and **counting** idempotent; the application makes **business effects** idempotent under at-least-once delivery.\n\n---",
+      "char_count": 1206
     },
     {
       "id": "readme-2-non-negotiable-pitfalls-2-1-jobs-are-at-least-f58d4d957e81c43f",
@@ -149,16 +149,16 @@
       "char_count": 160
     },
     {
-      "id": "readme-2-non-negotiable-pitfalls-2-11-schedule-poller-o-246ed3638f1ca736",
+      "id": "readme-2-non-negotiable-pitfalls-2-11-schedule-poller-a-6c5e57f1bf9c8491",
       "source": "readme",
-      "title": "2.11 Schedule poller off by default",
+      "title": "2.11 Schedule poller and recurring ticker off by default",
       "heading_path": [
         "2. Non-negotiable pitfalls",
-        "2.11 Schedule poller off by default"
+        "2.11 Schedule poller and recurring ticker off by default"
       ],
       "section": "2. Non-negotiable pitfalls",
-      "text": "2. Non-negotiable pitfalls › 2.11 Schedule poller off by default\n\nEnable only on a few scheduler/control pods.",
-      "char_count": 110
+      "text": "2. Non-negotiable pitfalls › 2.11 Schedule poller and recurring ticker off by default\n\nEnable only on a few scheduler/control pods. Both `schedule_poller_enabled` and `recurring_scheduler_enabled` default **false**. Recurring also needs MySQL tables (§17) and Redis `kafka_batch:cron:leader_lock`.",
+      "char_count": 297
     },
     {
       "id": "readme-2-non-negotiable-pitfalls-2-12-cancellation-is-e-b4554ea580c02f95",
@@ -240,8 +240,8 @@
         "3. Three-tier architecture"
       ],
       "section": "3. Three-tier architecture",
-      "text": "3. Three-tier architecture\n\n| Tier | Responsibility | Ruby | Go |\n|------|----------------|------|-----|\n| **1 — Client** | Produce jobs & batches | `KafkaBatch::Batch` | `pkg/client` |\n| **2 — Control** | Fair forward, events, retry, callbacks produce, schedule, reclaim, reconcile | Karafka `-control`, `-dispatch-*` | `kbatch daemon` |\n| **3 — Execution** | Run handlers, emit events | Karafka `JobConsumer` | `kbatch worker` |\n\n```\n┌─────────────────────────────────────────────────────────────────┐\n│  Tier 1 — Client (enqueue Ruby + Go via job_type)               │\n└───────────────────────────────┬─────────────────────────────────┘\n                                │ produce\n                                ▼\n┌─────────────────────────────────────────────────────────────────┐\n│  Kafka + Redis (shared contracts — do not fork)                 │\n└───────────────┬───────────────────────────────┬─────────────────┘\n                ▼                               ▼\n┌───────────────────────────┐   ┌──────────────┐  ┌──────────────┐\n│ Tier 2 — Control          │   │ Tier 3 Ruby  │  │ Tier 3 Go    │\n│ fair forward, events,     │   │ JobConsumer  │  │ kbatch worker│\n│ retry, schedule, reclaim  │   │ SuperFetch   │  │ SuperFetch   │\n└───────────────────────────┘   └──────────────┘  └──────────────┘\n```\n\nGo CLI:\n\n| Command | Role |\n|---------|------|\n| `kbatch daemon --config` | Control plane |\n| `kbatch worker --config` | Go execution |\n| `kbatch reconcile --config` | One-shot reconciler |\n| `kbatch topics create/validate` | Topic provisioning |\n| `kbatch version` | Version |\n\n---",
-      "char_count": 1592
+      "text": "3. Three-tier architecture\n\n| Tier | Responsibility | Ruby | Go |\n|------|----------------|------|-----|\n| **1 — Client** | Produce jobs & batches | `KafkaBatch::Batch` | `pkg/client` |\n| **2 — Control** | Fair forward, events, retry, callbacks produce, schedule, **recurring cron**, reclaim, reconcile | Karafka `-control`, `-dispatch-*` (+ optional Ruby recurring ticker) | `kbatch daemon` |\n| **3 — Execution** | Run handlers, emit events | Karafka `JobConsumer` | `kbatch worker` |\n\n```\n┌─────────────────────────────────────────────────────────────────┐\n│  Tier 1 — Client (enqueue Ruby + Go via job_type)               │\n└───────────────────────────────┬─────────────────────────────────┘\n                                │ produce\n                                ▼\n┌─────────────────────────────────────────────────────────────────┐\n│  Kafka + Redis (shared contracts — do not fork)                 │\n└───────────────┬───────────────────────────────┬─────────────────┘\n                ▼                               ▼\n┌───────────────────────────┐   ┌──────────────┐  ┌──────────────┐\n│ Tier 2 — Control          │   │ Tier 3 Ruby  │  │ Tier 3 Go    │\n│ fair forward, events,     │   │ JobConsumer  │  │ kbatch worker│\n│ retry, schedule, cron,    │   │ SuperFetch   │  │ SuperFetch   │\n│ reclaim                   │   │              │  │              │\n└───────────────────────────┘   └──────────────┘  └──────────────┘\n```\n\nGo CLI:\n\n| Command | Role |\n|---------|------|\n| `kbatch daemon --config` | Control plane |\n| `kbatch worker --config` | Go execution |\n| `kbatch reconcile --config` | One-shot reconciler |\n| `kbatch topics create/validate` | Topic provisioning |\n| `kbatch version` | Version |\n\n---",
+      "char_count": 1714
     },
     {
       "id": "readme-4-end-to-end-data-flow-5c7ab90150437fc6",
@@ -251,8 +251,8 @@
         "4. End-to-end data flow"
       ],
       "section": "4. End-to-end data flow",
-      "text": "4. End-to-end data flow\n\n```\nApp  →  Redis batch record FIRST (when batched)\n     →  Kafka (plain topic | fair ingest | scheduled)\n          → [fair path] Dispatcher → Redis WFQ → Forwarder → ready[.ruby|.go]\n          → Execution SuperFetch: Claim → Kafka mark → perform pool\n               ├─ success  → events → EventConsumer (bitmaps) → callbacks\n               ├─ failure (retries left) → touch \"executed\" once → retry.{tier}\n               ├─ exhausted → DLT + failed event\n               └─ cancelled / expired → skip or DLT (+ failed event when batched)\n```\n\n| Worker kind | Client produces to | Executed from |\n|-------------|-------------------|---------------|\n| Plain Ruby | `kafka_topic` or `jobs_topic` | `{CG}-jobs` |\n| Plain Go | manifest `topic` | `{CG}-go-worker-jobs` |\n| Fair Ruby | ingest → `fair_*_ready.ruby` | `{CG}-jobs-fair-*` |\n| Fair Go | ingest → `fair_*_ready.go` | `{CG}-go-worker-fair-ready-*` |\n| Priority | YAML topics | `{CG}-<suffix>` or `{CG}-go-worker-<suffix>` |\n| Delayed | `scheduled_topic` + index | re-produced when due |\n| Fair retry | **ready** (skip ingest/WFQ) | same ready consumers |\n\n---",
-      "char_count": 1137
+      "text": "4. End-to-end data flow\n\n```\nApp  →  Redis batch record FIRST (when batched)\n     →  Kafka (plain topic | fair ingest | scheduled)\n          → [fair path] Dispatcher → Redis WFQ → Forwarder → ready[.ruby|.go]\n          → Execution SuperFetch: Claim → Kafka mark → perform pool\n               ├─ success  → events → EventConsumer (bitmaps) → callbacks\n               ├─ failure (retries left) → touch \"executed\" once → retry.{tier}\n               ├─ exhausted → DLT + failed event\n               └─ cancelled / expired → skip or DLT (+ failed event when batched)\nRecurring cron (MySQL) → enqueue_job → same plain/fair/priority paths as above\nSchedulePoller (delayed) → claim pointer → produce real topic → ack\n```\n\n| Worker kind | Client produces to | Executed from |\n|-------------|-------------------|---------------|\n| Plain Ruby | `kafka_topic` or `jobs_topic` | `{CG}-jobs` |\n| Plain Go | manifest `topic` | `{CG}-go-worker-jobs` |\n| Fair Ruby | ingest → `fair_*_ready.ruby` | `{CG}-jobs-fair-*` |\n| Fair Go | ingest → `fair_*_ready.go` | `{CG}-go-worker-fair-ready-*` |\n| Priority | YAML topics | `{CG}-<suffix>` or `{CG}-go-worker-<suffix>` |\n| Delayed | `scheduled_topic` + index | re-produced when due |\n| Fair retry | **ready** (skip ingest/WFQ) | same ready consumers |\n\n---",
+      "char_count": 1284
     },
     {
       "id": "readme-5-workers-job-type-handlerregistry-handlermanife-032a16dc8be974bd",
@@ -797,679 +797,1014 @@
         "Failure modes"
       ],
       "section": "16. Delayed jobs — SchedulePoller",
-      "text": "16. Delayed jobs — SchedulePoller › Failure modes\n\n- Payload missing (retention) → drop + ack\n- Many read misses → drop\n- Produce failure → leave leased → reclaim → duplicate-safe dispatch\n- Cancelled batch → skip via CancellationCache\n\nEnable only on few pods (`KB_ROLE=scheduler` / control with poller on).\n\n---",
-      "char_count": 313
+      "text": "16. Delayed jobs — SchedulePoller › Failure modes\n\n- Payload missing (retention) → drop + ack\n- Many read misses → drop\n- Produce failure → leave leased → reclaim → duplicate-safe dispatch\n- Cancelled batch → skip via CancellationCache\n\nEnable only on few pods (`KB_ROLE=scheduler` / control with poller on).\n\n**Not the same as recurring cron (§17).** Delayed jobs are one-shot `perform_in` / `perform_at` via `scheduled_topic` + pointer index. Recurring schedules live in MySQL cron tables and fire through the normal `enqueue_job` path.\n\n---",
+      "char_count": 543
     },
     {
-      "id": "readme-17-retries-retrycancel-dead-letter-tiers-a2dbb03060864708",
+      "id": "readme-17-recurring-cron-scheduler-54d5baf32ea5febf",
       "source": "readme",
-      "title": "Tiers",
+      "title": "17. Recurring (cron) scheduler",
       "heading_path": [
-        "17. Retries, RetryCancel, dead letter",
-        "Tiers"
+        "17. Recurring (cron) scheduler"
       ],
-      "section": "17. Retries, RetryCancel, dead letter",
-      "text": "17. Retries, RetryCancel, dead letter › Tiers\n\n| Tier | Default delay | Topic |\n|------|---------------|-------|\n| short | 30s | `{retry_topic}.short` |\n| medium | 7m | `.medium` |\n| large | 20m | `.large` |\n\nProgression walks tiers by attempt; worker `retry_tier` can pin. Jitter ±`retry_jitter` (Ruby; Go code default 0.1 but may not be fully wired in scheduling — prefer explicit YAML awareness).",
-      "char_count": 399
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler\n\nWhenever-style **repeating cron** that enqueues a **manifest `job_type`** on a schedule. Shared by Ruby (`KafkaBatch::Recurring::*`) and Go (`pkg/cron`) against the same MySQL tables and Redis leader lock.",
+      "char_count": 237
     },
     {
-      "id": "readme-17-retries-retrycancel-dead-letter-retryconsumer-89ee40e3af34e877",
+      "id": "readme-17-recurring-cron-scheduler-what-it-is-is-not-3253d0b2ddfd50c3",
       "source": "readme",
-      "title": "RetryConsumer invariants",
+      "title": "What it is / is not",
       "heading_path": [
-        "17. Retries, RetryCancel, dead letter",
-        "RetryConsumer invariants"
+        "17. Recurring (cron) scheduler",
+        "What it is / is not"
       ],
-      "section": "17. Retries, RetryCancel, dead letter",
-      "text": "17. Retries, RetryCancel, dead letter › RetryConsumer invariants\n\n- Process in offset order; **stop** at first not-due message (never skip head of partition)\n- Pause partition up to `retry_max_pause_seconds` / Go `retry_max_pause`\n- Cancel/skip checked before pause\n- Unroutable (no `retry_to`) → failed event + DLT",
-      "char_count": 315
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › What it is / is not\n\n| | Recurring (§17) | Delayed jobs (§16) |\n|--|-----------------|-------------------|\n| Trigger | Cron expression + timezone | Absolute `run_at` / relative delay |\n| Storage | `kafka_batch_recurring_schedules` + `_fires` | `scheduled_topic` + Redis/MySQL pointer index |\n| Dispatch | `Batch.enqueue_job` / Go `EnqueueJob` | Poller reads Kafka payload by offset |\n| Idempotency | PK `(schedule_id, fire_at)` + deterministic `job_id` | Lease + reclaim on schedule index |\n| Accuracy | Within one `recurring_window` (default 30s) | Poll interval + lease |\n\nDoes **not** run arbitrary code — only registered handlers (plain / fair / priority / uniq / retries / DLT all apply).",
+      "char_count": 726
     },
     {
-      "id": "readme-17-retries-retrycancel-dead-letter-retrycancel-u-2a969d51f27f5a24",
+      "id": "readme-17-recurring-cron-scheduler-architecture-d4f0cc1e2c07bcd5",
       "source": "readme",
-      "title": "RetryCancel (UI delete)",
+      "title": "Architecture",
       "heading_path": [
-        "17. Retries, RetryCancel, dead letter",
-        "RetryCancel (UI delete)"
+        "17. Recurring (cron) scheduler",
+        "Architecture"
       ],
-      "section": "17. Retries, RetryCancel, dead letter",
-      "text": "17. Retries, RetryCancel, dead letter › RetryCancel (UI delete)\n\n| Key | Role |\n|-----|------|\n| `kafka_batch:retry:cancel` | SET of job_ids |\n| `kafka_batch:retry:skip` | HASH `topic:partition` → max offset watermark |\n\nTTL `retry_cancel_ttl` default 7 days.",
-      "char_count": 259
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Architecture\n\n```\nDashboard Recurring::Store ──upsert──► kafka_batch_recurring_schedules\n                                              ▲\nRuby Recurring::Ticker ──┐                    │\n                         ├── Redis leader ──► Ledger claim_and_advance ──► enqueue_job\nGo pkg/cron.Ticker ──────┘   lock             kafka_batch_recurring_fires\n```\n\n| Piece | Ruby | Go |\n|-------|------|-----|\n| Loop | `Recurring::Ticker` | `pkg/cron.Ticker` |\n| Misfire plan | `Recurring::Planner` | `cron.PlanFires` |\n| Claim + ledger | `Recurring::Ledger` | `Store.ClaimAndAdvance` |\n| Leader lock | `Recurring::Lock` | `cron.Lock` |\n| List / stale health | `Recurring::Reader` | `Store.List` + heartbeat |\n| Dashboard CRUD | `Recurring::Store` + Web API | (UI is Ruby; Go daemon only fires) |\n| Boot | Railtie when `recurring_scheduler_enabled` | `StartRecurringScheduler` when YAML true |",
+      "char_count": 912
     },
     {
-      "id": "readme-17-retries-retrycancel-dead-letter-dlt-de3d112664397117",
+      "id": "readme-17-recurring-cron-scheduler-double-fire-preventi-26462f83f1c7d27c",
       "source": "readme",
-      "title": "DLT",
+      "title": "Double-fire prevention (Go + Ruby together)",
       "heading_path": [
-        "17. Retries, RetryCancel, dead letter",
-        "DLT"
+        "17. Recurring (cron) scheduler",
+        "Double-fire prevention (Go + Ruby together)"
       ],
-      "section": "17. Retries, RetryCancel, dead letter",
-      "text": "17. Retries, RetryCancel, dead letter › DLT\n\nCentral `Dlt.publish` → `dead_letter_topic` (30-day retention at creation). Types include: `malformed_event`, `incomplete_event`, `callback*`, `retry_routing`, `expired`, `malformed_ingest`, `schedule_route_error`, poison jobs, etc. Optional Redis `kafka_batch:dlt:stats`.\n\n`max_retries` library default **7** (install template often **3** — README essential table may match install, not library).\n\n---",
-      "char_count": 447
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Double-fire prevention (Go + Ruby together)\n\nSafe to run **both** tickers against one cluster:\n\n1. **Leader lock (optimization):** Redis `kafka_batch:cron:leader_lock` — SET NX EX + token-checked release. TTL = `recurring_lock_ttl` (default **60s**). Brief split-brain is OK.\n2. **Fire ledger (correctness):** `kafka_batch_recurring_fires` PRIMARY KEY `(schedule_id, fire_at)`. `INSERT IGNORE` → second emit of the same instant is a no-op. Status: `pending` → `dispatched`.\n3. **Deterministic job id:** `sched-{schedule_id}-{fire_at_unix_utc}` — recovery re-enqueue + uniq handlers stay idempotent. Go treats uniq-skip (`ErrJobSkipped`) as successful dispatch.\n\nEnable on **few scheduler/control pods**, not every execution replica.",
+      "char_count": 765
     },
     {
-      "id": "readme-18-priority-queues-c9e77f40b9c5af58",
+      "id": "readme-17-recurring-cron-scheduler-tick-lifecycle-leade-938263b4f85b5bda",
       "source": "readme",
-      "title": "18. Priority queues",
+      "title": "Tick lifecycle (leader only, each `recurring_window`)",
       "heading_path": [
-        "18. Priority queues"
+        "17. Recurring (cron) scheduler",
+        "Tick lifecycle (leader only, each `recurring_window`)"
       ],
-      "section": "18. Priority queues",
-      "text": "18. Priority queues\n\nYAML groups (Sidekiq-style):\n\n```yaml\nconsumer_group_suffix: jobs-fast\nmode: weighted   # or strict\nweighted_interleave: 4\ntopics: [p0, p1, p2]  # highest first\n```\n\n| Setting | Default |\n|---------|---------|\n| `priority_config_paths` | [] (+ env) |\n| `priority_lag_check_interval` | 2s |\n| `priority_weighted_interleave` | 4 |\n\nBoot: topic in exactly one group; default `jobs_topic` forbidden in priority YAML; `fairness_type` workers bypass priority.\n\nGate uses Admin lag; **fail-open** if cluster unreachable. Topic-level pause excludes topic from lag gate so lower ranks keep flowing. **Not preemption.**\n\nGo groups: `{CG}-go-worker-{suffix}` with `priority_consumer_concurrency` members (default 4).\n\n---",
-      "char_count": 731
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Tick lifecycle (leader only, each `recurring_window`)\n\n1. **`dispatch_due`** — `claim_and_advance(now, batch_size, planner)`:\n   - `SELECT … WHERE enabled=1 AND next_run_at <= now FOR UPDATE SKIP LOCKED LIMIT recurring_batch_size` (default **100**)\n   - Planner → `{fires[], new_next}` per schedule\n   - INSERT IGNORE each fire; enqueue only **newly inserted** rows; update `next_run_at` / `last_fire_at`\n   - **Poison** cron/tz: disable schedule (`enabled=0`), log error\n2. **`recover`** (every `recurring_recover_every`, default **300s**): re-enqueue `pending` rows older than `recurring_recover_grace` (default **120s**) with the same `job_id`\n3. **`prune`** (every `recurring_prune_every`, default **3600s**): delete `dispatched` rows older than `recurring_prune_retention` (default **7 days**)\n4. **`heartbeat`** (every `recurring_heartbeat_every`, default **60s**): emit `cron.stale` / `cron.heartbeat` for enabled schedules past the stale threshold\n\nEnqueue failure → row stays `pending` → recover retries. Uniq duplicate on enqueue → treat as dispatched.",
+      "char_count": 1095
     },
     {
-      "id": "readme-19-cancellation-and-cancellationcache-7c199324eb8f7ca2",
+      "id": "readme-17-recurring-cron-scheduler-misfire-policies-1a6dc516bb256ca8",
       "source": "readme",
-      "title": "19. Cancellation and CancellationCache",
+      "title": "Misfire policies",
       "heading_path": [
-        "19. Cancellation and CancellationCache"
+        "17. Recurring (cron) scheduler",
+        "Misfire policies"
       ],
-      "section": "19. Cancellation and CancellationCache",
-      "text": "19. Cancellation and CancellationCache\n\n`Batch.cancel(id)` → status cancelled + cancelled index. Consumers with `skip_cancelled_jobs` (default true) skip when ID is in process-local cache.\n\n| Setting | Default |\n|---------|---------|\n| `skip_cancelled_jobs` | true |\n| `cancellation_cache_ttl` | 120s |\n| `retry_cancel_ttl` | 7 days |\n\n`CancellationCache`: refresh at most every TTL from Redis cancelled index; web cancel calls `add(id)` for immediate same-process effect. SchedulePoller also drops scheduled jobs for cancelled batches.\n\nEventually consistent across pods up to TTL.\n\n---",
-      "char_count": 587
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Misfire policies\n\n| Policy | Behavior |\n|--------|----------|\n| **`fire_once`** (default) | Fire one instant at `next_run_at`, then advance to first instant **strictly after now** |\n| **`skip`** | If lag ≤ `misfire_grace` → fire; else no fires; always advance past now |\n| **`backfill`** | Fire every missed instant while `≤ now`, capped `recurring_max_backfill` per tick (default **1000**); remainder drains later (ledger dedups) |\n\n`misfire_grace` default **60s**. Go `applyDefaults`: if grace ≤ 0 at runtime, uses `2 × window`.",
+      "char_count": 563
     },
     {
-      "id": "readme-20-consumption-pause-resume-d7bb01c0f067a6c7",
+      "id": "readme-17-recurring-cron-scheduler-stale-detection-heal-e7963a569d30641b",
       "source": "readme",
-      "title": "20. Consumption pause / resume",
+      "title": "Stale detection / health",
       "heading_path": [
-        "20. Consumption pause / resume"
+        "17. Recurring (cron) scheduler",
+        "Stale detection / health"
       ],
-      "section": "20. Consumption pause / resume",
-      "text": "20. Consumption pause / resume\n\nRedis:\n\n| Key | Members |\n|-----|---------|\n| `kafka_batch:consumption:topics` | `group\\x1ftopic` |\n| `kafka_batch:consumption:partitions` | `group\\x1ftopic\\x1fpartition` |\n\nConsumers (`ConsumptionGate`) refresh every `consumption_control_refresh_interval` (30s). UI reads fresh. MySQL fallback table when `store: :mysql` and Redis down. Go mirrors via franz-go PauseFetch so paused topics do not advance offsets.\n\n---",
-      "char_count": 450
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Stale detection / health\n\n- Interval = gap between next two cron instants\n- Threshold = `recurring_stale_factor × interval` (default factor **2.0**)\n- Reference = `last_fire_at` else `next_run_at`; idle = `now - reference`\n- **Stale** = enabled AND idle > threshold → UI health `stale`; else `ok` / `paused`\n- Ruby interval needs **fugit**; without it, staleness is not computed (health ok/paused only)\n- Go uses built-in 5-field cron parser",
+      "char_count": 474
     },
     {
-      "id": "readme-21-liveness-bae2a48ffd04af53",
+      "id": "readme-17-recurring-cron-scheduler-cron-expressions-a84c81a83b049aa1",
       "source": "readme",
-      "title": "21. Liveness",
+      "title": "Cron expressions",
       "heading_path": [
-        "21. Liveness"
+        "17. Recurring (cron) scheduler",
+        "Cron expressions"
       ],
-      "section": "21. Liveness",
-      "text": "21. Liveness\n\n| Key | Role |\n|-----|------|\n| `kafka_batch:live:consumer:{id}` | Heartbeat JSON + TTL |\n| `kafka_batch:live:job:{consumer}:{job}` | Running job detail |\n\n| Setting | Default |\n|---------|---------|\n| `liveness_backend` (Ruby) | `:redis` or `:off` |\n| `liveness_ttl` | 180s |\n| `liveness_heartbeat_interval` | 20s |\n| `liveness_stats_interval` (Ruby) | 15s (0 disables RSS/CPU) |\n| `track_running_jobs` | true |\n\nCircuit breaker on Redis errors; best-effort; never fails hot path. Feeds SuperFetch orphan detection.\n\nGo: SuperFetch forces Redis heartbeats even if `liveness_enabled: false`; HTTP `/health`+`/live` only when enabled (`:8080` default). HTTP stale ≈ `3 × heartbeat_interval`.\n\n---",
-      "char_count": 709
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Cron expressions\n\n| Runtime | Parser |\n|---------|--------|\n| Ruby | **Fugit** (`Fugit::Cron.parse`, timezone appended) |\n| Go | **5-field** min hour dom month dow + `@hourly` / `@daily` / `@weekly` / `@monthly` / `@yearly` |\n\nInvalid cron on register → API 400; poison on tick → schedule disabled.",
+      "char_count": 331
     },
     {
-      "id": "readme-22-reconciler-84eda0bc39b56d0b",
+      "id": "readme-17-recurring-cron-scheduler-mysql-schema-37ca396cf3ee44ce",
       "source": "readme",
-      "title": "22. Reconciler",
+      "title": "MySQL schema",
       "heading_path": [
-        "22. Reconciler"
+        "17. Recurring (cron) scheduler",
+        "MySQL schema"
       ],
-      "section": "22. Reconciler",
-      "text": "22. Reconciler\n\nRecovers:\n\n1. Stuck **running** — sealed, `completed+failed >= total`, status still running\n2. **Lost callback** — terminal status, callback timestamps null\n\n| Setting | Default |\n|---------|---------|\n| `reconciliation_interval` | 300s |\n| `reconciler_lock_ttl` | 600s |\n| `max_reconcile_per_run` | 100 |\n\nLock: `kafka_batch:b:reconciler_lock`. Summary: `kafka_batch:reconciler:last`, `:last_skip`. Skips open (unsealed) and genuinely in-progress batches.\n\nTriggers: EventConsumer/daemon background; `rake kafka_batch:reconcile`; `kbatch reconcile`.\n\n---",
-      "char_count": 571
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › MySQL schema\n\n**Install:** `rails g kafka_batch:install --recurring && rails db:migrate`  \nMigration: `db/migrate/20240101000005_create_kafka_batch_recurring_schedules.rb`  \nConnection: `config.schedule_store_database_connection` (Ruby) / `recurring_mysql_dsn` falling back to `schedule_mysql_dsn` (Go).\n\nGo `Store.EnsureSchema` can auto-create on boot; prefer explicit SQL in production (Go README appendix **block C**).\n\n**`kafka_batch_recurring_schedules`:** `name` (unique upsert key, `\\A[a-zA-Z0-9_.:-]{1,191}\\z`), `cron_expr`, `timezone` (default UTC), `job_type` (manifest key), `args_json`, `tenant_id`, `enabled`, `misfire_policy`, `next_run_at`, `last_fire_at`, indexes `uq_name`, `idx_due(enabled, next_run_at)`.\n\n**`kafka_batch_recurring_fires`:** PK `(schedule_id, fire_at)`, `status` (`pending`|`dispatched`), `job_id`, `created_at`, `dispatched_at`, index `idx_pending(status, created_at)`.",
+      "char_count": 938
     },
     {
-      "id": "readme-23-instrumentation-metrics-performancemetrics-in-bd03403b314fc1ce",
+      "id": "readme-17-recurring-cron-scheduler-ruby-config-env-a1854e5db3c7a57f",
+      "source": "readme",
+      "title": "Ruby config + env",
+      "heading_path": [
+        "17. Recurring (cron) scheduler",
+        "Ruby config + env"
+      ],
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Ruby config + env\n\n| Knob | Default | Env |\n|------|---------|-----|\n| `recurring_scheduler_enabled` | false | `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED` (`1`/`true`/`yes`) |\n| `recurring_window` | 30.0 s | `KAFKA_BATCH_RECURRING_WINDOW` |\n| `recurring_lock_ttl` | 60 | `KAFKA_BATCH_RECURRING_LOCK_TTL` |\n| `recurring_batch_size` | 100 | `KAFKA_BATCH_RECURRING_BATCH_SIZE` |\n| `recurring_misfire_grace` | 60.0 | `KAFKA_BATCH_RECURRING_MISFIRE_GRACE` |\n| `recurring_max_backfill` | 1000 | `KAFKA_BATCH_RECURRING_MAX_BACKFILL` |\n| `recurring_recover_every` | 300.0 | `KAFKA_BATCH_RECURRING_RECOVER_EVERY` |\n| `recurring_recover_grace` | 120.0 | `KAFKA_BATCH_RECURRING_RECOVER_GRACE` |\n| `recurring_prune_every` | 3600.0 | `KAFKA_BATCH_RECURRING_PRUNE_EVERY` |\n| `recurring_prune_retention` | 604800 (7d) | `KAFKA_BATCH_RECURRING_PRUNE_RETENTION` |\n| `recurring_heartbeat_every` | 60.0 | `KAFKA_BATCH_RECURRING_HEARTBEAT_EVERY` |\n| `recurring_stale_factor` | 2.0 | `KAFKA_BATCH_RECURRING_STALE_FACTOR` |\n\n**Boot:** Karafka railtie starts an embedded thread when enabled. **Dedicated pod:** `rake kafka_batch:recurring:run` (loop) or `rake kafka_batch:recurring:tick` (one leader-gated pass).",
+      "char_count": 1220
+    },
+    {
+      "id": "readme-17-recurring-cron-scheduler-go-config-b23485be9a4b64bb",
+      "source": "readme",
+      "title": "Go config",
+      "heading_path": [
+        "17. Recurring (cron) scheduler",
+        "Go config"
+      ],
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Go config\n\nSame YAML key names and defaults. Extra: `recurring_mysql_dsn` (falls back to `schedule_mysql_dsn`). **No `KAFKA_BATCH_RECURRING_*` env overrides in Go `applyEnv` today** — YAML only. Enable with `recurring_scheduler_enabled: true` on the daemon.",
+      "char_count": 290
+    },
+    {
+      "id": "readme-17-recurring-cron-scheduler-web-ui-api-e129d201b3162187",
+      "source": "readme",
+      "title": "Web UI + API",
+      "heading_path": [
+        "17. Recurring (cron) scheduler",
+        "Web UI + API"
+      ],
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Web UI + API\n\nPage: `/kafka_batch/recurring` (nav “Recurring”). Without migrated tables → `available: false`.\n\n| Method | Path | Action |\n|--------|------|--------|\n| GET | `/api/recurring` | List + summary `{total,enabled,stale}` + health |\n| POST | `/api/recurring` | Upsert by `name`: cron, job_type, timezone, args, tenant_id, misfire_policy, enabled |\n| PATCH/POST | `/api/recurring/:name` | `{enabled: true\\|false}` |\n| DELETE | `/api/recurring/:name` | Delete |\n| POST | `/api/recurring/:name/run` | Immediate one-shot enqueue (**no** ledger row) |\n\n`job_type` accepts manifest key **or** Ruby worker class → canonicalized via `Manifest.ResolveJobType` / Go equivalent. Dashboard writes only mutate MySQL; ticker picks up within ≤ one window.",
+      "char_count": 782
+    },
+    {
+      "id": "readme-17-recurring-cron-scheduler-instrumentation-d4a84da4324c6fda",
       "source": "readme",
       "title": "Instrumentation",
       "heading_path": [
-        "23. Instrumentation, Metrics, PerformanceMetrics",
+        "17. Recurring (cron) scheduler",
         "Instrumentation"
       ],
-      "section": "23. Instrumentation, Metrics, PerformanceMetrics",
-      "text": "23. Instrumentation, Metrics, PerformanceMetrics › Instrumentation\n\nActiveSupport::Notifications pattern `*.kafka_batch` (Ruby). Go `pkg/instrument` mirrors events: `job.processed/retried/failed`, `batch.*`, `callback.*`, `dlt.published`, `workset.reclaimed`, `super_fetch.drained`, `scheduled.*`, `reconciler.ran`, etc.",
-      "char_count": 320
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Instrumentation\n\n| Event | When |\n|-------|------|\n| `cron.fired` | Successful enqueue |\n| `cron.enqueue_failed` | Enqueue error; left pending |\n| `cron.stale` | Enabled schedule past stale threshold |\n| `cron.heartbeat` | Sweep pulse `{enabled_count, stale_count, max_stale_seconds}` |\n\nMirrored in Go `pkg/instrument` for Datadog parity.",
+      "char_count": 372
     },
     {
-      "id": "readme-23-instrumentation-metrics-performancemetrics-me-9b4be680e382b625",
+      "id": "readme-17-recurring-cron-scheduler-deployment-e7576b9486ed273a",
       "source": "readme",
-      "title": "Metrics export",
+      "title": "Deployment",
       "heading_path": [
-        "23. Instrumentation, Metrics, PerformanceMetrics",
-        "Metrics export"
+        "17. Recurring (cron) scheduler",
+        "Deployment"
       ],
-      "section": "23. Instrumentation, Metrics, PerformanceMetrics",
-      "text": "23. Instrumentation, Metrics, PerformanceMetrics › Metrics export\n\nOpt-in `metrics_enabled`. Adapters StatsD/Datadog/proc (Ruby) or StatsD (Go). You supply the client. Prefix `kafka_batch`.",
-      "char_count": 189
+      "section": "17. Recurring (cron) scheduler",
+      "text": "17. Recurring (cron) scheduler › Deployment\n\n- Enable on 1–few control/scheduler pods (same pattern as §16 schedule poller)\n- Needs **Redis** (leader lock) + **MySQL** (tables)\n- Go-control clusters typically enable only the Go ticker; Ruby-control without Go enables the Ruby ticker; both together are safe\n- Handlers must exist in the shared manifest on the workers that will execute them\n\n---",
+      "char_count": 395
     },
     {
-      "id": "readme-23-instrumentation-metrics-performancemetrics-pe-73e8d4595c5c21c2",
+      "id": "readme-18-retries-retrycancel-dead-letter-tiers-d772e41109303241",
       "source": "readme",
-      "title": "Performance dashboard metrics",
+      "title": "Tiers",
       "heading_path": [
-        "23. Instrumentation, Metrics, PerformanceMetrics",
-        "Performance dashboard metrics"
+        "18. Retries, RetryCancel, dead letter",
+        "Tiers"
       ],
-      "section": "23. Instrumentation, Metrics, PerformanceMetrics",
-      "text": "23. Instrumentation, Metrics, PerformanceMetrics › Performance dashboard metrics\n\nOpt-in Redis minute buckets shared by Ruby + Go for Web UI `/performance`:\n\n`kafka_batch:perf:min:{epoch}:{processed|failed|retried|reclaimed}`\n\nFields: `_all`, per `job_type`, `_other` overflow.\n\n| Knob | Default |\n|------|---------|\n| `performance_metrics_enabled` | false |\n| `performance_metrics_retention` | 86400 |\n| `performance_metrics_max_job_types` | 50 |\n| `performance_metrics_bucket_seconds` | 60 |\n| `performance_metrics_sample_rate` | 1.0 |\n\nBest-effort; never raises into hot path.\n\n---",
-      "char_count": 584
+      "section": "18. Retries, RetryCancel, dead letter",
+      "text": "18. Retries, RetryCancel, dead letter › Tiers\n\n| Tier | Default delay | Topic |\n|------|---------------|-------|\n| short | 30s | `{retry_topic}.short` |\n| medium | 7m | `.medium` |\n| large | 20m | `.large` |\n\nProgression walks tiers by attempt; worker `retry_tier` can pin. Jitter ±`retry_jitter` (Ruby; Go code default 0.1 but may not be fully wired in scheduling — prefer explicit YAML awareness).",
+      "char_count": 399
     },
     {
-      "id": "readme-24-stores-redis-vs-mysql-config-store-4447a59f55e1dd32",
+      "id": "readme-18-retries-retrycancel-dead-letter-retryconsumer-c2953ea09f1bd357",
       "source": "readme",
-      "title": "`config.store`",
+      "title": "RetryConsumer invariants",
       "heading_path": [
-        "24. Stores — Redis vs MySQL",
-        "`config.store`"
+        "18. Retries, RetryCancel, dead letter",
+        "RetryConsumer invariants"
       ],
-      "section": "24. Stores — Redis vs MySQL",
-      "text": "24. Stores — Redis vs MySQL › `config.store`\n\n| Concern | `:redis` | `:mysql` |\n|---------|----------|----------|\n| Batch ledger / bitmaps | Redis | **Still Redis** (MysqlStore delegates ledger) |\n| Failure log | none (DLT + retry topics) | `kafka_batch_failures` |\n| Pause state | Redis | MySQL fallback |\n| Migrations | none | required |",
-      "char_count": 339
+      "section": "18. Retries, RetryCancel, dead letter",
+      "text": "18. Retries, RetryCancel, dead letter › RetryConsumer invariants\n\n- Process in offset order; **stop** at first not-due message (never skip head of partition)\n- Pause partition up to `retry_max_pause_seconds` / Go `retry_max_pause`\n- Cancel/skip checked before pause\n- Unroutable (no `retry_to`) → failed event + DLT",
+      "char_count": 315
     },
     {
-      "id": "readme-24-stores-redis-vs-mysql-config-schedule-store-i-edc84856a2a75237",
+      "id": "readme-18-retries-retrycancel-dead-letter-retrycancel-u-f13a34635586f428",
       "source": "readme",
-      "title": "`config.schedule_store` (independent)",
+      "title": "RetryCancel (UI delete)",
       "heading_path": [
-        "24. Stores — Redis vs MySQL",
-        "`config.schedule_store` (independent)"
+        "18. Retries, RetryCancel, dead letter",
+        "RetryCancel (UI delete)"
       ],
-      "section": "24. Stores — Redis vs MySQL",
-      "text": "24. Stores — Redis vs MySQL › `config.schedule_store` (independent)\n\n| `:redis` | `:mysql` |\n|----------|----------|\n| ZSET index | `kafka_batch_scheduled_jobs` |\n\nHot batch counters are **never** in SQL by design.\n\n---",
-      "char_count": 219
+      "section": "18. Retries, RetryCancel, dead letter",
+      "text": "18. Retries, RetryCancel, dead letter › RetryCancel (UI delete)\n\n| Key | Role |\n|-----|------|\n| `kafka_batch:retry:cancel` | SET of job_ids |\n| `kafka_batch:retry:skip` | HASH `topic:partition` → max offset watermark |\n\nTTL `retry_cancel_ttl` default 7 days.",
+      "char_count": 259
     },
     {
-      "id": "readme-25-topics-partitions-create-all-9a66375d20f829ed",
+      "id": "readme-18-retries-retrycancel-dead-letter-dlt-762011a2736ef14f",
       "source": "readme",
-      "title": "25. Topics, partitions, create_all",
+      "title": "DLT",
       "heading_path": [
-        "25. Topics, partitions, create_all"
+        "18. Retries, RetryCancel, dead letter",
+        "DLT"
       ],
-      "section": "25. Topics, partitions, create_all",
-      "text": "25. Topics, partitions, create_all\n\nRuby `KafkaBatch::Topics` / rake `kafka_batch:create_topics` / `kafka_batch:topics` (dry-run).\n\nGo: `kbatch topics create|validate`.",
-      "char_count": 168
-    },
-    {
-      "id": "readme-25-topics-partitions-create-all-default-partitio-30b5b5aa81a2df56",
-      "source": "readme",
-      "title": "DEFAULT_PARTITIONS (Ruby)",
-      "heading_path": [
-        "25. Topics, partitions, create_all",
-        "DEFAULT_PARTITIONS (Ruby)"
-      ],
-      "section": "25. Topics, partitions, create_all",
-      "text": "25. Topics, partitions, create_all › DEFAULT_PARTITIONS (Ruby)\n\nThese are **create_topics defaults only** — not necessarily what exists on a live cluster.\nKafka cannot shrink partitions; ops often create smaller topics for local/dev (e.g. 10).\n\n| Category | Create default |\n|----------|----------------|\n| jobs / priority / ready | 768 |\n| events | 48 |\n| callbacks | 6 |\n| retry per tier | 12 |\n| scheduled | 48 |\n| dead_letter | 3 |\n| fair ingest per lane | 300 |\n\nEnv: `REPLICATION_FACTOR` (default 3), `PARTITIONS` uniform override.\n\nScheduled retention ≥ `max_schedule_horizon` (+1 day buffer). DLT retention 30 days at creation. Existing topics skipped, never altered.\n\n**Manifest plain Go topics** are not always auto-discovered by Ruby `create_topics` — create them explicitly or via Go topics CLI.",
-      "char_count": 807
-    },
-    {
-      "id": "readme-25-topics-partitions-create-all-live-broker-inve-9a59239ae9fb0494",
-      "source": "readme",
-      "title": "Live broker inventory (AI + ops)",
-      "heading_path": [
-        "25. Topics, partitions, create_all",
-        "Live broker inventory (AI + ops)"
-      ],
-      "section": "25. Topics, partitions, create_all",
-      "text": "25. Topics, partitions, create_all › Live broker inventory (AI + ops)\n\nOn AI knowledge sync (NX-locked, at most every 24h with the config snapshot), `KafkaBatch::Topics.inventory` merges:\n\n| Field | Meaning |\n|-------|---------|\n| `live_broker_partitions` / `broker_partitions` | Actual count from `Karafka::Admin.cluster_info` |\n| `create_default_partitions` / `configured_partitions` | `DEFAULT_PARTITIONS` / create_topics intent |\n| `status` | `matches_default` / `differs_from_default` / `missing_on_broker` / `broker_unavailable` |\n\nAlways includes both fairness lanes’ ingest + ready (`.ruby` / `.go`) even when Worker classes are not loaded (UI-only pods). Stored in Redis `kafka_batch:ai:knowledge:config` → `topic_inventory` and the `config:live` RAG chunk.\n\n**Assistant rule:** when asked “how many partitions does topic X have?”, answer from `live_broker_partitions`. Never report 768 / DEFAULT_PARTITIONS as the live count unless broker metadata is unavailable (then say so).\n\n---",
-      "char_count": 992
-    },
-    {
-      "id": "readme-26-deployment-consumer-groups-kb-role-daemon-mod-c4602c3d116b4c6b",
-      "source": "readme",
-      "title": "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-      "heading_path": [
-        "26. Deployment, consumer groups, KB_ROLE, daemon_mode"
-      ],
-      "section": "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-      "text": "26. Deployment, consumer groups, KB_ROLE, daemon_mode\n\n`CG` = `consumer_group` (default `kafka-batch`; with prefix `myapp` → `myapp.kafka-batch`).",
-      "char_count": 146
-    },
-    {
-      "id": "readme-26-deployment-consumer-groups-kb-role-daemon-mod-b645983a80e638a5",
-      "source": "readme",
-      "title": "Ruby groups (`draw_routes`)",
-      "heading_path": [
-        "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-        "Ruby groups (`draw_routes`)"
-      ],
-      "section": "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-      "text": "26. Deployment, consumer groups, KB_ROLE, daemon_mode › Ruby groups (`draw_routes`)\n\n| Group | Tier | Consumers |\n|-------|------|-----------|\n| `{CG}-control` | Control | Event, Callback, Retry |\n| `{CG}-dispatch-{lane}` | Control | Fairness::Dispatcher |\n| `{CG}-jobs-fair-{lane}` | Execution | JobConsumer on ruby ready |\n| `{CG}-{priority-suffix}` | Execution | PriorityJobConsumer |\n| `{CG}-jobs` | Execution | plain + non-priority manifest topics |\n\n`daemon_mode` / `KAFKA_BATCH_DAEMON_MODE` skips `draw_routes` entirely (API enqueue-only).",
-      "char_count": 546
-    },
-    {
-      "id": "readme-26-deployment-consumer-groups-kb-role-daemon-mod-e89277d2cc5021d7",
-      "source": "readme",
-      "title": "Go groups",
-      "heading_path": [
-        "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-        "Go groups"
-      ],
-      "section": "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-      "text": "26. Deployment, consumer groups, KB_ROLE, daemon_mode › Go groups\n\n| Group | Role |\n|-------|------|\n| `{CG}-events` / retry / dispatch (daemon) | Control |\n| `{CG}-go-worker-jobs` | Plain Go jobs |\n| `{CG}-go-worker-fair-ready-{lane}` | Fair Go ready |\n| `{CG}-go-worker-{priority-suffix}` | Priority Go |",
-      "char_count": 306
-    },
-    {
-      "id": "readme-26-deployment-consumer-groups-kb-role-daemon-mod-a20d04dd40ad49fa",
-      "source": "readme",
-      "title": "KB_ROLE (schedule poller helper — does not filter Karafka groups by itself)",
-      "heading_path": [
-        "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-        "KB_ROLE (schedule poller helper — does not filter Karafka groups by itself)"
-      ],
-      "section": "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-      "text": "26. Deployment, consumer groups, KB_ROLE, daemon_mode › KB_ROLE (schedule poller helper — does not filter Karafka groups by itself)\n\n| Role | Poller |\n|------|--------|\n| `all`, `scheduler` | on (generated initializer patterns) |\n| other | off unless `KB_SCHEDULE_POLLER=true` |\n\nFilter groups explicitly: `karafka server --include-consumer-groups ...`.",
-      "char_count": 353
-    },
-    {
-      "id": "readme-26-deployment-consumer-groups-kb-role-daemon-mod-722fd0ebda8717a7",
-      "source": "readme",
-      "title": "Layouts",
-      "heading_path": [
-        "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-        "Layouts"
-      ],
-      "section": "26. Deployment, consumer groups, KB_ROLE, daemon_mode",
-      "text": "26. Deployment, consumer groups, KB_ROLE, daemon_mode › Layouts\n\nAll-in-one (dev), standalone (small prod), split (scale). Mixed: Ruby or Go control **xor** per topic set; Ruby exec + Go exec in parallel on different topics.\n\n---",
-      "char_count": 229
-    },
-    {
-      "id": "readme-27-web-ui-and-json-api-3977b1bd5f19133b",
-      "source": "readme",
-      "title": "27. Web UI and JSON API",
-      "heading_path": [
-        "27. Web UI and JSON API"
-      ],
-      "section": "27. Web UI and JSON API",
-      "text": "27. Web UI and JSON API\n\nMount `KafkaBatch::Web` at `/kafka_batch` behind host auth.",
-      "char_count": 84
-    },
-    {
-      "id": "readme-27-web-ui-and-json-api-pages-3212f1bd3c3eed81",
-      "source": "readme",
-      "title": "Pages",
-      "heading_path": [
-        "27. Web UI and JSON API",
-        "Pages"
-      ],
-      "section": "27. Web UI and JSON API",
-      "text": "27. Web UI and JSON API › Pages\n\n`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/reconciler`, `/system`, `/audit`, `/performance`, `/ai`\n\nLive refresh: localStorage `kafka_batch_live`, 5s.",
-      "char_count": 252
-    },
-    {
-      "id": "readme-27-web-ui-and-json-api-dashboard-metrics-get-api-f8603375ee58c62f",
-      "source": "readme",
-      "title": "Dashboard metrics (`GET /api/dashboard`)",
-      "heading_path": [
-        "27. Web UI and JSON API",
-        "Dashboard metrics (`GET /api/dashboard`)"
-      ],
-      "section": "27. Web UI and JSON API",
-      "text": "27. Web UI and JSON API › Dashboard metrics (`GET /api/dashboard`)\n\n| Field | Meaning |\n|-------|---------|\n| `counts` / `total` | Batch status counters from Redis ledger |\n| `pending_jobs` | Untouched jobs in **running batches** (ledger) — UI label “Pending in batches” |\n| `topic_pending` | Sum of Kafka consumer-group lag across gem topics **excluding** scheduled log-archive rows — UI label “Jobs pending” (links to `/lag`) |\n| `liveness` | Live consumers + running jobs when liveness is on |\n\nDo not conflate `pending_jobs` (batch ledger) with `topic_pending` (Kafka lag). Fair ingest + ready can both count the same logical job mid-pipeline in the lag sum.",
-      "char_count": 662
-    },
-    {
-      "id": "readme-27-web-ui-and-json-api-system-page-9c43dc8a28ab3bc9",
-      "source": "readme",
-      "title": "System page",
-      "heading_path": [
-        "27. Web UI and JSON API",
-        "System page"
-      ],
-      "section": "27. Web UI and JSON API",
-      "text": "27. Web UI and JSON API › System page\n\nRead-only `KafkaBatch::SystemInfo` sections: Overview, Kafka, Redis, MySQL (if store), SuperFetch, Uniqueness, Liveness, Fairness, Scheduled jobs, Retry, Reconciliation, Cancellation, Priority, Retention, Performance metrics, Instrumentation metrics, Audit, AI, optional rdkafka overrides. Secrets masked.",
-      "char_count": 344
-    },
-    {
-      "id": "readme-27-web-ui-and-json-api-ai-assistant-462897ec63ff9d3f",
-      "source": "readme",
-      "title": "AI assistant",
-      "heading_path": [
-        "27. Web UI and JSON API",
-        "AI assistant"
-      ],
-      "section": "27. Web UI and JSON API",
-      "text": "27. Web UI and JSON API › AI assistant\n\nSettings + shared chat at `/ai`. RAG over packaged `knowledge_chunks.json` + live config snapshot (`config:live`). OpenRouter key encrypted in Redis (`kafka_batch:ai:settings`). Never touches operational ledger/fairness/workset keys.",
-      "char_count": 273
-    },
-    {
-      "id": "readme-27-web-ui-and-json-api-mutating-api-csrf-cookie-bb64e73717f60ae5",
-      "source": "readme",
-      "title": "Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)",
-      "heading_path": [
-        "27. Web UI and JSON API",
-        "Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)"
-      ],
-      "section": "27. Web UI and JSON API",
-      "text": "27. Web UI and JSON API › Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)\n\nBatch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; AI settings/chat/history.\n\nOptional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.\n\n---",
-      "char_count": 299
-    },
-    {
-      "id": "readme-28-redis-key-namespace-catalog-36119c6edc8a8024",
-      "source": "readme",
-      "title": "28. Redis key namespace catalog",
-      "heading_path": [
-        "28. Redis key namespace catalog"
-      ],
-      "section": "28. Redis key namespace catalog",
-      "text": "28. Redis key namespace catalog\n\n| Prefix / pattern | Subsystem |\n|------------------|-----------|\n| `kafka_batch:b:{id}` | Batch hash |\n| `kafka_batch:b:seq:{id}` | batch_seq allocator |\n| `kafka_batch:b:bitmap:{id}` | Touch bitmap |\n| `kafka_batch:b:okbit:{id}` | Success bitmap |\n| `kafka_batch:b:failbit:{id}` | Fail bitmap |\n| `kafka_batch:b:reconciler_lock` | Reconciler lock |\n| `kafka_batch:index:running` | Running ZSET |\n| `kafka_batch:index:done` | Done / callback-pending ZSET |\n| `kafka_batch:index:all` | UI listing ZSET |\n| `kafka_batch:index:cancelled` | Cancelled ZSET |\n| `kafka_batch:counts` | Status counters HASH |\n| `kafka_batch:uniq:{digest}` | Uniqueness locks |\n| `kafka_batch:sched:pending` | Schedule index |\n| `kafka_batch:sched:inflight` | Schedule leases |\n| `kafka_batch:sched:read_miss` | Schedule read failures |\n| `kafka_batch:fair_time:*` / `fair_throughput:*` | WFQ per lane |\n| `kafka_batch:tenant_partitions:{lane}` (+ `:free`, `:partition_count`) | Dynamic partitions |\n| `kafka_batch:work:job:*` | SuperFetch workset |\n| `kafka_batch:work:by_consumer:*` | Workset by consumer |\n| `kafka_batch:work:index` | Workset ZSET |\n| `kafka_batch:work:reclaiming:*` | Reclaim state |\n| `kafka_batch:work:produced:*` | Re-produce dedup |\n| `kafka_batch:live:job:*` / `live:consumer:*` | Liveness |\n| `kafka_batch:consumption:topics` / `partitions` | Pause state |\n| `kafka_batch:retry:cancel` / `retry:skip` | Retry UI cancel |\n| `kafka_batch:reconciler:last` / `last_skip` | Sweep summary |\n| `kafka_batch:perf:min:*` | Performance metrics |\n| `kafka_batch:dlt:stats` | DLT stats |\n\nAssistant must not touch these operational keys.\n\n---",
-      "char_count": 1666
-    },
-    {
-      "id": "readme-29-kafka-topic-catalog-b6276f6d0504b45d",
-      "source": "readme",
-      "title": "29. Kafka topic catalog",
-      "heading_path": [
-        "29. Kafka topic catalog"
-      ],
-      "section": "29. Kafka topic catalog",
-      "text": "29. Kafka topic catalog\n\nDefaults with empty prefix:\n\n| Topic | Group / reader | Consumer |\n|-------|----------------|----------|\n| `kafka_batch.jobs` | `{CG}-jobs` | JobConsumer |\n| `kafka_batch.events` | `{CG}-control` / Go events | EventConsumer |\n| `kafka_batch.callbacks` | `{CG}-control` | CallbackConsumer (Ruby) |\n| `kafka_batch.jobs.retry.{tier}` | control | RetryConsumer |\n| `kafka_batch.scheduled` | SchedulePoller (no CG) | poller |\n| `kafka_batch.dead_letter` | UI reader | — |\n| `kafka_batch.fair_*_ingest` | `{CG}-dispatch-*` | Dispatcher |\n| `kafka_batch.fair_*_ready.ruby` | `{CG}-jobs-fair-*` | JobConsumer |\n| `kafka_batch.fair_*_ready.go` | Go fair-ready | kbatch worker |\n| Custom / priority / manifest | respective groups | Job/Priority/Go |\n\n---",
-      "char_count": 769
-    },
-    {
-      "id": "readme-30-ruby-configuration-reference-fe573bda53d332b3",
-      "source": "readme",
-      "title": "30. Ruby configuration reference",
-      "heading_path": [
-        "30. Ruby configuration reference"
-      ],
-      "section": "30. Ruby configuration reference",
-      "text": "30. Ruby configuration reference\n\nAll on `KafkaBatch.config`. Library `initialize` defaults below; install generator may ship larger production values.",
-      "char_count": 151
-    },
-    {
-      "id": "readme-30-ruby-configuration-reference-connection-ident-1b0e2e906d7aaae6",
-      "source": "readme",
-      "title": "Connection / identity / topics",
-      "heading_path": [
-        "30. Ruby configuration reference",
-        "Connection / identity / topics"
-      ],
-      "section": "30. Ruby configuration reference",
-      "text": "30. Ruby configuration reference › Connection / identity / topics\n\n`brokers`, `redis_url`/`redis`, `redis_pool_size`, `topic_prefix`, `consumer_group`, `jobs_topic`, `events_topic`, `callbacks_topic`, `dead_letter_topic`, `retry_topic`, `scheduled_topic`, all `fair_*` topic accessors, `extra_job_topics`, `jobs_topics`, `handler_manifest_path`, `validate_topics_on_boot`, `topics_replication_factor`, `daemon_mode`, `producer_config`, `consumer_config`, `logger`, `web_authenticator`.",
-      "char_count": 485
-    },
-    {
-      "id": "readme-30-ruby-configuration-reference-store-retention-5e7095211ca7336c",
-      "source": "readme",
-      "title": "Store / retention",
-      "heading_path": [
-        "30. Ruby configuration reference",
-        "Store / retention"
-      ],
-      "section": "30. Ruby configuration reference",
-      "text": "30. Ruby configuration reference › Store / retention\n\n`store`, `store_database_connection`, `batch_ttl`, `all_index_max_size`, `failures_ttl`, `max_failures_per_batch`, `retry_cancel_ttl`.",
-      "char_count": 188
-    },
-    {
-      "id": "readme-30-ruby-configuration-reference-superfetch-uniq-2a1d6a0951f6a08c",
-      "source": "readme",
-      "title": "SuperFetch / uniq / cancel / liveness / consumption",
-      "heading_path": [
-        "30. Ruby configuration reference",
-        "SuperFetch / uniq / cancel / liveness / consumption"
-      ],
-      "section": "30. Ruby configuration reference",
-      "text": "30. Ruby configuration reference › SuperFetch / uniq / cancel / liveness / consumption\n\nSee sections 10, 14, 19, 21, 20.",
-      "char_count": 120
-    },
-    {
-      "id": "readme-30-ruby-configuration-reference-retry-428ee89db0b4e3d6",
-      "source": "readme",
-      "title": "Retry",
-      "heading_path": [
-        "30. Ruby configuration reference",
-        "Retry"
-      ],
-      "section": "30. Ruby configuration reference",
-      "text": "30. Ruby configuration reference › Retry\n\n| Option | Default |\n|--------|---------|\n| `max_retries` | 7 |\n| `retry_jitter` | 0.1 |\n| `retry_tiers` | short 30 / medium 420 / large 1200 |\n| `retry_tier_progression` | short→medium→large |\n| `retry_max_pause_seconds` | 30 |\n| `event_emit_retries` | 3 |\n| `event_emit_backoff` | 1 |",
-      "char_count": 328
-    },
-    {
-      "id": "readme-30-ruby-configuration-reference-schedule-fairnes-43adb86bca56eadf",
-      "source": "readme",
-      "title": "Schedule / fairness / priority / reconciler / producer / audit / metrics",
-      "heading_path": [
-        "30. Ruby configuration reference",
-        "Schedule / fairness / priority / reconciler / producer / audit / metrics"
-      ],
-      "section": "30. Ruby configuration reference",
-      "text": "30. Ruby configuration reference › Schedule / fairness / priority / reconciler / producer / audit / metrics\n\nSee respective sections. Notable fairness defaults: `fairness_global_concurrency=50`, `fairness_ready_window=500`, `fairness_lease_ttl=1800`, `fairness_weighted_concurrency=true`, `fairness_dynamic_tenant_partitions=true`, `fairness_min_ingest_partitions=2`, `fairness_dispatcher_batch_size=50`, `fairness_dispatcher_concurrency=5`, `fairness_forwarder_idle_sleep=0.05`, `fairness_forwarding_recovery_grace=5.0`, `fairness_slot_dedup_ttl=0`, `fairness_active_count_ttl=5`, `fairness_active_count_source=:inflight_plus_ready`, `fairness_weight_cache_ttl=60`, `fairness_default_weight=1.0`, `fairness_max_inflight_per_tenant=0`.",
-      "char_count": 735
-    },
-    {
-      "id": "readme-30-ruby-configuration-reference-env-overrides-se-3c5c61c11bdc5dc7",
-      "source": "readme",
-      "title": "Env overrides (selected)",
-      "heading_path": [
-        "30. Ruby configuration reference",
-        "Env overrides (selected)"
-      ],
-      "section": "30. Ruby configuration reference",
-      "text": "30. Ruby configuration reference › Env overrides (selected)\n\n`KAFKA_BATCH_SUPER_FETCH_*`, `KAFKA_BATCH_LIVENESS_*`, `KAFKA_BATCH_REDIS_POOL_SIZE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_PERFORMANCE_METRICS_*`, `KB_ROLE`, `KB_SCHEDULE_POLLER`.\n\n---",
-      "char_count": 364
-    },
-    {
-      "id": "readme-31-go-configuration-reference-62e3e92d65b7d173",
-      "source": "readme",
-      "title": "31. Go configuration reference",
-      "heading_path": [
-        "31. Go configuration reference"
-      ],
-      "section": "31. Go configuration reference",
-      "text": "31. Go configuration reference\n\nLoad `daemon.yml` → `DefaultDaemon` → YAML → `applyEnv` → `prefixTopics`. Values support `${VAR}` / `${VAR:-default}`.",
-      "char_count": 150
-    },
-    {
-      "id": "readme-31-go-configuration-reference-shared-env-d7e36f2eff5461fd",
-      "source": "readme",
-      "title": "Shared env",
-      "heading_path": [
-        "31. Go configuration reference",
-        "Shared env"
-      ],
-      "section": "31. Go configuration reference",
-      "text": "31. Go configuration reference › Shared env\n\n`KAFKA_BROKERS`, `REDIS_URL`, `KAFKA_PREFIX`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_SCHEDULE_MYSQL_DSN`, `KAFKA_BATCH_STORE_MYSQL_DSN`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, metrics/liveness/performance env vars, consumer fetch/acks/stall, SF concurrency/claim window, cancellation TTL, jobs/fair/priority consumer concurrency.\n\nMySQL DSNs accept go-sql-driver form or `mysql2://` / `mysql://` URLs.",
+      "section": "18. Retries, RetryCancel, dead letter",
+      "text": "18. Retries, RetryCancel, dead letter › DLT\n\nCentral `Dlt.publish` → `dead_letter_topic` (30-day retention at creation). Types include: `malformed_event`, `incomplete_event`, `callback*`, `retry_routing`, `expired`, `malformed_ingest`, `schedule_route_error`, poison jobs, etc. Optional Redis `kafka_batch:dlt:stats`.\n\n`max_retries` library default **7** (install template often **3** — README essential table may match install, not library).\n\n---",
       "char_count": 447
     },
     {
-      "id": "readme-31-go-configuration-reference-go-only-knobs-ba1bbbe13f32b0bc",
+      "id": "readme-19-priority-queues-952179a65aba89e0",
       "source": "readme",
-      "title": "Go-only knobs",
+      "title": "19. Priority queues",
       "heading_path": [
-        "31. Go configuration reference",
-        "Go-only knobs"
+        "19. Priority queues"
       ],
-      "section": "31. Go configuration reference",
-      "text": "31. Go configuration reference › Go-only knobs\n\n| Knob | Default | Purpose |\n|------|---------|---------|\n| `jobs_consumer_concurrency` | 8 | In-process members plain jobs |\n| `fair_ready_consumer_concurrency` | 8 | Members per fair-ready lane |\n| `priority_consumer_concurrency` | 4 | Members per priority group |\n| `producer_required_acks` | `all_isr` | or `leader` |\n| `consumer_fetch_max_bytes` | 1 MiB | |\n| `consumer_fetch_max_partition_bytes` | 128 KiB | |\n| `consumer_fetch_max_wait_ms` | 200 | |\n| `consumer_stall_timeout` | 90s | Force reconnect on stall |\n| `fairness_enabled` | false | Daemon gate for fair dispatch |\n| `liveness_enabled` | false | HTTP health (Redis HB still on for SF) |\n| `liveness_http_addr` | `:8080` | |\n\nControl plane scales by **pods + partitions** (one franz-go client per group per pod; events fan out per partition).\n\n---",
-      "char_count": 861
+      "section": "19. Priority queues",
+      "text": "19. Priority queues\n\nYAML groups (Sidekiq-style):\n\n```yaml\nconsumer_group_suffix: jobs-fast\nmode: weighted   # or strict\nweighted_interleave: 4\ntopics: [p0, p1, p2]  # highest first\n```\n\n| Setting | Default |\n|---------|---------|\n| `priority_config_paths` | [] (+ env) |\n| `priority_lag_check_interval` | 2s |\n| `priority_weighted_interleave` | 4 |\n\nBoot: topic in exactly one group; default `jobs_topic` forbidden in priority YAML; `fairness_type` workers bypass priority.\n\nGate uses Admin lag; **fail-open** if cluster unreachable. Topic-level pause excludes topic from lag gate so lower ranks keep flowing. **Not preemption.**\n\nGo groups: `{CG}-go-worker-{suffix}` with `priority_consumer_concurrency` members (default 4).\n\n---",
+      "char_count": 731
     },
     {
-      "id": "readme-32-ruby-go-parity-gaps-2ea33ba006e6d3c8",
+      "id": "readme-20-cancellation-and-cancellationcache-a446bfe0272828d4",
       "source": "readme",
-      "title": "32. Ruby ↔ Go parity gaps",
+      "title": "20. Cancellation and CancellationCache",
       "heading_path": [
-        "32. Ruby ↔ Go parity gaps"
+        "20. Cancellation and CancellationCache"
       ],
-      "section": "32. Ruby ↔ Go parity gaps",
-      "text": "32. Ruby ↔ Go parity gaps\n\n| Setting | Ruby | Go | Action |\n|---------|------|-----|--------|\n| `super_fetch_concurrency` | 1 | 10 | Intentional; do not copy blindly |\n| `fairness_ready_window` | 500 | 100 | Set Go YAML to 500 for parity |\n| `schedule_poll_jitter` | 0.1 | 0 unless set | Set Go `0.1` |\n| Fairness enable | per-worker | `fairness_enabled` | Must set true on Go daemon |\n| Legacy CallbackConsumer | Ruby control | Go produces only | Need Ruby for legacy class callbacks |\n| SF lease/grace/reclaim env | many `KAFKA_BATCH_SUPER_FETCH_*` | often YAML-only | Set in daemon.yml |\n| `fairness_min_ingest_partitions` | 2 (warn) | internal | Ops often size ingest to 300 |\n| `max_retries` docs | README table may say 3 | both library 7 | Prefer Configuration / YAML |\n\n---",
-      "char_count": 780
+      "section": "20. Cancellation and CancellationCache",
+      "text": "20. Cancellation and CancellationCache\n\n`Batch.cancel(id)` → status cancelled + cancelled index. Consumers with `skip_cancelled_jobs` (default true) skip when ID is in process-local cache.\n\n| Setting | Default |\n|---------|---------|\n| `skip_cancelled_jobs` | true |\n| `cancellation_cache_ttl` | 120s |\n| `retry_cancel_ttl` | 7 days |\n\n`CancellationCache`: refresh at most every TTL from Redis cancelled index; web cancel calls `add(id)` for immediate same-process effect. SchedulePoller also drops scheduled jobs for cancelled batches.\n\nEventually consistent across pods up to TTL.\n\n---",
+      "char_count": 587
     },
     {
-      "id": "readme-33-atomicity-and-idempotency-matrix-e26791c8c62f46d5",
+      "id": "readme-21-consumption-pause-resume-0f6c3a027eaf4acc",
       "source": "readme",
-      "title": "33. Atomicity and idempotency matrix",
+      "title": "21. Consumption pause / resume",
       "heading_path": [
-        "33. Atomicity and idempotency matrix"
+        "21. Consumption pause / resume"
       ],
-      "section": "33. Atomicity and idempotency matrix",
-      "text": "33. Atomicity and idempotency matrix\n\n| Feature | Atomic primitive | Idempotency expectation |\n|---------|------------------|-------------------------|\n| Batch create | `HSETNX` Lua | Create-once |\n| Add jobs / seal | Lua | Reject after terminal |\n| Job completion count | Three bitmaps + counters in one Lua | Re-delivered events do not double-count |\n| Callback dispatch claim | `HSETNX` | One dispatcher; handler at-least-once |\n| SuperFetch claim | `CLAIM_LUA` + fence | Lost claim → ack duplicate |\n| SuperFetch complete | Fence `COMPLETE_LUA` | Stolen fence → no-op |\n| Workset reclaim | NX + `work:produced:` | At-most-once produce; at-least-once perform |\n| Fairness enqueue | Window Lua | Full → pause (no silent drop) |\n| Fairness checkout | Lease ZSET Lua | Complete by slot id idempotent |\n| Fairness forward | Forwarding HASH | Crash-safe pop→produce |\n| Uniqueness | SETNX + compare-del | Duplicate enqueue skipped/raised; fail-open on Redis error |\n| Schedule dispatch | Lease + reclaim | At-least-once due dispatch |\n| Reconciler | `SET NX EX` | Single sweeper |\n| Job `#perform` | — | **Always application-idempotent** |\n| Job callbacks | Deterministic `job_id` | **Always application-idempotent** |\n\n---",
-      "char_count": 1221
+      "section": "21. Consumption pause / resume",
+      "text": "21. Consumption pause / resume\n\nRedis:\n\n| Key | Members |\n|-----|---------|\n| `kafka_batch:consumption:topics` | `group\\x1ftopic` |\n| `kafka_batch:consumption:partitions` | `group\\x1ftopic\\x1fpartition` |\n\nConsumers (`ConsumptionGate`) refresh every `consumption_control_refresh_interval` (30s). UI reads fresh. MySQL fallback table when `store: :mysql` and Redis down. Go mirrors via franz-go PauseFetch so paused topics do not advance offsets.\n\n---",
+      "char_count": 450
     },
     {
-      "id": "readme-34-scaling-and-tuning-31cf91465f21e4ec",
+      "id": "readme-22-liveness-d915fd8fd11f379d",
       "source": "readme",
-      "title": "34. Scaling and tuning",
+      "title": "22. Liveness",
       "heading_path": [
-        "34. Scaling and tuning"
+        "22. Liveness"
       ],
-      "section": "34. Scaling and tuning",
-      "text": "34. Scaling and tuning\n\n1. Partitions ≥ peak_pods × (Karafka concurrency or Go members) × SuperFetch concurrency.\n2. Ruby: prefer pods over huge SF for CPU; keep product ≤ 10 in prod unless tested.\n3. Go: members ≈ partitions; SF ~50×cores for IO; 1–2×cores for CPU.\n4. `fairness_lease_ttl` and `super_fetch_lease_ttl` above longest job (+ renew margin).\n5. Schedule poller only on few control/scheduler pods.\n6. Workset reclaim on ≥1 control plane sharing Redis.\n7. Autoscale on lag; partitions fixed.\n8. Cap/shard mega-batches.\n9. Extreme throughput: `track_running_jobs = false` if per-job `/live` unused.\n10. Never share execution topic across Ruby and Go.\n11. One control plane per topic set.\n12. Size fair ingest partitions for active tenants when using exclusive dynamic partitions.\n13. Size `redis_pool_size` before raising Ruby SF.\n14. Fair ready backlog with ingest OK → raise `fairness_global_concurrency` or reduce oversubscribed workers.",
-      "char_count": 950
+      "section": "22. Liveness",
+      "text": "22. Liveness\n\n| Key | Role |\n|-----|------|\n| `kafka_batch:live:consumer:{id}` | Heartbeat JSON + TTL |\n| `kafka_batch:live:job:{consumer}:{job}` | Running job detail |\n\n| Setting | Default |\n|---------|---------|\n| `liveness_backend` (Ruby) | `:redis` or `:off` |\n| `liveness_ttl` | 180s |\n| `liveness_heartbeat_interval` | 20s |\n| `liveness_stats_interval` (Ruby) | 15s (0 disables RSS/CPU) |\n| `track_running_jobs` | true |\n\nCircuit breaker on Redis errors; best-effort; never fails hot path. Feeds SuperFetch orphan detection.\n\nGo: SuperFetch forces Redis heartbeats even if `liveness_enabled: false`; HTTP `/health`+`/live` only when enabled (`:8080` default). HTTP stale ≈ `3 × heartbeat_interval`.\n\n---",
+      "char_count": 709
     },
     {
-      "id": "readme-34-scaling-and-tuning-go-tuning-sketch-32-partit-07eed48bf1de6079",
+      "id": "readme-23-reconciler-e5c93af75f6b57f0",
+      "source": "readme",
+      "title": "23. Reconciler",
+      "heading_path": [
+        "23. Reconciler"
+      ],
+      "section": "23. Reconciler",
+      "text": "23. Reconciler\n\nRecovers:\n\n1. Stuck **running** — sealed, `completed+failed >= total`, status still running\n2. **Lost callback** — terminal status, callback timestamps null\n\n| Setting | Default |\n|---------|---------|\n| `reconciliation_interval` | 300s |\n| `reconciler_lock_ttl` | 600s |\n| `max_reconcile_per_run` | 100 |\n\nLock: `kafka_batch:b:reconciler_lock`. Summary: `kafka_batch:reconciler:last`, `:last_skip`. Skips open (unsealed) and genuinely in-progress batches.\n\nTriggers: EventConsumer/daemon background; `rake kafka_batch:reconcile`; `kbatch reconcile`.\n\n---",
+      "char_count": 571
+    },
+    {
+      "id": "readme-24-instrumentation-metrics-performancemetrics-in-6b5102e97b8c66db",
+      "source": "readme",
+      "title": "Instrumentation",
+      "heading_path": [
+        "24. Instrumentation, Metrics, PerformanceMetrics",
+        "Instrumentation"
+      ],
+      "section": "24. Instrumentation, Metrics, PerformanceMetrics",
+      "text": "24. Instrumentation, Metrics, PerformanceMetrics › Instrumentation\n\nActiveSupport::Notifications pattern `*.kafka_batch` (Ruby). Go `pkg/instrument` mirrors events: `job.processed/retried/failed`, `batch.*`, `callback.*`, `dlt.published`, `workset.reclaimed`, `super_fetch.drained`, `scheduled.*`, `reconciler.ran`, etc.",
+      "char_count": 320
+    },
+    {
+      "id": "readme-24-instrumentation-metrics-performancemetrics-me-e2e0fe0764e1d409",
+      "source": "readme",
+      "title": "Metrics export",
+      "heading_path": [
+        "24. Instrumentation, Metrics, PerformanceMetrics",
+        "Metrics export"
+      ],
+      "section": "24. Instrumentation, Metrics, PerformanceMetrics",
+      "text": "24. Instrumentation, Metrics, PerformanceMetrics › Metrics export\n\nOpt-in `metrics_enabled`. Adapters StatsD/Datadog/proc (Ruby) or StatsD (Go). You supply the client. Prefix `kafka_batch`.",
+      "char_count": 189
+    },
+    {
+      "id": "readme-24-instrumentation-metrics-performancemetrics-pe-4fe520596d9035de",
+      "source": "readme",
+      "title": "Performance dashboard metrics",
+      "heading_path": [
+        "24. Instrumentation, Metrics, PerformanceMetrics",
+        "Performance dashboard metrics"
+      ],
+      "section": "24. Instrumentation, Metrics, PerformanceMetrics",
+      "text": "24. Instrumentation, Metrics, PerformanceMetrics › Performance dashboard metrics\n\nOpt-in Redis minute buckets shared by Ruby + Go for Web UI `/performance`:\n\n`kafka_batch:perf:min:{epoch}:{processed|failed|retried|reclaimed}`\n\nFields: `_all`, per `job_type`, `_other` overflow.\n\n| Knob | Default |\n|------|---------|\n| `performance_metrics_enabled` | false |\n| `performance_metrics_retention` | 86400 |\n| `performance_metrics_max_job_types` | 50 |\n| `performance_metrics_bucket_seconds` | 60 |\n| `performance_metrics_sample_rate` | 1.0 |\n\nBest-effort; never raises into hot path.\n\n---",
+      "char_count": 584
+    },
+    {
+      "id": "readme-25-stores-redis-vs-mysql-config-store-5aea145abe47279f",
+      "source": "readme",
+      "title": "`config.store`",
+      "heading_path": [
+        "25. Stores — Redis vs MySQL",
+        "`config.store`"
+      ],
+      "section": "25. Stores — Redis vs MySQL",
+      "text": "25. Stores — Redis vs MySQL › `config.store`\n\n| Concern | `:redis` | `:mysql` |\n|---------|----------|----------|\n| Batch ledger / bitmaps | Redis | **Still Redis** (MysqlStore delegates ledger) |\n| Failure log | none (DLT + retry topics) | `kafka_batch_failures` |\n| Pause state | Redis | MySQL fallback |\n| Migrations | none | required |",
+      "char_count": 339
+    },
+    {
+      "id": "readme-25-stores-redis-vs-mysql-config-schedule-store-i-fdc6978c00de6de8",
+      "source": "readme",
+      "title": "`config.schedule_store` (independent)",
+      "heading_path": [
+        "25. Stores — Redis vs MySQL",
+        "`config.schedule_store` (independent)"
+      ],
+      "section": "25. Stores — Redis vs MySQL",
+      "text": "25. Stores — Redis vs MySQL › `config.schedule_store` (independent)\n\n| `:redis` | `:mysql` |\n|----------|----------|\n| ZSET index | `kafka_batch_scheduled_jobs` |",
+      "char_count": 162
+    },
+    {
+      "id": "readme-25-stores-redis-vs-mysql-recurring-cron-tables-i-15af4dcba94e130e",
+      "source": "readme",
+      "title": "Recurring cron tables (independent of `store`; MySQL required)",
+      "heading_path": [
+        "25. Stores — Redis vs MySQL",
+        "Recurring cron tables (independent of `store`; MySQL required)"
+      ],
+      "section": "25. Stores — Redis vs MySQL",
+      "text": "25. Stores — Redis vs MySQL › Recurring cron tables (independent of `store`; MySQL required)\n\n| Table | Role |\n|-------|------|\n| `kafka_batch_recurring_schedules` | Cron definitions (see §17) |\n| `kafka_batch_recurring_fires` | Fire ledger PK `(schedule_id, fire_at)` |\n\nRuby binds via `schedule_store_database_connection`. Go uses `recurring_mysql_dsn` (fallback `schedule_mysql_dsn`). Install: `rails g kafka_batch:install --recurring` or Go README SQL block C / `EnsureSchema`.\n\nHot batch counters are **never** in SQL by design.\n\n---",
+      "char_count": 538
+    },
+    {
+      "id": "readme-26-topics-partitions-create-all-b7ab94c871ba2bdc",
+      "source": "readme",
+      "title": "26. Topics, partitions, create_all",
+      "heading_path": [
+        "26. Topics, partitions, create_all"
+      ],
+      "section": "26. Topics, partitions, create_all",
+      "text": "26. Topics, partitions, create_all\n\nRuby `KafkaBatch::Topics` / rake `kafka_batch:create_topics` / `kafka_batch:topics` (dry-run).\n\nGo: `kbatch topics create|validate`.",
+      "char_count": 168
+    },
+    {
+      "id": "readme-26-topics-partitions-create-all-default-partitio-18214db0bdddfcb7",
+      "source": "readme",
+      "title": "DEFAULT_PARTITIONS (Ruby)",
+      "heading_path": [
+        "26. Topics, partitions, create_all",
+        "DEFAULT_PARTITIONS (Ruby)"
+      ],
+      "section": "26. Topics, partitions, create_all",
+      "text": "26. Topics, partitions, create_all › DEFAULT_PARTITIONS (Ruby)\n\nThese are **create_topics defaults only** — not necessarily what exists on a live cluster.\nKafka cannot shrink partitions; ops often create smaller topics for local/dev (e.g. 10).\n\n| Category | Create default |\n|----------|----------------|\n| jobs / priority / ready | 768 |\n| events | 48 |\n| callbacks | 6 |\n| retry per tier | 12 |\n| scheduled | 48 |\n| dead_letter | 3 |\n| fair ingest per lane | 300 |\n\nEnv: `REPLICATION_FACTOR` (default 3), `PARTITIONS` uniform override.\n\nScheduled retention ≥ `max_schedule_horizon` (+1 day buffer). DLT retention 30 days at creation. Existing topics skipped, never altered.\n\n**Manifest plain Go topics** are not always auto-discovered by Ruby `create_topics` — create them explicitly or via Go topics CLI.",
+      "char_count": 807
+    },
+    {
+      "id": "readme-26-topics-partitions-create-all-live-broker-inve-54e1bc96369a3b75",
+      "source": "readme",
+      "title": "Live broker inventory (AI + ops)",
+      "heading_path": [
+        "26. Topics, partitions, create_all",
+        "Live broker inventory (AI + ops)"
+      ],
+      "section": "26. Topics, partitions, create_all",
+      "text": "26. Topics, partitions, create_all › Live broker inventory (AI + ops)\n\nOn AI knowledge sync (NX-locked, at most every 24h with the config snapshot), `KafkaBatch::Topics.inventory` merges:\n\n| Field | Meaning |\n|-------|---------|\n| `live_broker_partitions` / `broker_partitions` | Actual count from `Karafka::Admin.cluster_info` |\n| `create_default_partitions` / `configured_partitions` | `DEFAULT_PARTITIONS` / create_topics intent |\n| `status` | `matches_default` / `differs_from_default` / `missing_on_broker` / `broker_unavailable` |\n\nAlways includes both fairness lanes’ ingest + ready (`.ruby` / `.go`) even when Worker classes are not loaded (UI-only pods). Stored in Redis `kafka_batch:ai:knowledge:config` → `topic_inventory` and the `config:live` RAG chunk.\n\n**Assistant rule:** when asked “how many partitions does topic X have?”, answer from `live_broker_partitions`. Never report 768 / DEFAULT_PARTITIONS as the live count unless broker metadata is unavailable (then say so).\n\n---",
+      "char_count": 992
+    },
+    {
+      "id": "readme-27-deployment-consumer-groups-kb-role-daemon-mod-bad9a6f9bd795380",
+      "source": "readme",
+      "title": "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+      "heading_path": [
+        "27. Deployment, consumer groups, KB_ROLE, daemon_mode"
+      ],
+      "section": "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+      "text": "27. Deployment, consumer groups, KB_ROLE, daemon_mode\n\n`CG` = `consumer_group` (default `kafka-batch`; with prefix `myapp` → `myapp.kafka-batch`).",
+      "char_count": 146
+    },
+    {
+      "id": "readme-27-deployment-consumer-groups-kb-role-daemon-mod-e5b1897b94700fed",
+      "source": "readme",
+      "title": "Ruby groups (`draw_routes`)",
+      "heading_path": [
+        "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+        "Ruby groups (`draw_routes`)"
+      ],
+      "section": "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+      "text": "27. Deployment, consumer groups, KB_ROLE, daemon_mode › Ruby groups (`draw_routes`)\n\n| Group | Tier | Consumers |\n|-------|------|-----------|\n| `{CG}-control` | Control | Event, Callback, Retry |\n| `{CG}-dispatch-{lane}` | Control | Fairness::Dispatcher |\n| `{CG}-jobs-fair-{lane}` | Execution | JobConsumer on ruby ready |\n| `{CG}-{priority-suffix}` | Execution | PriorityJobConsumer |\n| `{CG}-jobs` | Execution | plain + non-priority manifest topics |\n\n`daemon_mode` / `KAFKA_BATCH_DAEMON_MODE` skips `draw_routes` entirely (API enqueue-only).",
+      "char_count": 546
+    },
+    {
+      "id": "readme-27-deployment-consumer-groups-kb-role-daemon-mod-97361a84f8352958",
+      "source": "readme",
+      "title": "Go groups",
+      "heading_path": [
+        "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+        "Go groups"
+      ],
+      "section": "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+      "text": "27. Deployment, consumer groups, KB_ROLE, daemon_mode › Go groups\n\n| Group | Role |\n|-------|------|\n| `{CG}-events` / retry / dispatch (daemon) | Control |\n| `{CG}-go-worker-jobs` | Plain Go jobs |\n| `{CG}-go-worker-fair-ready-{lane}` | Fair Go ready |\n| `{CG}-go-worker-{priority-suffix}` | Priority Go |",
+      "char_count": 306
+    },
+    {
+      "id": "readme-27-deployment-consumer-groups-kb-role-daemon-mod-64204c8ae843a710",
+      "source": "readme",
+      "title": "KB_ROLE (schedule poller / recurring helper — does not filter Karafka groups by itself)",
+      "heading_path": [
+        "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+        "KB_ROLE (schedule poller / recurring helper — does not filter Karafka groups by itself)"
+      ],
+      "section": "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+      "text": "27. Deployment, consumer groups, KB_ROLE, daemon_mode › KB_ROLE (schedule poller / recurring helper — does not filter Karafka groups by itself)\n\n| Role | Poller / recurring pattern |\n|------|----------------------------|\n| `all`, `scheduler` | schedule poller on (generated initializer); also set `recurring_scheduler_enabled` on those pods when using cron |\n| other | poller off unless `KB_SCHEDULE_POLLER=true`; recurring off unless `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED=true` / YAML |\n\nFilter groups explicitly: `karafka server --include-consumer-groups ...`.",
+      "char_count": 565
+    },
+    {
+      "id": "readme-27-deployment-consumer-groups-kb-role-daemon-mod-dd5c0ba6cdf9228b",
+      "source": "readme",
+      "title": "Layouts",
+      "heading_path": [
+        "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+        "Layouts"
+      ],
+      "section": "27. Deployment, consumer groups, KB_ROLE, daemon_mode",
+      "text": "27. Deployment, consumer groups, KB_ROLE, daemon_mode › Layouts\n\nAll-in-one (dev), standalone (small prod), split (scale). Mixed: Ruby or Go control **xor** per topic set; Ruby exec + Go exec in parallel on different topics.\n\n---",
+      "char_count": 229
+    },
+    {
+      "id": "readme-28-web-ui-and-json-api-34740cec2d1fe530",
+      "source": "readme",
+      "title": "28. Web UI and JSON API",
+      "heading_path": [
+        "28. Web UI and JSON API"
+      ],
+      "section": "28. Web UI and JSON API",
+      "text": "28. Web UI and JSON API\n\nMount `KafkaBatch::Web` at `/kafka_batch` behind host auth.",
+      "char_count": 84
+    },
+    {
+      "id": "readme-28-web-ui-and-json-api-pages-1f22330a5699b8ca",
+      "source": "readme",
+      "title": "Pages",
+      "heading_path": [
+        "28. Web UI and JSON API",
+        "Pages"
+      ],
+      "section": "28. Web UI and JSON API",
+      "text": "28. Web UI and JSON API › Pages\n\n`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/recurring`, `/reconciler`, `/system`, `/audit`, `/performance`, `/ai`\n\nLive refresh: localStorage `kafka_batch_live`, 5s.",
+      "char_count": 266
+    },
+    {
+      "id": "readme-28-web-ui-and-json-api-dashboard-metrics-get-api-ff5a43114a87cd24",
+      "source": "readme",
+      "title": "Dashboard metrics (`GET /api/dashboard`)",
+      "heading_path": [
+        "28. Web UI and JSON API",
+        "Dashboard metrics (`GET /api/dashboard`)"
+      ],
+      "section": "28. Web UI and JSON API",
+      "text": "28. Web UI and JSON API › Dashboard metrics (`GET /api/dashboard`)\n\n| Field | Meaning |\n|-------|---------|\n| `counts` / `total` | Batch status counters from Redis ledger |\n| `pending_jobs` | Untouched jobs in **running batches** (ledger) — UI label “Pending in batches” |\n| `topic_pending` | Sum of Kafka consumer-group lag across gem topics **excluding** scheduled log-archive rows — UI label “Jobs pending” (links to `/lag`) |\n| `liveness` | Live consumers + running jobs when liveness is on |\n\nDo not conflate `pending_jobs` (batch ledger) with `topic_pending` (Kafka lag). Fair ingest + ready can both count the same logical job mid-pipeline in the lag sum.",
+      "char_count": 662
+    },
+    {
+      "id": "readme-28-web-ui-and-json-api-system-page-6356ce4c5ac5999e",
+      "source": "readme",
+      "title": "System page",
+      "heading_path": [
+        "28. Web UI and JSON API",
+        "System page"
+      ],
+      "section": "28. Web UI and JSON API",
+      "text": "28. Web UI and JSON API › System page\n\nRead-only `KafkaBatch::SystemInfo` sections: Overview, Kafka, Redis, MySQL (if store), SuperFetch, Uniqueness, Liveness, Fairness, Scheduled jobs, Retry, Reconciliation, Cancellation, Priority, Retention, Performance metrics, Instrumentation metrics, Audit, AI, optional rdkafka overrides. Secrets masked. Recurring schedules are managed on `/recurring` (not a dedicated SystemInfo block today).",
+      "char_count": 434
+    },
+    {
+      "id": "readme-28-web-ui-and-json-api-ai-assistant-4ba62256db24e06e",
+      "source": "readme",
+      "title": "AI assistant",
+      "heading_path": [
+        "28. Web UI and JSON API",
+        "AI assistant"
+      ],
+      "section": "28. Web UI and JSON API",
+      "text": "28. Web UI and JSON API › AI assistant\n\nSettings + shared chat at `/ai`. RAG over packaged `knowledge_chunks.json` + live config snapshot (`config:live`). OpenRouter key encrypted in Redis (`kafka_batch:ai:settings`). Never touches operational ledger/fairness/workset/cron-lock keys.",
+      "char_count": 283
+    },
+    {
+      "id": "readme-28-web-ui-and-json-api-mutating-api-csrf-cookie-525fde72906284bb",
+      "source": "readme",
+      "title": "Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)",
+      "heading_path": [
+        "28. Web UI and JSON API",
+        "Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)"
+      ],
+      "section": "28. Web UI and JSON API",
+      "text": "28. Web UI and JSON API › Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)\n\nBatch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; recurring upsert/pause/resume/delete/run-now (§17); AI settings/chat/history.\n\nOptional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.\n\n---",
+      "char_count": 351
+    },
+    {
+      "id": "readme-29-redis-key-namespace-catalog-f8bb9428393d3b52",
+      "source": "readme",
+      "title": "29. Redis key namespace catalog",
+      "heading_path": [
+        "29. Redis key namespace catalog"
+      ],
+      "section": "29. Redis key namespace catalog",
+      "text": "29. Redis key namespace catalog\n\n| Prefix / pattern | Subsystem |\n|------------------|-----------|\n| `kafka_batch:b:{id}` | Batch hash |\n| `kafka_batch:b:seq:{id}` | batch_seq allocator |\n| `kafka_batch:b:bitmap:{id}` | Touch bitmap |\n| `kafka_batch:b:okbit:{id}` | Success bitmap |\n| `kafka_batch:b:failbit:{id}` | Fail bitmap |\n| `kafka_batch:b:reconciler_lock` | Reconciler lock |\n| `kafka_batch:index:running` | Running ZSET |\n| `kafka_batch:index:done` | Done / callback-pending ZSET |\n| `kafka_batch:index:all` | UI listing ZSET |\n| `kafka_batch:index:cancelled` | Cancelled ZSET |\n| `kafka_batch:counts` | Status counters HASH |\n| `kafka_batch:uniq:{digest}` | Uniqueness locks |\n| `kafka_batch:sched:pending` | Schedule index |\n| `kafka_batch:sched:inflight` | Schedule leases |\n| `kafka_batch:sched:read_miss` | Schedule read failures |\n| `kafka_batch:cron:leader_lock` | Recurring ticker leader lease (§17) |\n| `kafka_batch:fair_time:*` / `fair_throughput:*` | WFQ per lane |\n| `kafka_batch:tenant_partitions:{lane}` (+ `:free`, `:partition_count`) | Dynamic partitions |\n| `kafka_batch:work:job:*` | SuperFetch workset |\n| `kafka_batch:work:by_consumer:*` | Workset by consumer |\n| `kafka_batch:work:index` | Workset ZSET |\n| `kafka_batch:work:reclaiming:*` | Reclaim state |\n| `kafka_batch:work:produced:*` | Re-produce dedup |\n| `kafka_batch:live:job:*` / `live:consumer:*` | Liveness |\n| `kafka_batch:consumption:topics` / `partitions` | Pause state |\n| `kafka_batch:retry:cancel` / `retry:skip` | Retry UI cancel |\n| `kafka_batch:reconciler:last` / `last_skip` | Sweep summary |\n| `kafka_batch:perf:min:*` | Performance metrics |\n| `kafka_batch:dlt:stats` | DLT stats |\n\nAssistant must not touch these operational keys.\n\n---",
+      "char_count": 1739
+    },
+    {
+      "id": "readme-30-kafka-topic-catalog-3ba4b1769502c34d",
+      "source": "readme",
+      "title": "30. Kafka topic catalog",
+      "heading_path": [
+        "30. Kafka topic catalog"
+      ],
+      "section": "30. Kafka topic catalog",
+      "text": "30. Kafka topic catalog\n\nDefaults with empty prefix:\n\n| Topic | Group / reader | Consumer |\n|-------|----------------|----------|\n| `kafka_batch.jobs` | `{CG}-jobs` | JobConsumer |\n| `kafka_batch.events` | `{CG}-control` / Go events | EventConsumer |\n| `kafka_batch.callbacks` | `{CG}-control` | CallbackConsumer (Ruby) |\n| `kafka_batch.jobs.retry.{tier}` | control | RetryConsumer |\n| `kafka_batch.scheduled` | SchedulePoller (no CG) | poller |\n| `kafka_batch.dead_letter` | UI reader | — |\n| `kafka_batch.fair_*_ingest` | `{CG}-dispatch-*` | Dispatcher |\n| `kafka_batch.fair_*_ready.ruby` | `{CG}-jobs-fair-*` | JobConsumer |\n| `kafka_batch.fair_*_ready.go` | Go fair-ready | kbatch worker |\n| Custom / priority / manifest | respective groups | Job/Priority/Go |\n\n---",
+      "char_count": 769
+    },
+    {
+      "id": "readme-31-ruby-configuration-reference-94e4a50a677133cd",
+      "source": "readme",
+      "title": "31. Ruby configuration reference",
+      "heading_path": [
+        "31. Ruby configuration reference"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference\n\nAll on `KafkaBatch.config`. Library `initialize` defaults below; install generator may ship larger production values.",
+      "char_count": 151
+    },
+    {
+      "id": "readme-31-ruby-configuration-reference-connection-ident-e1de9c7e1d7a7ad0",
+      "source": "readme",
+      "title": "Connection / identity / topics",
+      "heading_path": [
+        "31. Ruby configuration reference",
+        "Connection / identity / topics"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference › Connection / identity / topics\n\n`brokers`, `redis_url`/`redis`, `redis_pool_size`, `topic_prefix`, `consumer_group`, `jobs_topic`, `events_topic`, `callbacks_topic`, `dead_letter_topic`, `retry_topic`, `scheduled_topic`, all `fair_*` topic accessors, `extra_job_topics`, `jobs_topics`, `handler_manifest_path`, `validate_topics_on_boot`, `topics_replication_factor`, `daemon_mode`, `producer_config`, `consumer_config`, `logger`, `web_authenticator`.",
+      "char_count": 485
+    },
+    {
+      "id": "readme-31-ruby-configuration-reference-store-retention-763dc5112db9acf7",
+      "source": "readme",
+      "title": "Store / retention",
+      "heading_path": [
+        "31. Ruby configuration reference",
+        "Store / retention"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference › Store / retention\n\n`store`, `store_database_connection`, `batch_ttl`, `all_index_max_size`, `failures_ttl`, `max_failures_per_batch`, `retry_cancel_ttl`.",
+      "char_count": 188
+    },
+    {
+      "id": "readme-31-ruby-configuration-reference-superfetch-uniq-18f3365b8dc4fe80",
+      "source": "readme",
+      "title": "SuperFetch / uniq / cancel / liveness / consumption",
+      "heading_path": [
+        "31. Ruby configuration reference",
+        "SuperFetch / uniq / cancel / liveness / consumption"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference › SuperFetch / uniq / cancel / liveness / consumption\n\nSee sections 10, 14, 20, 22, 21.",
+      "char_count": 120
+    },
+    {
+      "id": "readme-31-ruby-configuration-reference-retry-da1352f8e98665d3",
+      "source": "readme",
+      "title": "Retry",
+      "heading_path": [
+        "31. Ruby configuration reference",
+        "Retry"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference › Retry\n\n| Option | Default |\n|--------|---------|\n| `max_retries` | 7 |\n| `retry_jitter` | 0.1 |\n| `retry_tiers` | short 30 / medium 420 / large 1200 |\n| `retry_tier_progression` | short→medium→large |\n| `retry_max_pause_seconds` | 30 |\n| `event_emit_retries` | 3 |\n| `event_emit_backoff` | 1 |",
+      "char_count": 328
+    },
+    {
+      "id": "readme-31-ruby-configuration-reference-schedule-fairnes-527bf32dba23f7b4",
+      "source": "readme",
+      "title": "Schedule / fairness / priority / reconciler / producer / audit / metrics / recurring",
+      "heading_path": [
+        "31. Ruby configuration reference",
+        "Schedule / fairness / priority / reconciler / producer / audit / metrics / recurring"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference › Schedule / fairness / priority / reconciler / producer / audit / metrics / recurring\n\nSee respective sections. Notable fairness defaults: `fairness_global_concurrency=50`, `fairness_ready_window=500`, `fairness_lease_ttl=1800`, `fairness_weighted_concurrency=true`, `fairness_dynamic_tenant_partitions=true`, `fairness_min_ingest_partitions=2`, `fairness_dispatcher_batch_size=50`, `fairness_dispatcher_concurrency=5`, `fairness_forwarder_idle_sleep=0.05`, `fairness_forwarding_recovery_grace=5.0`, `fairness_slot_dedup_ttl=0`, `fairness_active_count_ttl=5`, `fairness_active_count_source=:inflight_plus_ready`, `fairness_weight_cache_ttl=60`, `fairness_default_weight=1.0`, `fairness_max_inflight_per_tenant=0`.",
+      "char_count": 747
+    },
+    {
+      "id": "readme-31-ruby-configuration-reference-recurring-cron-f-e344360f0fba7b66",
+      "source": "readme",
+      "title": "Recurring cron (full table in §17)",
+      "heading_path": [
+        "31. Ruby configuration reference",
+        "Recurring cron (full table in §17)"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference › Recurring cron (full table in §17)\n\n| Option | Default |\n|--------|---------|\n| `recurring_scheduler_enabled` | false (env `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED`) |\n| `recurring_window` | 30.0 |\n| `recurring_lock_ttl` | 60 |\n| `recurring_batch_size` | 100 |\n| `recurring_misfire_grace` | 60.0 |\n| `recurring_max_backfill` | 1000 |\n| `recurring_recover_every` | 300.0 |\n| `recurring_recover_grace` | 120.0 |\n| `recurring_prune_every` | 3600.0 |\n| `recurring_prune_retention` | 604800 |\n| `recurring_heartbeat_every` | 60.0 |\n| `recurring_stale_factor` | 2.0 |\n\nAlso: `schedule_store_database_connection` (shared with MySQL delayed-job index + recurring tables).",
+      "char_count": 698
+    },
+    {
+      "id": "readme-31-ruby-configuration-reference-env-overrides-se-2c0f7708b5a351e3",
+      "source": "readme",
+      "title": "Env overrides (selected)",
+      "heading_path": [
+        "31. Ruby configuration reference",
+        "Env overrides (selected)"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference › Env overrides (selected)\n\n`KAFKA_BATCH_SUPER_FETCH_*`, `KAFKA_BATCH_LIVENESS_*`, `KAFKA_BATCH_REDIS_POOL_SIZE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_PERFORMANCE_METRICS_*`, `KAFKA_BATCH_RECURRING_*` (all twelve knobs in §17), `KB_ROLE`, `KB_SCHEDULE_POLLER`.\n\n---",
+      "char_count": 417
+    },
+    {
+      "id": "readme-32-go-configuration-reference-9f5390d88b733c69",
+      "source": "readme",
+      "title": "32. Go configuration reference",
+      "heading_path": [
+        "32. Go configuration reference"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference\n\nAligned with [kafka-batch-go README appendix](https://github.com/y-shashank/kafka-batch-go) and `DefaultDaemon()` / `LoadDaemon` / `applyEnv`.",
+      "char_count": 174
+    },
+    {
+      "id": "readme-32-go-configuration-reference-load-order-1390cfa6e86aec81",
+      "source": "readme",
+      "title": "Load order",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Load order"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Load order\n\n`DefaultDaemon()` → YAML file → `${VAR}` / `${VAR:-default}` expansion → field merge → `applyEnv()` → `prefixTopics()`.\n\nMost numeric YAML values only override when **positive** (zeros often mean “keep default”).",
+      "char_count": 257
+    },
+    {
+      "id": "readme-32-go-configuration-reference-kafka-identity-a672121f2deb7120",
+      "source": "readme",
+      "title": "Kafka & identity",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Kafka & identity"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Kafka & identity\n\n| Key | Default |\n|-----|---------|\n| `brokers` | `[\"localhost:9092\"]` |\n| `topic_prefix` | `\"\"` |\n| `consumer_group` | `kafka-batch` |\n| `node_id` | hostname#pid |\n| `handler_manifest` | path string |\n| `jobs_topics` | derived from manifest if empty |\n| `redis_url` | `redis://localhost:6379/0` |",
+      "char_count": 348
+    },
+    {
+      "id": "readme-32-go-configuration-reference-core-topics-8d7f633a230b2e90",
+      "source": "readme",
+      "title": "Core topics",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Core topics"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Core topics\n\n| Key | Default |\n|-----|---------|\n| `events_topic` | `kafka_batch.events` |\n| `callbacks_topic` | `kafka_batch.callbacks` |\n| `dead_letter_topic` | `kafka_batch.dead_letter` |\n| `retry_topic` | `kafka_batch.jobs.retry` (base; tiers append `.short`/`.medium`/`.large`) |",
+      "char_count": 317
+    },
+    {
+      "id": "readme-32-go-configuration-reference-retry-producer-fet-d4ec4d4f08ce6231",
+      "source": "readme",
+      "title": "Retry / producer / fetch",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Retry / producer / fetch"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Retry / producer / fetch\n\n| Key | Default |\n|-----|---------|\n| `max_retries` | 7 |\n| `retry_tiers` | short 30 / medium 420 / large 1200 (seconds) |\n| `retry_max_pause` | 30 s |\n| `producer_required_acks` | `all_isr` (`leader` allowed) |\n| `consumer_fetch_max_bytes` | 1048576 (1 MiB) |\n| `consumer_fetch_max_partition_bytes` | 131072 (128 KiB) |\n| `consumer_fetch_max_wait_ms` | 200 |\n| `consumer_stall_timeout` | 90 s |\n\n**Code-only (not YAML today):** `retry_jitter` 0.1, `event_emit_retries` 3, `event_emit_backoff` 1s, `batch_ttl` 7d, `retry_progression` short→medium→large.",
+      "char_count": 612
+    },
+    {
+      "id": "readme-32-go-configuration-reference-worker-throughput-7a9cbc0d88971a89",
+      "source": "readme",
+      "title": "Worker throughput (`kbatch worker`)",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Worker throughput (`kbatch worker`)"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Worker throughput (`kbatch worker`)\n\n| Key | Default |\n|-----|---------|\n| `jobs_consumer_concurrency` | 8 |\n| `fair_ready_consumer_concurrency` | 8 |\n| `priority_consumer_concurrency` | 4 |\n| `super_fetch_concurrency` | 10 |\n| `super_fetch_claim_window` | 0 → **2×** concurrency |\n| `super_fetch_lease_ttl` | 120 s |\n| `super_fetch_reclaim_interval` | 30 s |\n| `super_fetch_reclaim_limit` | 100 |\n| `super_fetch_orphan_grace` | 40 s |\n| `super_fetch_drain_timeout` | 30 s |\n| `execution_mode` | `superfetch` (`watermark` advanced — Redis-free offset watermark; requires idempotent handlers; one mode per topic) |",
+      "char_count": 646
+    },
+    {
+      "id": "readme-32-go-configuration-reference-delayed-jobs-sched-a571de23762f0dba",
+      "source": "readme",
+      "title": "Delayed jobs (SchedulePoller)",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Delayed jobs (SchedulePoller)"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Delayed jobs (SchedulePoller)\n\n| Key | Default | Notes |\n|-----|---------|-------|\n| `schedule_poller_enabled` | false | Scheduler/control pods only |\n| `scheduled_topic` | `kafka_batch.scheduled` | |\n| `schedule_store` | empty → **redis** | `mysql` needs SQL block A |\n| `schedule_mysql_dsn` | | env `KAFKA_BATCH_SCHEDULE_MYSQL_DSN` |\n| `schedule_poll_interval` | 5 s | |\n| `schedule_poll_max_interval` | 60 s | |\n| `schedule_poll_jitter` | **0** | ⚠️ set `0.1` for Ruby parity |\n| `schedule_batch_size` | 100 | |\n| `schedule_lease_seconds` | 60 | |\n| `schedule_reclaim_interval` | 30 s | |",
+      "char_count": 624
+    },
+    {
+      "id": "readme-32-go-configuration-reference-recurring-cron-see-c4d0f86fb11b5ddb",
+      "source": "readme",
+      "title": "Recurring cron (see §17)",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Recurring cron (see §17)"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Recurring cron (see §17)\n\n| Key | Default |\n|-----|---------|\n| `recurring_scheduler_enabled` | false |\n| `recurring_mysql_dsn` | falls back to `schedule_mysql_dsn` |\n| `recurring_window` | 30 s |\n| `recurring_lock_ttl` | 60 s |\n| `recurring_batch_size` | 100 |\n| `recurring_misfire_grace` | 60 s |\n| `recurring_max_backfill` | 1000 |\n| `recurring_recover_every` | 300 s |\n| `recurring_recover_grace` | 120 s |\n| `recurring_prune_every` | 3600 s |\n| `recurring_prune_retention` | 604800 s (7d) |\n| `recurring_heartbeat_every` | 60 s |\n| `recurring_stale_factor` | 2.0 |\n\nNo `KAFKA_BATCH_RECURRING_*` env vars in Go today — YAML only.",
+      "char_count": 666
+    },
+    {
+      "id": "readme-32-go-configuration-reference-priority-9b3b4dafec8cad89",
+      "source": "readme",
+      "title": "Priority",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Priority"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Priority\n\n| Key | Default |\n|-----|---------|\n| `priority_config_paths` | `[]` |\n| `priority_lag_check_interval` | 2 s |\n| `priority_weighted_interleave` | 4 |",
+      "char_count": 192
+    },
+    {
+      "id": "readme-32-go-configuration-reference-fairness-09210c0ac74074f0",
+      "source": "readme",
+      "title": "Fairness",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Fairness"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Fairness\n\n| Key | Default | Notes |\n|-----|---------|-------|\n| `fairness_enabled` | **false** | Must set true for fair dispatch |\n| `fairness_time_ingest` / `_ready` / `_ready_go` / `_ready_ruby` | `kafka_batch.fair_time_*` | |\n| `fairness_throughput_ingest` / `_ready` / `_ready_go` / `_ready_ruby` | `kafka_batch.fair_throughput_*` | |\n| `fairness_ready_window` | **100** | ⚠️ Ruby 500 — set 500 for parity |\n| `fairness_global_concurrency` | 50 | |\n| `fairness_max_inflight_per_tenant` | 0 | 0 = dynamic share |\n| `fairness_lease_ttl` | 1800 s | |\n| `fairness_default_weight` | 1.0 | |\n| `fairness_weighted_concurrency` | true | |\n| `fairness_active_count_ttl` | 5 s | |\n| `fairness_active_count_source` | `inflight_plus_ready` | or `inflight` |\n| `fairness_dynamic_tenant_partitions` | true | |\n| `fairness_tenant_partition_cache_ttl` | 30 s | |\n| `fairness_tenant_partitions` | map | static pins win |",
+      "char_count": 940
+    },
+    {
+      "id": "readme-32-go-configuration-reference-store-cancel-consu-675e8351fe817204",
+      "source": "readme",
+      "title": "Store / cancel / consumption / reconciler",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Store / cancel / consumption / reconciler"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Store / cancel / consumption / reconciler\n\n| Key | Default |\n|-----|---------|\n| `store` | redis (`mysql` → SQL block B) |\n| `store_mysql_dsn` | env `KAFKA_BATCH_STORE_MYSQL_DSN` |\n| `skip_cancelled_jobs` | true |\n| `cancellation_cache_ttl` | 120 s |\n| `consumption_control_refresh_interval` | 30 s |\n| `reconciliation_interval` | 300 s |\n| `reconciler_lock_ttl` | 600 s |\n| `max_reconcile_per_run` | 100 |",
+      "char_count": 439
+    },
+    {
+      "id": "readme-32-go-configuration-reference-liveness-metrics-p-d0742d4dd3e09cb3",
+      "source": "readme",
+      "title": "Liveness / metrics / performance",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Liveness / metrics / performance"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Liveness / metrics / performance\n\n| Key | Default |\n|-----|---------|\n| `liveness_enabled` | false |\n| `liveness_http_addr` | `:8080` |\n| `liveness_ttl` | 180 s |\n| `liveness_heartbeat_interval` | 20 s |\n| `track_running_jobs` | true |\n| `metrics_enabled` | false |\n| `metrics_prefix` | `kafka_batch` |\n| `metrics_statsd_addr` | |\n| `performance_metrics_enabled` | false |\n| `performance_metrics_retention` | 86400 s |\n| `performance_metrics_max_job_types` | 50 |\n| `performance_metrics_bucket_seconds` | 60 |\n| `performance_metrics_sample_rate` | 1.0 |\n| `redis_rtt_probe_interval` | 15 s |\n| `redis_rtt_probe_timeout` | 0.2 s |",
+      "char_count": 662
+    },
+    {
+      "id": "readme-32-go-configuration-reference-env-overrides-appl-fe925ea0706c6d8c",
+      "source": "readme",
+      "title": "Env overrides (`applyEnv` — complete list)",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Env overrides (`applyEnv` — complete list)"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Env overrides (`applyEnv` — complete list)\n\n`KAFKA_BROKERS`, `KAFKA_PREFIX`, `REDIS_URL`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_SCHEDULE_MYSQL_DSN`, `KAFKA_BATCH_STORE_MYSQL_DSN`, `KAFKA_BATCH_PRIORITY_CONFIG`, `KAFKA_BATCH_PRIORITY_CONFIGS`, `KAFKA_BATCH_METRICS_ENABLED`, `KAFKA_BATCH_METRICS_PREFIX`, `KAFKA_BATCH_METRICS_STATSD_ADDR`, `KAFKA_BATCH_LIVENESS_ENABLED`, `KAFKA_BATCH_LIVENESS_HTTP_ADDR`, `KAFKA_BATCH_LIVENESS_TTL`, `KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL`, `KAFKA_BATCH_PERFORMANCE_METRICS_ENABLED`, `KAFKA_BATCH_PERFORMANCE_METRICS_RETENTION`, `KAFKA_BATCH_PERFORMANCE_METRICS_MAX_JOB_TYPES`, `KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE`, `KAFKA_BATCH_REDIS_RTT_PROBE_INTERVAL`, `KAFKA_BATCH_REDIS_RTT_PROBE_TIMEOUT`, `KAFKA_BATCH_RETRY_MAX_PAUSE`, `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS`, `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_SKIP_CANCELLED_JOBS`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_CANCELLATION_CACHE_TTL`, `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY`, `KAFKA_BATCH_SUPER_FETCH_CLAIM_WINDOW`, `KAFKA_BATCH_EXECUTION_MODE`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS`, `KAFKA_BATCH_CONSUMER_STALL_TIMEOUT`.\n\nMySQL DSNs: go-sql-driver form **or** `mysql2://` / `mysql://` URLs.",
+      "char_count": 1452
+    },
+    {
+      "id": "readme-32-go-configuration-reference-handler-manifest-k-62a65d8d89fd6134",
+      "source": "readme",
+      "title": "Handler manifest (`kafka_batch_handlers.yml`)",
+      "heading_path": [
+        "32. Go configuration reference",
+        "Handler manifest (`kafka_batch_handlers.yml`)"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › Handler manifest (`kafka_batch_handlers.yml`)\n\n| Field | Purpose |\n|-------|---------|\n| `runtime` | `go` \\| `ruby` (required) |\n| `worker_class` | Ruby constant (required if ruby) |\n| `topic` | Plain job topic (default jobs topic) |\n| `apply_topic_prefix` | Prepend `topic_prefix` |\n| `max_retries` | Override daemon default |\n| `retry_tier` | `short` \\| `medium` \\| `large` |\n| `fairness_type` | `time` \\| `throughput` (no plain topic) |\n| `uniq` | Fingerprint dedupe |\n\nYAML map key = wire `job_type`. Recurring schedules must reference these keys (or a resolvable worker class name).",
+      "char_count": 620
+    },
+    {
+      "id": "readme-32-go-configuration-reference-mysql-ddl-go-only-7ae5a529a336ceb0",
+      "source": "readme",
+      "title": "MySQL DDL (Go-only bootstrap)",
+      "heading_path": [
+        "32. Go configuration reference",
+        "MySQL DDL (Go-only bootstrap)"
+      ],
+      "section": "32. Go configuration reference",
+      "text": "32. Go configuration reference › MySQL DDL (Go-only bootstrap)\n\n| Block | Tables | When |\n|-------|--------|------|\n| **A** | `kafka_batch_scheduled_jobs` | `schedule_store: mysql` |\n| **B** | `kafka_batch_failures`, `kafka_batch_consumption_pauses` | `store: mysql` |\n| **C** | `kafka_batch_recurring_schedules`, `kafka_batch_recurring_fires` | recurring enabled |\n\nFull SQL + annotated `daemon.yml` live in the Go README appendix. Batch ledger / uniq / fair weights **always Redis**.\n\nControl plane scales by **pods + partitions** (one franz-go client per group per pod; events fan out per partition).\n\n---",
+      "char_count": 608
+    },
+    {
+      "id": "readme-33-ruby-go-parity-gaps-905ae1a1e969ac48",
+      "source": "readme",
+      "title": "33. Ruby ↔ Go parity gaps",
+      "heading_path": [
+        "33. Ruby ↔ Go parity gaps"
+      ],
+      "section": "33. Ruby ↔ Go parity gaps",
+      "text": "33. Ruby ↔ Go parity gaps\n\n| Setting | Ruby | Go | Action |\n|---------|------|-----|--------|\n| `super_fetch_concurrency` | 1 | 10 | Intentional; do not copy blindly |\n| `fairness_ready_window` | 500 | 100 | Set Go YAML to 500 for parity |\n| `schedule_poll_jitter` | 0.1 | 0 unless set | Set Go `0.1` |\n| Fairness enable | per-worker | `fairness_enabled` | Must set true on Go daemon |\n| Legacy CallbackConsumer | Ruby control | Go produces only | Need Ruby for legacy class callbacks |\n| SF lease/grace/reclaim env | many `KAFKA_BATCH_SUPER_FETCH_*` | often YAML-only | Set in daemon.yml |\n| `fairness_min_ingest_partitions` | 2 (warn) | internal | Ops often size ingest to 300 |\n| `max_retries` docs | README table may say 3 | both library 7 | Prefer Configuration / YAML |\n| Recurring env overrides | all `KAFKA_BATCH_RECURRING_*` | **YAML only** | Set daemon.yml for Go |\n| Cron parser | Fugit (needs gem) | built-in 5-field + macros | Prefer portable 5-field exprs |\n| Recurring UI writes | Ruby Web API | — | Dashboard is Ruby even under Go control |\n| Recurring auto-schema | migrate `--recurring` | `EnsureSchema` on boot | Prefer explicit SQL in prod |\n\n---",
+      "char_count": 1166
+    },
+    {
+      "id": "readme-34-atomicity-and-idempotency-matrix-397fc5f2bb0a0b90",
+      "source": "readme",
+      "title": "34. Atomicity and idempotency matrix",
+      "heading_path": [
+        "34. Atomicity and idempotency matrix"
+      ],
+      "section": "34. Atomicity and idempotency matrix",
+      "text": "34. Atomicity and idempotency matrix\n\n| Feature | Atomic primitive | Idempotency expectation |\n|---------|------------------|-------------------------|\n| Batch create | `HSETNX` Lua | Create-once |\n| Add jobs / seal | Lua | Reject after terminal |\n| Job completion count | Three bitmaps + counters in one Lua | Re-delivered events do not double-count |\n| Callback dispatch claim | `HSETNX` | One dispatcher; handler at-least-once |\n| SuperFetch claim | `CLAIM_LUA` + fence | Lost claim → ack duplicate |\n| SuperFetch complete | Fence `COMPLETE_LUA` | Stolen fence → no-op |\n| Workset reclaim | NX + `work:produced:` | At-most-once produce; at-least-once perform |\n| Fairness enqueue | Window Lua | Full → pause (no silent drop) |\n| Fairness checkout | Lease ZSET Lua | Complete by slot id idempotent |\n| Fairness forward | Forwarding HASH | Crash-safe pop→produce |\n| Uniqueness | SETNX + compare-del | Duplicate enqueue skipped/raised; fail-open on Redis error |\n| Schedule dispatch | Lease + reclaim | At-least-once due dispatch |\n| Recurring fire | `(schedule_id, fire_at)` INSERT IGNORE + `sched-{id}-{unix}` job id | At-most-once emit per instant; at-least-once perform (Kafka) |\n| Reconciler | `SET NX EX` | Single sweeper |\n| Job `#perform` | — | **Always application-idempotent** |\n| Job callbacks | Deterministic `job_id` | **Always application-idempotent** |\n\n---",
+      "char_count": 1373
+    },
+    {
+      "id": "readme-35-scaling-and-tuning-17c0e0cd962e12d0",
+      "source": "readme",
+      "title": "35. Scaling and tuning",
+      "heading_path": [
+        "35. Scaling and tuning"
+      ],
+      "section": "35. Scaling and tuning",
+      "text": "35. Scaling and tuning\n\n1. Partitions ≥ peak_pods × (Karafka concurrency or Go members) × SuperFetch concurrency.\n2. Ruby: prefer pods over huge SF for CPU; keep product ≤ 10 in prod unless tested.\n3. Go: members ≈ partitions; SF ~50×cores for IO; 1–2×cores for CPU.\n4. `fairness_lease_ttl` and `super_fetch_lease_ttl` above longest job (+ renew margin).\n5. Schedule poller **and** recurring ticker only on few control/scheduler pods.\n6. Workset reclaim on ≥1 control plane sharing Redis.\n7. Autoscale on lag; partitions fixed.\n8. Cap/shard mega-batches.\n9. Extreme throughput: `track_running_jobs = false` if per-job `/live` unused.\n10. Never share execution topic across Ruby and Go.\n11. One control plane per topic set.\n12. Size fair ingest partitions for active tenants when using exclusive dynamic partitions.\n13. Size `redis_pool_size` before raising Ruby SF.\n14. Fair ready backlog with ingest OK → raise `fairness_global_concurrency` or reduce oversubscribed workers.",
+      "char_count": 975
+    },
+    {
+      "id": "readme-35-scaling-and-tuning-go-tuning-sketch-32-partit-69f22edf457f1a7d",
       "source": "readme",
       "title": "Go tuning sketch (32 partitions, IO, 4-core)",
       "heading_path": [
-        "34. Scaling and tuning",
+        "35. Scaling and tuning",
         "Go tuning sketch (32 partitions, IO, 4-core)"
       ],
-      "section": "34. Scaling and tuning",
-      "text": "34. Scaling and tuning › Go tuning sketch (32 partitions, IO, 4-core)\n\n```yaml\njobs_consumer_concurrency: 32\nfair_ready_consumer_concurrency: 32\npriority_consumer_concurrency: 8\nsuper_fetch_concurrency: 200\nproducer_required_acks: all_isr\nfairness_enabled: true\nfairness_ready_window: 500\nschedule_poll_jitter: 0.1\n```\n\n---",
+      "section": "35. Scaling and tuning",
+      "text": "35. Scaling and tuning › Go tuning sketch (32 partitions, IO, 4-core)\n\n```yaml\njobs_consumer_concurrency: 32\nfair_ready_consumer_concurrency: 32\npriority_consumer_concurrency: 8\nsuper_fetch_concurrency: 200\nproducer_required_acks: all_isr\nfairness_enabled: true\nfairness_ready_window: 500\nschedule_poll_jitter: 0.1\n```\n\n---",
       "char_count": 323
     },
     {
-      "id": "readme-35-operator-cheat-sheet-e599ff272c9d4f04",
+      "id": "readme-36-operator-cheat-sheet-4ff7ee71fec006ba",
       "source": "readme",
-      "title": "35. Operator cheat sheet",
+      "title": "36. Operator cheat sheet",
       "heading_path": [
-        "35. Operator cheat sheet"
+        "36. Operator cheat sheet"
       ],
-      "section": "35. Operator cheat sheet",
-      "text": "35. Operator cheat sheet\n\n```bash\n# Topics\nREPLICATION_FACTOR=1 PARTITIONS=12 bundle exec rake kafka_batch:create_topics\nbundle exec rake kafka_batch:topics\nkbatch topics create --brokers ... --manifest ...\n\n# Reconciler\nbundle exec rake kafka_batch:reconcile\nkbatch reconcile --config daemon.yml\n\n# Dev all-in-one Ruby\nKB_ROLE=all bundle exec karafka server\n\n# API only\nKAFKA_BATCH_DAEMON_MODE=1 bundle exec puma\n\n# Go control + worker\nkbatch daemon --config config/daemon.yml\nkbatch worker --config config/daemon.yml\n```\n\nTypical env: `KAFKA_BROKERS`, `REDIS_URL`, `KAFKA_PREFIX`, `KB_ROLE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`.\n\n---",
-      "char_count": 691
+      "section": "36. Operator cheat sheet",
+      "text": "36. Operator cheat sheet\n\n```bash\n# Topics\nREPLICATION_FACTOR=1 PARTITIONS=12 bundle exec rake kafka_batch:create_topics\nbundle exec rake kafka_batch:topics\nkbatch topics create --brokers ... --manifest ... --include-control\n\n# Recurring MySQL (pick one)\nbundle exec rails generate kafka_batch:install --recurring && rails db:migrate\n# or copy SQL block C from kafka-batch-go README appendix\n\n# Recurring ticker (Ruby dedicated pod)\nKAFKA_BATCH_RECURRING_SCHEDULER_ENABLED=true bundle exec rake kafka_batch:recurring:run\n# one-shot leader-gated pass:\nbundle exec rake kafka_batch:recurring:tick\n\n# Reconciler\nbundle exec rake kafka_batch:reconcile\nkbatch reconcile --config daemon.yml\n\n# Dev all-in-one Ruby\nKB_ROLE=all bundle exec karafka server\n\n# API only\nKAFKA_BATCH_DAEMON_MODE=1 bundle exec puma\n\n# Go control + worker (enable recurring in daemon.yml)\nkbatch daemon --config config/daemon.yml\nkbatch worker --config config/daemon.yml\n```\n\nTypical env: `KAFKA_BROKERS`, `REDIS_URL`, `KAFKA_PREFIX`, `KB_ROLE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED`, `KAFKA_BATCH_SCHEDULE_MYSQL_DSN` / `KAFKA_BATCH_STORE_MYSQL_DSN`.\n\n---",
+      "char_count": 1221
     },
     {
-      "id": "readme-36-document-maintenance-506ff4d1afbce71c",
+      "id": "readme-37-document-maintenance-d63aa017f5feb006",
       "source": "readme",
-      "title": "36. Document maintenance",
+      "title": "37. Document maintenance",
       "heading_path": [
-        "36. Document maintenance"
+        "37. Document maintenance"
       ],
-      "section": "36. Document maintenance",
-      "text": "36. Document maintenance\n\nWhen adding a feature or knob:\n\n1. Update the matching section here (behavior + keys + knobs + atomicity row).\n2. Add Q&A in `ai/FAQ.md`.\n3. Note Ruby↔Go parity gaps if defaults diverge.\n4. Rebuild packaged chunks: `bin/build_ai_chunks` → `lib/kafka_batch/ai/knowledge_chunks.json`.\n5. Commit markdown + JSON; ship a new gem version so `corpus_version` changes.\n\nFull release checklist: **`lib/kafka_batch/ai/README.md`**.",
+      "section": "37. Document maintenance",
+      "text": "37. Document maintenance\n\nWhen adding a feature or knob:\n\n1. Update the matching section here (behavior + keys + knobs + atomicity row).\n2. Add Q&A in `ai/FAQ.md`.\n3. Note Ruby↔Go parity gaps if defaults diverge.\n4. Rebuild packaged chunks: `bin/build_ai_chunks` → `lib/kafka_batch/ai/knowledge_chunks.json`.\n5. Commit markdown + JSON; ship a new gem version so `corpus_version` changes.\n\nFull release checklist: **`lib/kafka_batch/ai/README.md`**.",
       "char_count": 448
     },
     {
-      "id": "readme-36-document-maintenance-packaged-chunks-redis-sy-d48846bd5202cfad",
+      "id": "readme-37-document-maintenance-packaged-chunks-redis-sy-989aee2c68cfc27f",
       "source": "readme",
       "title": "Packaged chunks + Redis sync (boot)",
       "heading_path": [
-        "36. Document maintenance",
+        "37. Document maintenance",
         "Packaged chunks + Redis sync (boot)"
       ],
-      "section": "36. Document maintenance",
-      "text": "36. Document maintenance › Packaged chunks + Redis sync (boot)\n\nEditable source lives in `ai/*.md`. Clients do **not** re-chunk markdown at boot.\n\n| Artifact | Role |\n|----------|------|\n| `lib/kafka_batch/ai/knowledge_chunks.json` | Prebuilt chunks (shipped in the gem) |\n| `kafka_batch:ai:knowledge:chunks` | Redis HASH id → chunk JSON |\n| `kafka_batch:ai:knowledge:config` | Live masked config snapshot |\n| `kafka_batch:ai:knowledge:meta` | `corpus_version`, `config_refreshed_at`, … |\n| `kafka_batch:ai:knowledge:lock` | Short NX lock during write only |\n\n**Many UI pods:** every pod calls `sync!` after Rails init; only one writer wins the lock.\n\n| Data | Refresh rule |\n|------|----------------|\n| Knowledge chunks | Only when packaged `corpus_version` ≠ Redis meta |\n| Config snapshot + topic inventory + routing | At most every **24 hours** on boot (`config_refreshed_at`); NX lock so only one pod writes. Includes masked knobs, `Topics.inventory` (broker partitions), and `Ai::RoutingSnapshot` (handler manifest + priority queue YAML). |\n\n```ruby\nconfig.ai_knowledge_enabled = true\n# ENV: KAFKA_BATCH_AI_KNOWLEDGE_ENABLED=false to disable\n```\n\nForce full re-sync: `FORCE=1 bundle exec rake kafka_batch:sync_ai_knowledge`\n\nLive RAG chunk (`config:live`) is injected first for chat. Prefer:\n- `live_broker_partitions` over DEFAULT_PARTITIONS docs for partition counts\n- AUTHORITATIVE LIVE ROUTING (handlers / priority groups) over example YAML in docs\n\nThis file intentionally expands beyond the root README so the assistant has a self-contained corpus without live cluster operational state.\n\n\n---",
+      "section": "37. Document maintenance",
+      "text": "37. Document maintenance › Packaged chunks + Redis sync (boot)\n\nEditable source lives in `ai/*.md`. Clients do **not** re-chunk markdown at boot.\n\n| Artifact | Role |\n|----------|------|\n| `lib/kafka_batch/ai/knowledge_chunks.json` | Prebuilt chunks (shipped in the gem) |\n| `kafka_batch:ai:knowledge:chunks` | Redis HASH id → chunk JSON |\n| `kafka_batch:ai:knowledge:config` | Live masked config snapshot |\n| `kafka_batch:ai:knowledge:meta` | `corpus_version`, `config_refreshed_at`, … |\n| `kafka_batch:ai:knowledge:lock` | Short NX lock during write only |\n\n**Many UI pods:** every pod calls `sync!` after Rails init; only one writer wins the lock.\n\n| Data | Refresh rule |\n|------|----------------|\n| Knowledge chunks | Only when packaged `corpus_version` ≠ Redis meta |\n| Config snapshot + topic inventory + routing | At most every **24 hours** on boot (`config_refreshed_at`); NX lock so only one pod writes. Includes masked knobs, `Topics.inventory` (broker partitions), and `Ai::RoutingSnapshot` (handler manifest + priority queue YAML). |\n\n```ruby\nconfig.ai_knowledge_enabled = true\n# ENV: KAFKA_BATCH_AI_KNOWLEDGE_ENABLED=false to disable\n```\n\nForce full re-sync: `FORCE=1 bundle exec rake kafka_batch:sync_ai_knowledge`\n\nLive RAG chunk (`config:live`) is injected first for chat. Prefer:\n- `live_broker_partitions` over DEFAULT_PARTITIONS docs for partition counts\n- AUTHORITATIVE LIVE ROUTING (handlers / priority groups) over example YAML in docs\n\nThis file intentionally expands beyond the root README so the assistant has a self-contained corpus without live cluster operational state.\n\n\n---",
       "char_count": 1605
     },
     {
-      "id": "readme-37-batch-hash-fields-redis-3c89a3927c68a4a7",
+      "id": "readme-38-batch-hash-fields-redis-412647af7dfd7643",
       "source": "readme",
-      "title": "37. Batch hash fields (Redis)",
+      "title": "38. Batch hash fields (Redis)",
       "heading_path": [
-        "37. Batch hash fields (Redis)"
+        "38. Batch hash fields (Redis)"
       ],
-      "section": "37. Batch hash fields (Redis)",
-      "text": "37. Batch hash fields (Redis)\n\nTypical fields on `kafka_batch:b:{id}` (names may evolve; treat as operational contract mirrored in Go store):\n\n| Field | Role |\n|-------|------|\n| `id` | Batch id (HSETNX create sentinel) |\n| `total_jobs` | Reserved/pushed job count |\n| `touched_count` | First-execution count |\n| `completed_count` | Terminal success count |\n| `failed_count` | Terminal fail count |\n| `status` | `running` / `success` / `complete` / `cancelled` / … |\n| `locked_at` | Seal timestamp (empty while open/block populating) |\n| `on_success` / `on_complete` | Serialized callback descriptors |\n| `meta` / `callback_args` / `description` | App metadata |\n| `tenant_id` | Default fair tenant for pushes |\n| `complete_callback_dispatched_at` | HSETNX claim stamp |\n| `success_callback_dispatched_at` | HSETNX claim stamp |\n| `callback_dispatched_at` | Legacy/any claim stamp |\n| `created_at` / other timestamps | Observability |\n\nIndexes: `index:running`, `index:done`, `index:all`, `index:cancelled`; aggregate `kafka_batch:counts`.\n\n---",
+      "section": "38. Batch hash fields (Redis)",
+      "text": "38. Batch hash fields (Redis)\n\nTypical fields on `kafka_batch:b:{id}` (names may evolve; treat as operational contract mirrored in Go store):\n\n| Field | Role |\n|-------|------|\n| `id` | Batch id (HSETNX create sentinel) |\n| `total_jobs` | Reserved/pushed job count |\n| `touched_count` | First-execution count |\n| `completed_count` | Terminal success count |\n| `failed_count` | Terminal fail count |\n| `status` | `running` / `success` / `complete` / `cancelled` / … |\n| `locked_at` | Seal timestamp (empty while open/block populating) |\n| `on_success` / `on_complete` | Serialized callback descriptors |\n| `meta` / `callback_args` / `description` | App metadata |\n| `tenant_id` | Default fair tenant for pushes |\n| `complete_callback_dispatched_at` | HSETNX claim stamp |\n| `success_callback_dispatched_at` | HSETNX claim stamp |\n| `callback_dispatched_at` | Legacy/any claim stamp |\n| `created_at` / other timestamps | Observability |\n\nIndexes: `index:running`, `index:done`, `index:all`, `index:cancelled`; aggregate `kafka_batch:counts`.\n\n---",
       "char_count": 1044
     },
     {
-      "id": "readme-38-instrumentation-event-catalog-ruby-a2f323e22105458f",
+      "id": "readme-39-instrumentation-event-catalog-ruby-55d3b2037de650eb",
       "source": "readme",
-      "title": "38. Instrumentation event catalog (Ruby)",
+      "title": "39. Instrumentation event catalog (Ruby)",
       "heading_path": [
-        "38. Instrumentation event catalog (Ruby)"
+        "39. Instrumentation event catalog (Ruby)"
       ],
-      "section": "38. Instrumentation event catalog (Ruby)",
-      "text": "38. Instrumentation event catalog (Ruby)\n\nSubscribe via ActiveSupport::Notifications (`*.kafka_batch`) or Metrics bridge. Notable events:\n\n| Event | When |\n|-------|------|\n| `job.processed` | Successful perform |\n| `job.retried` | Scheduled onto retry tier |\n| `job.failed` | Terminal failure / exhausted |\n| `job.cancelled` | Skipped due to cancel |\n| `job.uniq_skipped` | Duplicate enqueue skipped |\n| `job.expired` | `valid_till` gate |\n| `batch.created` / `batch.sealed` / `batch.completed` | Lifecycle |\n| `callback.dispatched` / related | Callback path |\n| `dlt.published` | Dead letter write |\n| `consumer.priority_yielded` | Priority gate yielded |\n| `reconciler.ran` | Sweep finished |\n| `workset.reclaimed` | Orphan reclaim sweep |\n| `super_fetch.drained` | Graceful shutdown drain |\n| `scheduled.claimed` / related | Schedule poller |\n\nGo `pkg/instrument` mirrors the cross-runtime subset (including `workset.reclaimed`, `super_fetch.drained`).\n\n---",
-      "char_count": 961
+      "section": "39. Instrumentation event catalog (Ruby)",
+      "text": "39. Instrumentation event catalog (Ruby)\n\nSubscribe via ActiveSupport::Notifications (`*.kafka_batch`) or Metrics bridge. Notable events:\n\n| Event | When |\n|-------|------|\n| `job.processed` | Successful perform |\n| `job.retried` | Scheduled onto retry tier |\n| `job.failed` | Terminal failure / exhausted |\n| `job.cancelled` | Skipped due to cancel |\n| `job.uniq_skipped` | Duplicate enqueue skipped |\n| `job.expired` | `valid_till` gate |\n| `batch.created` / `batch.sealed` / `batch.completed` | Lifecycle |\n| `callback.dispatched` / related | Callback path |\n| `dlt.published` | Dead letter write |\n| `consumer.priority_yielded` | Priority gate yielded |\n| `reconciler.ran` | Sweep finished |\n| `workset.reclaimed` | Orphan reclaim sweep |\n| `super_fetch.drained` | Graceful shutdown drain |\n| `scheduled.claimed` / related | Schedule poller |\n| `cron.fired` / `cron.enqueue_failed` / `cron.stale` / `cron.heartbeat` | Recurring ticker (§17) |\n\nGo `pkg/instrument` mirrors the cross-runtime subset (including `workset.reclaimed`, `super_fetch.drained`, `cron.*`).\n\n---",
+      "char_count": 1071
     },
     {
-      "id": "readme-39-client-produce-safety-and-partial-failure-ord-ccdda35a29e0114c",
+      "id": "readme-40-client-produce-safety-and-partial-failure-ord-8bb5b92e0e34fccd",
       "source": "readme",
       "title": "Ordering invariant",
       "heading_path": [
-        "39. Client produce safety and partial failure",
+        "40. Client produce safety and partial failure",
         "Ordering invariant"
       ],
-      "section": "39. Client produce safety and partial failure",
-      "text": "39. Client produce safety and partial failure › Ordering invariant\n\nRedis batch mutations that reserve `batch_seq` happen **before** or tightly around Kafka produce. On produce failure, client attempts:\n\n1. Release uniqueness locks for unproduced items\n2. Decrement/reserve rollback via `add_jobs(-n)` where applicable",
+      "section": "40. Client produce safety and partial failure",
+      "text": "40. Client produce safety and partial failure › Ordering invariant\n\nRedis batch mutations that reserve `batch_seq` happen **before** or tightly around Kafka produce. On produce failure, client attempts:\n\n1. Release uniqueness locks for unproduced items\n2. Decrement/reserve rollback via `add_jobs(-n)` where applicable",
       "char_count": 318
     },
     {
-      "id": "readme-39-client-produce-safety-and-partial-failure-sch-939be7fe94110726",
+      "id": "readme-40-client-produce-safety-and-partial-failure-sch-2aac04533ce23d05",
       "source": "readme",
       "title": "Schedule index",
       "heading_path": [
-        "39. Client produce safety and partial failure",
+        "40. Client produce safety and partial failure",
         "Schedule index"
       ],
-      "section": "39. Client produce safety and partial failure",
-      "text": "39. Client produce safety and partial failure › Schedule index\n\nIf Kafka scheduled produce succeeds but index write fails: `schedule_index_write_retries` with linear backoff; may raise `PartialProduceError`. Poller reclaim cannot find undindexed jobs — treat as operator incident.",
+      "section": "40. Client produce safety and partial failure",
+      "text": "40. Client produce safety and partial failure › Schedule index\n\nIf Kafka scheduled produce succeeds but index write fails: `schedule_index_write_retries` with linear backoff; may raise `PartialProduceError`. Poller reclaim cannot find undindexed jobs — treat as operator incident.",
       "char_count": 280
     },
     {
-      "id": "readme-39-client-produce-safety-and-partial-failure-max-3023c27d40d52c3d",
+      "id": "readme-40-client-produce-safety-and-partial-failure-max-d6a3021a0c346aeb",
       "source": "readme",
       "title": "max_message_bytes",
       "heading_path": [
-        "39. Client produce safety and partial failure",
+        "40. Client produce safety and partial failure",
         "max_message_bytes"
       ],
-      "section": "39. Client produce safety and partial failure",
-      "text": "39. Client produce safety and partial failure › max_message_bytes\n\nEncoded payload size guard (default 1 MiB) raises `ProducerError` before broker reject.",
+      "section": "40. Client produce safety and partial failure",
+      "text": "40. Client produce safety and partial failure › max_message_bytes\n\nEncoded payload size guard (default 1 MiB) raises `ProducerError` before broker reject.",
       "char_count": 154
     },
     {
-      "id": "readme-39-client-produce-safety-and-partial-failure-pus-85422c8abfa0e3b6",
+      "id": "readme-40-client-produce-safety-and-partial-failure-pus-5fc606b52d43e4d8",
       "source": "readme",
       "title": "push_many chunking",
       "heading_path": [
-        "39. Client produce safety and partial failure",
+        "40. Client produce safety and partial failure",
         "push_many chunking"
       ],
-      "section": "39. Client produce safety and partial failure",
-      "text": "39. Client produce safety and partial failure › push_many chunking\n\nChunks preserve contiguous `batch_seq` while pipelining `produce_many_sync`.\n\n---",
+      "section": "40. Client produce safety and partial failure",
+      "text": "40. Client produce safety and partial failure › push_many chunking\n\nChunks preserve contiguous `batch_seq` while pipelining `produce_many_sync`.\n\n---",
       "char_count": 149
     },
     {
-      "id": "readme-40-fairness-lua-responsibilities-summary-baa3202457f7a025",
+      "id": "readme-41-fairness-lua-responsibilities-summary-a49057e79bf687f2",
       "source": "readme",
-      "title": "40. Fairness Lua responsibilities (summary)",
+      "title": "41. Fairness Lua responsibilities (summary)",
       "heading_path": [
-        "40. Fairness Lua responsibilities (summary)"
+        "41. Fairness Lua responsibilities (summary)"
       ],
-      "section": "40. Fairness Lua responsibilities (summary)",
-      "text": "40. Fairness Lua responsibilities (summary)\n\n| Script | Role |\n|--------|------|\n| `ENQUEUE_LUA` | Bound window; admit tenant to ring; RPUSH ready list |\n| `CHECKOUT_LUA_COUNT` | Throughput lane: advance vtime at dispatch; lease slots |\n| Time checkout / `COMPLETE_LUA_TIME_LEASE` | Time lane: advance vtime at completion by duration/weight |\n| Tenant partition `CHECKOUT_LUA` | Exclusive partition assignment from free pool |\n| Forward confirm / reclaim paths | Clear forwarding HASH; recover stale forwards after grace |\n\nIn-flight is **derived from lease ZSETs**, not a brittle counter — expired leases self-heal concurrency budget after crashes.\n\n---",
+      "section": "41. Fairness Lua responsibilities (summary)",
+      "text": "41. Fairness Lua responsibilities (summary)\n\n| Script | Role |\n|--------|------|\n| `ENQUEUE_LUA` | Bound window; admit tenant to ring; RPUSH ready list |\n| `CHECKOUT_LUA_COUNT` | Throughput lane: advance vtime at dispatch; lease slots |\n| Time checkout / `COMPLETE_LUA_TIME_LEASE` | Time lane: advance vtime at completion by duration/weight |\n| Tenant partition `CHECKOUT_LUA` | Exclusive partition assignment from free pool |\n| Forward confirm / reclaim paths | Clear forwarding HASH; recover stale forwards after grace |\n\nIn-flight is **derived from lease ZSETs**, not a brittle counter — expired leases self-heal concurrency budget after crashes.\n\n---",
       "char_count": 654
     },
     {
-      "id": "readme-41-consumptiongate-and-prioritygate-interaction-96b4d1e78f523742",
+      "id": "readme-42-consumptiongate-and-prioritygate-interaction-6d9a8c7ad4d5d20c",
       "source": "readme",
-      "title": "41. ConsumptionGate and PriorityGate interaction",
+      "title": "42. ConsumptionGate and PriorityGate interaction",
       "heading_path": [
-        "41. ConsumptionGate and PriorityGate interaction"
+        "42. ConsumptionGate and PriorityGate interaction"
       ],
-      "section": "41. ConsumptionGate and PriorityGate interaction",
-      "text": "41. ConsumptionGate and PriorityGate interaction\n\n1. **ConsumptionGate** — if topic/partition paused in Redis snapshot, consumer does not process (refresh ≤30s).\n2. **PriorityGate** — lower ranks check higher-topic lag; paused higher topics count as inactive so lower ranks proceed.\n3. SuperFetch still applies inside allowed consumes.\n\n---",
+      "section": "42. ConsumptionGate and PriorityGate interaction",
+      "text": "42. ConsumptionGate and PriorityGate interaction\n\n1. **ConsumptionGate** — if topic/partition paused in Redis snapshot, consumer does not process (refresh ≤30s).\n2. **PriorityGate** — lower ranks check higher-topic lag; paused higher topics count as inactive so lower ranks proceed.\n3. SuperFetch still applies inside allowed consumes.\n\n---",
       "char_count": 340
     },
     {
-      "id": "readme-42-empty-and-edge-batches-496b859ef304e4e3",
+      "id": "readme-43-empty-and-edge-batches-80ef3d6f0e0645b2",
       "source": "readme",
-      "title": "42. Empty and edge batches",
+      "title": "43. Empty and edge batches",
       "heading_path": [
-        "42. Empty and edge batches"
+        "43. Empty and edge batches"
       ],
-      "section": "42. Empty and edge batches",
-      "text": "42. Empty and edge batches\n\n| Case | Behavior |\n|------|----------|\n| Seal with `total_jobs=0` | Immediate success path |\n| Open unsealed batch | Cannot finalize until seal |\n| Events for unknown/cancelled batch | Lua duplicate/ignore |\n| Mega-batch | One hash + three bitmaps; shard in app policy |\n\n---",
+      "section": "43. Empty and edge batches",
+      "text": "43. Empty and edge batches\n\n| Case | Behavior |\n|------|----------|\n| Seal with `total_jobs=0` | Immediate success path |\n| Open unsealed batch | Cannot finalize until seal |\n| Events for unknown/cancelled batch | Lua duplicate/ignore |\n| Mega-batch | One hash + three bitmaps; shard in app policy |\n\n---",
       "char_count": 304
     },
     {
-      "id": "readme-43-go-client-api-mirror-863efba338d21226",
+      "id": "readme-44-go-client-api-mirror-e7799edccdace77b",
       "source": "readme",
-      "title": "43. Go client API mirror",
+      "title": "44. Go client API mirror",
       "heading_path": [
-        "43. Go client API mirror"
+        "44. Go client API mirror"
       ],
-      "section": "43. Go client API mirror",
-      "text": "43. Go client API mirror\n\n| Go API | Ruby analogue |\n|--------|----------------|\n| `client.New` | configured `KafkaBatch` |\n| `CreateBatch` | `Batch.create` |\n| `OpenBatch` | `Batch.open` |\n| `PushJob` / `PushJobAt` | `push` / `push_at` / `push_job` |\n| `Seal` / `Cancel` | `seal!` / `cancel` |\n| `EnqueueJob` / `EnqueueJobAt` | `enqueue` / `enqueue_at` / `enqueue_job*` |\n\nBatchOptions: OnSuccess, OnComplete, Meta, CallbackArgs, Description, TenantID. PushOptions: JobID, TenantID, ValidTill.\n\n---",
+      "section": "44. Go client API mirror",
+      "text": "44. Go client API mirror\n\n| Go API | Ruby analogue |\n|--------|----------------|\n| `client.New` | configured `KafkaBatch` |\n| `CreateBatch` | `Batch.create` |\n| `OpenBatch` | `Batch.open` |\n| `PushJob` / `PushJobAt` | `push` / `push_at` / `push_job` |\n| `Seal` / `Cancel` | `seal!` / `cancel` |\n| `EnqueueJob` / `EnqueueJobAt` | `enqueue` / `enqueue_at` / `enqueue_job*` |\n\nBatchOptions: OnSuccess, OnComplete, Meta, CallbackArgs, Description, TenantID. PushOptions: JobID, TenantID, ValidTill.\n\n---",
       "char_count": 499
     },
     {
-      "id": "readme-44-readme-drift-vs-library-defaults-operators-12e63f7135e6b1f6",
+      "id": "readme-45-readme-drift-vs-library-defaults-operators-97a5fa874e8eee1e",
       "source": "readme",
-      "title": "44. README drift vs library defaults (operators)",
+      "title": "45. README drift vs library defaults (operators)",
       "heading_path": [
-        "44. README drift vs library defaults (operators)"
+        "45. README drift vs library defaults (operators)"
       ],
-      "section": "44. README drift vs library defaults (operators)",
-      "text": "44. README drift vs library defaults (operators)\n\n| Topic | Library default | Often documented / install |\n|-------|-----------------|----------------------------|\n| `max_retries` | 7 | 3 in install / some tables |\n| `fairness_global_concurrency` | 50 | 1000 install / fairness examples |\n| `fairness_lease_ttl` | 1800 | 7200 install |\n| `fairness_min_ingest_partitions` | 2 | 300 ops target |\n| Bitmaps | touch + ok + fail | Older docs mentioned only touch |\n| Completion dedup | `batch_seq` bitmaps | Not Kafka offset keys |\n\nWhen answering “what is the default?”, prefer `Configuration#initialize` / Go `DefaultDaemon` over marketing tables.",
+      "section": "45. README drift vs library defaults (operators)",
+      "text": "45. README drift vs library defaults (operators)\n\n| Topic | Library default | Often documented / install |\n|-------|-----------------|----------------------------|\n| `max_retries` | 7 | 3 in install / some tables |\n| `fairness_global_concurrency` | 50 | 1000 install / fairness examples |\n| `fairness_lease_ttl` | 1800 | 7200 install |\n| `fairness_min_ingest_partitions` | 2 | 300 ops target |\n| Bitmaps | touch + ok + fail | Older docs mentioned only touch |\n| Completion dedup | `batch_seq` bitmaps | Not Kafka offset keys |\n\nWhen answering “what is the default?”, prefer `Configuration#initialize` / Go `DefaultDaemon` over marketing tables.",
       "char_count": 644
     },
     {
@@ -1517,8 +1852,8 @@
         "Can I run without MySQL?"
       ],
       "section": "A. Product basics",
-      "text": "FAQ: Can I run without MySQL?\n\nYes. Defaults `store: :redis` and `schedule_store: :redis` need no MySQL. Use MySQL for durable failure logs/pauses and/or a disk-backed schedule index.",
-      "char_count": 183
+      "text": "FAQ: Can I run without MySQL?\n\nYes. Defaults `store: :redis` and `schedule_store: :redis` need no MySQL. Use MySQL for durable failure logs/pauses, a disk-backed schedule index, and/or **recurring cron tables**.",
+      "char_count": 211
     },
     {
       "id": "faq-a-product-basics-does-store-mysql-move-the-batch-aa11e394e5949ea9",
@@ -1565,8 +1900,8 @@
         "What are the three tiers?"
       ],
       "section": "B. Architecture and tiers",
-      "text": "FAQ: What are the three tiers?\n\n1. **Client** — enqueue batches/jobs. 2. **Control** — fair forward, events, retry, callback produce, schedule poller, workset reclaim, reconciler. 3. **Execution** — run handlers and emit completion events.",
-      "char_count": 239
+      "text": "FAQ: What are the three tiers?\n\n1. **Client** — enqueue batches/jobs. 2. **Control** — fair forward, events, retry, callback produce, schedule poller, **recurring ticker**, workset reclaim, reconciler. 3. **Execution** — run handlers and emit completion events.",
+      "char_count": 261
     },
     {
       "id": "faq-b-architecture-and-tiers-do-tiers-talk-over-http-860a90e6d635fe3c",
@@ -1589,8 +1924,8 @@
         "What runs in Ruby control vs Go daemon?"
       ],
       "section": "B. Architecture and tiers",
-      "text": "FAQ: What runs in Ruby control vs Go daemon?\n\nBoth can run events, retry, fair dispatch/forward, schedule poller, reclaim, reconciler. **Do not run both** on the same events/retry/ingest topics.",
-      "char_count": 194
+      "text": "FAQ: What runs in Ruby control vs Go daemon?\n\nBoth can run events, retry, fair dispatch/forward, schedule poller, **recurring ticker**, reclaim, reconciler. **Do not run both control planes** on the same events/retry/ingest topics. Ruby + Go **recurring** tickers **may** share one cluster (ledger + leader lock prevent double-fire).",
+      "char_count": 333
     },
     {
       "id": "faq-b-architecture-and-tiers-what-does-kbatch-worker-498a66f2899ed160",
@@ -1637,8 +1972,8 @@
         "Does `KB_ROLE` select which Karafka groups run?"
       ],
       "section": "B. Architecture and tiers",
-      "text": "FAQ: Does `KB_ROLE` select which Karafka groups run?\n\nNot by itself. It mainly gates schedule poller in generated initializer patterns. Filter groups with `--include-consumer-groups`.",
-      "char_count": 183
+      "text": "FAQ: Does `KB_ROLE` select which Karafka groups run?\n\nNot by itself. It mainly gates schedule poller in generated initializer patterns. Filter groups with `--include-consumer-groups`. Recurring is separate: set `recurring_scheduler_enabled` / `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED` on those same scheduler pods.",
+      "char_count": 314
     },
     {
       "id": "faq-b-architecture-and-tiers-what-is-cg-ef7014ef137c6f81",
@@ -2477,8 +2812,128 @@
         "What is `schedule_lease_seconds`?"
       ],
       "section": "H. Delayed jobs / schedule",
-      "text": "FAQ: What is `schedule_lease_seconds`?\n\nTTL on a claimed due pointer so a crashed poller does not strand the job forever.\n\n---",
-      "char_count": 126
+      "text": "FAQ: What is `schedule_lease_seconds`?\n\nTTL on a claimed due pointer so a crashed poller does not strand the job forever.",
+      "char_count": 121
+    },
+    {
+      "id": "faq-h-delayed-jobs-schedule-is-recurring-cron-the-sa-f159962635c78960",
+      "source": "faq",
+      "title": "Is recurring cron the same as delayed jobs?",
+      "heading_path": [
+        "H. Delayed jobs / schedule",
+        "Is recurring cron the same as delayed jobs?"
+      ],
+      "section": "H. Delayed jobs / schedule",
+      "text": "FAQ: Is recurring cron the same as delayed jobs?\n\n**No.** Delayed jobs (§16 / FAQ H) are one-shot `perform_in`/`perform_at` via `scheduled_topic` + pointer index. Recurring cron (FAQ H2 / README §17) stores schedules in MySQL and fires via normal `enqueue_job`.\n\n---",
+      "char_count": 266
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-what-is-the-recurrin-ec7cdb8bb2113b51",
+      "source": "faq",
+      "title": "What is the recurring scheduler?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "What is the recurring scheduler?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: What is the recurring scheduler?\n\nWhenever-style repeating cron that enqueues a **manifest `job_type`** on a schedule. Ruby `Recurring::Ticker` and Go `pkg/cron` share MySQL tables + Redis leader lock.",
+      "char_count": 206
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-how-do-i-install-the-c11c09bd7694f7d9",
+      "source": "faq",
+      "title": "How do I install the tables?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "How do I install the tables?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: How do I install the tables?\n\nRuby: `rails g kafka_batch:install --recurring && rails db:migrate`. Go-only: copy SQL block C from kafka-batch-go README (or rely on `EnsureSchema` on first daemon boot — prefer explicit SQL in prod).",
+      "char_count": 236
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-how-do-i-enable-it-66f6f6e1e85bc52f",
+      "source": "faq",
+      "title": "How do I enable it?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "How do I enable it?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: How do I enable it?\n\nRuby: `config.recurring_scheduler_enabled = true` or `KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED=true`. Go: `recurring_scheduler_enabled: true` in `daemon.yml` (**no** Go env override today). Enable on few scheduler/control pods only.",
+      "char_count": 257
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-can-ruby-and-go-tick-56cd9f026351958a",
+      "source": "faq",
+      "title": "Can Ruby and Go tickers run together?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "Can Ruby and Go tickers run together?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: Can Ruby and Go tickers run together?\n\nYes. Correctness is the fire ledger PK `(schedule_id, fire_at)` + deterministic `job_id` `sched-{id}-{unix}`. Leader lock `kafka_batch:cron:leader_lock` is an optimization.",
+      "char_count": 216
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-what-are-misfire-pol-5250b14f25a84c5d",
+      "source": "faq",
+      "title": "What are misfire policies?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "What are misfire policies?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: What are misfire policies?\n\n`fire_once` (default) — one catch-up fire then jump to next after now. `skip` — fire only if within `misfire_grace`, else skip. `backfill` — every missed instant capped by `recurring_max_backfill` per tick.",
+      "char_count": 239
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-where-is-the-ui-b8ee76f14efa539f",
+      "source": "faq",
+      "title": "Where is the UI?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "Where is the UI?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: Where is the UI?\n\n`/kafka_batch/recurring`. APIs: `GET/POST /api/recurring`, `POST/PATCH/DELETE /api/recurring/:name`, `POST /api/recurring/:name/run` (run-now has **no** ledger row).",
+      "char_count": 188
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-what-db-connection-d-a8c7f2f7ed999d00",
+      "source": "faq",
+      "title": "What DB connection does recurring use?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "What DB connection does recurring use?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: What DB connection does recurring use?\n\nRuby: `schedule_store_database_connection`. Go: `recurring_mysql_dsn` falling back to `schedule_mysql_dsn`.",
+      "char_count": 152
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-why-is-a-schedule-st-ee52bdb5ed8c64b3",
+      "source": "faq",
+      "title": "Why is a schedule “stale”?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "Why is a schedule “stale”?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: Why is a schedule “stale”?\n\nEnabled and idle longer than `recurring_stale_factor × cron_interval` (default factor 2). Idle measured from `last_fire_at` or `next_run_at`.",
+      "char_count": 174
+    },
+    {
+      "id": "faq-h2-recurring-cron-scheduler-dedicated-ruby-proce-e72054ab35ca1ed7",
+      "source": "faq",
+      "title": "Dedicated Ruby process?",
+      "heading_path": [
+        "H2. Recurring (cron) scheduler",
+        "Dedicated Ruby process?"
+      ],
+      "section": "H2. Recurring (cron) scheduler",
+      "text": "FAQ: Dedicated Ruby process?\n\n`rake kafka_batch:recurring:run` (loop) or `kafka_batch:recurring:tick` (one pass). Requires fugit for cron parsing / staleness interval.\n\n---",
+      "char_count": 172
     },
     {
       "id": "faq-i-retries-and-dlt-how-do-retry-tiers-avoid-head-9c3373d62ecf2b90",
@@ -3401,8 +3856,8 @@
         "Which defaults intentionally differ?"
       ],
       "section": "Y. Cross-runtime parity FAQ",
-      "text": "FAQ: Which defaults intentionally differ?\n\nSF concurrency (1 vs 10), fairness_ready_window (500 vs 100), schedule_poll_jitter (0.1 vs 0).",
-      "char_count": 137
+      "text": "FAQ: Which defaults intentionally differ?\n\nSF concurrency (1 vs 10), fairness_ready_window (500 vs 100), schedule_poll_jitter (0.1 vs 0). Recurring: Ruby has `KAFKA_BATCH_RECURRING_*` env overrides; Go is YAML-only. Cron parsers differ (Fugit vs Go 5-field).",
+      "char_count": 258
     },
     {
       "id": "faq-y-cross-runtime-parity-faq-which-contracts-must-dd5f461fc5f62b63",
@@ -4077,6 +4532,18 @@
       "char_count": 113
     },
     {
+      "id": "faq-aj-web-api-surface-detailed-recurring-api-5769d8b53bd04ab7",
+      "source": "faq",
+      "title": "Recurring API?",
+      "heading_path": [
+        "AJ. Web API surface (detailed)",
+        "Recurring API?"
+      ],
+      "section": "AJ. Web API surface (detailed)",
+      "text": "FAQ: Recurring API?\n\n`GET/POST /api/recurring`, `POST|PATCH /api/recurring/:name` (enabled), `DELETE /api/recurring/:name`, `POST /api/recurring/:name/run`. Requires migrated tables; see FAQ H2.",
+      "char_count": 194
+    },
+    {
       "id": "faq-aj-web-api-surface-detailed-lag-pause-resume-d892a6bad273f423",
       "source": "faq",
       "title": "Lag pause/resume?",
@@ -4617,5 +5084,5 @@
       "char_count": 58
     }
   ],
-  "corpus_version": "86a3b82643cb785f110bf724cb530fa1"
+  "corpus_version": "b4eb4c9211212020304597105dcd30b6"
 }
