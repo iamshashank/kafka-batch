@@ -25,6 +25,14 @@ KafkaBatch.configure do |config|
   #          `rails g kafka_batch:install --schedule-store mysql` then `rails db:migrate`.
   config.schedule_store = :<%= @schedule_store %>
   # config.schedule_store_database_connection = :kafka_batch_schedule
+  # Also used by the recurring (cron) tables when installed with --recurring.
+
+  # ── Recurring (cron) scheduler ────────────────────────────────────────────────
+  # Requires the kafka_batch_recurring_schedules / _fires tables:
+  #   rails g kafka_batch:install --recurring && rails db:migrate
+  # Enable on scheduler pods only (shares Redis leader lock + fire ledger with Go).
+  # config.recurring_scheduler_enabled = true
+  # Or: KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED=true
 
   # Delayed-job poller. Disabled by default (config.schedule_poller_enabled = false).
   # Enable on scheduler pods — or on every pod in dev when KB_ROLE=all. For high pod

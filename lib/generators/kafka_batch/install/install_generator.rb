@@ -16,7 +16,7 @@ module KafkaBatch
 
       desc "Creates a KafkaBatch initializer, copies the topic-creation shell " \
            "script, and copies the migrations required by the chosen --store / " \
-           "--schedule-store (mysql)."
+           "--schedule-store / --audit / --recurring flags."
 
       class_option :store, type: :string, default: "redis",
                            desc: "Batch-ledger store: redis (default) or mysql (failures/pauses in MySQL)"
@@ -29,10 +29,16 @@ module KafkaBatch
                            desc: "Also copy the kafka_batch_audit_logs migration (Web UI action audit log). " \
                                  "Requires ActiveRecord; enable at runtime with config.audit_enabled = true."
 
+      class_option :recurring, type: :boolean, default: false,
+                               desc: "Also copy the kafka_batch_recurring_schedules / _fires migrations " \
+                                     "(cron scheduler shared with the Go control plane). Requires ActiveRecord; " \
+                                     "enable at runtime with config.recurring_scheduler_enabled = true."
+
       # Migration filenames per store (kept verbatim so they stay idempotent/skippable).
-      LEDGER_MIGRATION    = "20240101000001_create_kafka_batch_tables.rb".freeze
-      SCHEDULED_MIGRATION = "20240101000002_create_kafka_batch_scheduled_jobs.rb".freeze
-      AUDIT_MIGRATION     = "20240101000004_create_kafka_batch_audit_logs.rb".freeze
+      LEDGER_MIGRATION     = "20240101000001_create_kafka_batch_tables.rb".freeze
+      SCHEDULED_MIGRATION  = "20240101000002_create_kafka_batch_scheduled_jobs.rb".freeze
+      AUDIT_MIGRATION      = "20240101000004_create_kafka_batch_audit_logs.rb".freeze
+      RECURRING_MIGRATION  = "20240101000005_create_kafka_batch_recurring_schedules.rb".freeze
 
       def validate_store_options
         %i[store schedule_store].each do |opt|
@@ -44,6 +50,7 @@ module KafkaBatch
         @store          = options[:store]
         @schedule_store = options[:schedule_store]
         @audit          = options[:audit]
+        @recurring      = options[:recurring]
       end
 
       def create_initializer
@@ -67,9 +74,11 @@ module KafkaBatch
         #   --store mysql          → failures / pauses tables
         #   --schedule-store mysql → kafka_batch_scheduled_jobs table
         #   --audit                → kafka_batch_audit_logs table (Web UI audit log)
+        #   --recurring            → kafka_batch_recurring_schedules / _fires
         copy_file LEDGER_MIGRATION,    "db/migrate/#{LEDGER_MIGRATION}"    if @store == "mysql"
         copy_file SCHEDULED_MIGRATION, "db/migrate/#{SCHEDULED_MIGRATION}" if @schedule_store == "mysql"
         copy_file AUDIT_MIGRATION,     "db/migrate/#{AUDIT_MIGRATION}"     if @audit
+        copy_file RECURRING_MIGRATION, "db/migrate/#{RECURRING_MIGRATION}" if @recurring
       end
 
       def show_next_steps
@@ -88,16 +97,22 @@ module KafkaBatch
           end
         ROUTES
 
-        if @store == "mysql" || @schedule_store == "mysql" || @audit
+        if @store == "mysql" || @schedule_store == "mysql" || @audit || @recurring
           copied = []
           copied << "failures / pauses"     if @store == "mysql"
           copied << "scheduled-jobs index"  if @schedule_store == "mysql"
           copied << "audit log"             if @audit
+          copied << "recurring schedules"   if @recurring
           say "\n2. Run the migrations (#{copied.join(' + ')}):\n"
           say "     rails db:migrate\n"
           if @audit
             say "   Then enable the Web UI audit log in the initializer:\n"
             say "     config.audit_enabled = true\n"
+          end
+          if @recurring
+            say "   Then enable the recurring scheduler on scheduler pods:\n"
+            say "     config.recurring_scheduler_enabled = true\n"
+            say "   (or KAFKA_BATCH_RECURRING_SCHEDULER_ENABLED=true)\n"
           end
           say "\n3. Create Kafka topics (choose one):\n"
         else

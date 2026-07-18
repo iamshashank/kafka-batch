@@ -14,13 +14,13 @@ export function PageHeader({
 }) {
   return (
     <Stack
-      direction={{ xs: 'column', sm: 'row' }}
+      direction="row"
       spacing={1.5}
-      alignItems={{ sm: 'flex-start' }}
+      alignItems="flex-start"
       justifyContent="space-between"
-      sx={{ mb: 2.5 }}
+      sx={{ mb: 2.5, width: '100%' }}
     >
-      <Box sx={{ minWidth: 0 }}>
+      <Box sx={{ minWidth: 0, flex: '1 1 auto', pr: actions ? 2 : 0 }}>
         <Typography variant="h5" component="h1" sx={{ mb: 0.5 }}>
           {title}
         </Typography>
@@ -30,7 +30,9 @@ export function PageHeader({
           </Typography>
         ) : null}
       </Box>
-      {actions ? <Box sx={{ flexShrink: 0 }}>{actions}</Box> : null}
+      {actions ? (
+        <Box sx={{ flex: '0 0 auto', ml: 'auto', alignSelf: 'center' }}>{actions}</Box>
+      ) : null}
     </Stack>
   )
 }

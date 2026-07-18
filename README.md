@@ -118,6 +118,7 @@ bundle exec rails generate kafka_batch:install
 # optional: --store mysql           (durable failure log / pauses in MySQL; ledger still Redis)
 # optional: --schedule-store mysql  (delayed-job index in MySQL)
 # optional: --audit                 (copy the Web UI audit-log migration)
+# optional: --recurring             (copy recurring cron schedule / fire-ledger migrations)
 ```
 
 The generator copies only the migrations the chosen stores/features need, then run `rails db:migrate`. See [Web UI audit log](#web-ui-audit-log) for `--audit`.
