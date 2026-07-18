@@ -379,7 +379,9 @@ module KafkaBatch
             row("Retention", fmt_duration(config.performance_metrics_retention)),
             row("Max job types", config.performance_metrics_max_job_types),
             row("Bucket seconds", config.performance_metrics_bucket_seconds),
-            row("Sample rate", config.performance_metrics_sample_rate)
+            row("Sample rate", config.performance_metrics_sample_rate),
+            row("Redis RTT probe interval", "#{config.redis_rtt_probe_interval}s"),
+            row("Redis RTT probe timeout", "#{config.redis_rtt_probe_timeout}s")
           ]
         )
       end

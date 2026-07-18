@@ -19,12 +19,22 @@ type HoverState = {
 
 const VIEW_WIDTH = 300
 
-function fmtRate(count: number, bucketSeconds: number | null | undefined): string | null {
+function fmtRate(count: number, bucketSeconds: number | null | undefined, valueUnit: string): string | null {
+  if (valueUnit !== 'jobs') return null
   if (!bucketSeconds || bucketSeconds <= 0) return null
   const perMin = (count / bucketSeconds) * 60
   if (perMin >= 100) return `${Math.round(perMin)}/min`
   if (perMin >= 10) return `${perMin.toFixed(1)}/min`
   return `${perMin.toFixed(2)}/min`
+}
+
+function fmtValue(count: number, valueUnit: string): string {
+  if (valueUnit === 'ms') {
+    if (count >= 100) return count.toFixed(0)
+    if (count >= 10) return count.toFixed(1)
+    return count.toFixed(2)
+  }
+  return String(count)
 }
 
 function fmtHoverTime(epochSeconds: number): string {
@@ -182,7 +192,7 @@ export function MultiLineChart({
           <Stack spacing={0.35}>
             {series.map((s) => {
               const count = s.values[hoverIndex] ?? 0
-              const rate = fmtRate(count, bucketSeconds)
+              const rate = fmtRate(count, bucketSeconds, valueUnit)
               return (
                 <Stack key={s.key} direction="row" spacing={1} alignItems="baseline" justifyContent="space-between">
                   <Stack direction="row" spacing={0.75} alignItems="center">
@@ -190,7 +200,7 @@ export function MultiLineChart({
                     <Typography variant="caption">{s.label}</Typography>
                   </Stack>
                   <Typography variant="caption" sx={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
-                    {count} {valueUnit}
+                    {fmtValue(count, valueUnit)} {valueUnit}
                     {rate ? ` · ${rate}` : null}
                   </Typography>
                 </Stack>

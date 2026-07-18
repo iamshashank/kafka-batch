@@ -5,11 +5,14 @@ RSpec.describe KafkaBatch::PerformanceMetrics do
       expect(described_class.enabled?).to eq(false)
       expect(described_class.available?).to eq(false)
       expect { described_class.record(:processed, job_type: "W") }.not_to raise_error
+      expect { described_class.record_rtt(100) }.not_to raise_error
+      expect { described_class.record_rtt_error }.not_to raise_error
     end
 
     it "install! does not subscribe when disabled" do
       described_class.install!
       expect(described_class.installed?).to eq(false)
+      expect(KafkaBatch::PerformanceMetrics::RttProbe.running?).to eq(false)
     end
   end
 
@@ -22,9 +25,13 @@ RSpec.describe KafkaBatch::PerformanceMetrics do
       KafkaBatch.config.performance_metrics_bucket_seconds = 60
       KafkaBatch.config.performance_metrics_max_job_types  = 50
       KafkaBatch.config.performance_metrics_sample_rate  = 1.0
+      KafkaBatch.config.redis_rtt_probe_interval         = 15.0
+      KafkaBatch.config.redis_rtt_probe_timeout          = 0.2
       described_class.reset!
       KafkaBatchSpec::RedisHelper.flush!
     end
+
+    after { described_class.reset! }
 
     it "reports enabled and available" do
       expect(described_class.enabled?).to eq(true)
@@ -76,6 +83,7 @@ RSpec.describe KafkaBatch::PerformanceMetrics do
     it "subscribes to job.processed / job.retried / job.failed / workset.reclaimed via install!" do
       described_class.install!
       expect(described_class.installed?).to eq(true)
+      expect(KafkaBatch::PerformanceMetrics::RttProbe.running?).to eq(true)
 
       KafkaBatch::Instrumentation.job_processed(job_id: "j1", batch_id: "b1", worker_class: "MyWorker", duration: 0.1)
       KafkaBatch::Instrumentation.job_retried(job_id: "j2", batch_id: "b1", worker_class: "MyWorker", attempt: 1, next_attempt: 2)
@@ -95,6 +103,28 @@ RSpec.describe KafkaBatch::PerformanceMetrics do
       expect(described_class.available?).to eq(false)
       expect { described_class.record(:processed, job_type: "W") }.not_to raise_error
     end
+
+    it "aggregates RTT samples into count/sum_us/max_us and records probe errors" do
+      described_class.record_rtt(1_500)
+      described_class.record_rtt(2_500)
+      described_class.record_rtt_error
+
+      key = described_class.bucket_key(:rtt)
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      expect(redis.hget(key, "count")).to eq("2")
+      expect(redis.hget(key, "sum_us")).to eq("4000")
+      expect(redis.hget(key, "max_us")).to eq("2500")
+      expect(redis.hget(key, "errors")).to eq("1")
+    end
+
+    it "wins the RTT probe lock and writes a sample via RttProbe.tick!" do
+      KafkaBatch::PerformanceMetrics::RttProbe.tick!
+      key = described_class.bucket_key(:rtt)
+      redis = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+      expect(redis.exists?(key)).to eq(true)
+      expect(redis.hget(key, "count").to_i).to be >= 1
+      expect(redis.get("kafka_batch:perf:rtt:probe_lock")).to eq("1")
+    end
   end
 
   describe KafkaBatch::PerformanceMetrics::Reader do
@@ -107,6 +137,8 @@ RSpec.describe KafkaBatch::PerformanceMetrics do
       KafkaBatch::PerformanceMetrics.reset!
       KafkaBatchSpec::RedisHelper.flush!
     end
+
+    after { KafkaBatch::PerformanceMetrics.reset! }
 
     it "aggregates totals and per-job-type rows for the requested range" do
       3.times { KafkaBatch::PerformanceMetrics.record(:processed, job_type: "FooWorker") }
@@ -127,6 +159,22 @@ RSpec.describe KafkaBatch::PerformanceMetrics do
       expect(row[:processed]).to eq(3)
       expect(row[:failed]).to eq(1)
       expect(row[:sparkline]).to be_an(Array)
+    end
+
+    it "includes RTT avg/max/errors on points and an rtt summary" do
+      KafkaBatch::PerformanceMetrics.record_rtt(2_000)
+      KafkaBatch::PerformanceMetrics.record_rtt(4_000)
+      KafkaBatch::PerformanceMetrics.record_rtt_error
+
+      data = described_class.new.fetch(range: "5m")
+      point = data[:points].last
+      expect(point[:rtt_avg_ms]).to eq(3.0)
+      expect(point[:rtt_max_ms]).to eq(4.0)
+      expect(point[:rtt_errors]).to eq(1)
+      expect(data[:rtt][:avg_ms]).to eq(3.0)
+      expect(data[:rtt][:max_ms]).to eq(4.0)
+      expect(data[:rtt][:errors]).to eq(1)
+      expect(data[:rtt][:latest_avg_ms]).to eq(3.0)
     end
 
     it "falls back to the default range for unknown range values" do

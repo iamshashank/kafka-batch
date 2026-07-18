@@ -19,6 +19,7 @@ module KafkaBatch
   #   kafka_batch:perf:min:<bucket_start_epoch>:failed
   #   kafka_batch:perf:min:<bucket_start_epoch>:retried
   #   kafka_batch:perf:min:<bucket_start_epoch>:reclaimed
+  #   kafka_batch:perf:min:<bucket_start_epoch>:rtt   (count/sum_us/max_us/errors)
   # Hash field = job_type (worker_class), plus "_all" (system total across all
   # job types) and "_other" (overflow once performance_metrics_max_job_types
   # distinct job types have been seen — a safety valve, not the common case).
@@ -30,33 +31,49 @@ module KafkaBatch
   module PerformanceMetrics
     KEY_PREFIX       = "kafka_batch:perf:min:"
     STATUSES         = %i[processed failed retried reclaimed].freeze
+    RTT_STATUS       = :rtt
     ALL_FIELD        = "_all"
     OTHER_FIELD      = "_other"
     CIRCUIT_COOLDOWN = 30
     MAX_FIELD_BYTES  = 200
     EVENT_PATTERN    = /\A(job\.(?:processed|retried|failed)|workset\.reclaimed)\.kafka_batch\z/.freeze
 
+    # Atomically increments count/sum_us and raises max_us when needed.
+    RECORD_RTT_LUA = <<~LUA.freeze
+      redis.call('HINCRBY', KEYS[1], 'count', 1)
+      redis.call('HINCRBY', KEYS[1], 'sum_us', tonumber(ARGV[1]))
+      local cur = tonumber(redis.call('HGET', KEYS[1], 'max_us') or '0')
+      if tonumber(ARGV[1]) > cur then
+        redis.call('HSET', KEYS[1], 'max_us', ARGV[1])
+      end
+      redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+      return 1
+    LUA
+
     class << self
       def install!(force: false)
-        return unless defined?(ActiveSupport::Notifications)
         return unless enabled?
 
         @mutex ||= Mutex.new
         @mutex.synchronize do
-          return if @installed && !force
+          if defined?(ActiveSupport::Notifications)
+            return if @installed && !force
 
-          @subscription = ActiveSupport::Notifications.subscribe(EVENT_PATTERN) do |*args|
-            handle(ActiveSupport::Notifications::Event.new(*args))
+            @subscription = ActiveSupport::Notifications.subscribe(EVENT_PATTERN) do |*args|
+              handle(ActiveSupport::Notifications::Event.new(*args))
+            end
+            @installed = true
+            KafkaBatch.logger.info(
+              "[KafkaBatch][PerformanceMetrics] installed retention=#{retention}s " \
+              "bucket=#{bucket_seconds}s max_job_types=#{max_job_types}"
+            )
           end
-          @installed = true
-          KafkaBatch.logger.info(
-            "[KafkaBatch][PerformanceMetrics] installed retention=#{retention}s " \
-            "bucket=#{bucket_seconds}s max_job_types=#{max_job_types}"
-          )
         end
+        RttProbe.start!
       end
 
       def reset!
+        RttProbe.stop!
         @mutex&.synchronize do
           if defined?(ActiveSupport::Notifications) && @subscription
             ActiveSupport::Notifications.unsubscribe(@subscription)
@@ -121,6 +138,38 @@ module KafkaBatch
             pipe.expire(key, retention)
           end
         end
+        nil
+      end
+
+      # Successful RTT sample in microseconds (best-effort; never raises).
+      def record_rtt(rtt_us, at: Time.now)
+        return unless enabled?
+
+        us = rtt_us.to_i
+        return unless us.positive?
+
+        key = bucket_key(RTT_STATUS, at)
+        redis_with { |r| r.eval(RECORD_RTT_LUA, keys: [key], argv: [us, retention]) }
+        nil
+      rescue StandardError => e
+        KafkaBatch.logger.debug("[KafkaBatch][PerformanceMetrics] record_rtt failed: #{e.message}")
+        nil
+      end
+
+      # Failed / timed-out RTT probe (best-effort; never raises).
+      def record_rtt_error(at: Time.now)
+        return unless enabled?
+
+        key = bucket_key(RTT_STATUS, at)
+        redis_with do |r|
+          r.pipelined do |pipe|
+            pipe.hincrby(key, "errors", 1)
+            pipe.expire(key, retention)
+          end
+        end
+        nil
+      rescue StandardError => e
+        KafkaBatch.logger.debug("[KafkaBatch][PerformanceMetrics] record_rtt_error failed: #{e.message}")
         nil
       end
 
@@ -223,4 +272,5 @@ module KafkaBatch
   end
 end
 
+require_relative "performance_metrics/rtt_probe"
 require_relative "performance_metrics/reader"

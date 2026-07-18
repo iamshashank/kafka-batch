@@ -20,7 +20,16 @@ import { PageHeader } from '../components/PageHeader'
 import { SectionCard } from '../components/SectionCard'
 import { useLiveRefresh } from '../hooks/useLiveRefresh'
 
-type PerfPoint = { t: number; processed: number; failed: number; retried: number; reclaimed: number }
+type PerfPoint = {
+  t: number
+  processed: number
+  failed: number
+  retried: number
+  reclaimed: number
+  rtt_avg_ms?: number
+  rtt_max_ms?: number
+  rtt_errors?: number
+}
 type PerfJobType = { job_type: string; processed: number; failed: number; retried: number; sparkline: number[] }
 type PerfData = {
   ok: boolean
@@ -32,6 +41,7 @@ type PerfData = {
   points: PerfPoint[]
   job_types: PerfJobType[]
   totals: { processed?: number; failed?: number; retried?: number; reclaimed?: number }
+  rtt?: { avg_ms?: number; max_ms?: number; errors?: number; latest_avg_ms?: number; latest_max_ms?: number }
 }
 
 const RANGES: { value: string; label: string }[] = [
@@ -46,6 +56,9 @@ const COLORS = {
   failed: '#b91c1c',
   retried: '#b45309',
   reclaimed: '#4338ca',
+  rttAvg: '#0369a1',
+  rttMax: '#7c3aed',
+  rttErrors: '#be123c',
 }
 
 function fmtTime(epochSeconds: number): string {
@@ -101,7 +114,7 @@ export function PerformancePage() {
     <Box>
       <PageHeader
         title="Performance"
-        subtitle="Redis-backed throughput history from job.processed / job.retried / job.failed and reclaim sweeps."
+        subtitle="Redis-backed throughput history from job.processed / job.retried / job.failed, reclaim sweeps, and cluster-wide Redis RTT probes."
         actions={rangeChips}
       />
 
@@ -124,6 +137,14 @@ function PerformanceBody({ data }: { data: PerfData }) {
   const failed = data.totals.failed || 0
   const retried = data.totals.retried || 0
   const reclaimed = data.totals.reclaimed || 0
+  const rtt = data.rtt || {}
+  const fmtMs = (v: number | undefined) => {
+    const n = v || 0
+    if (n <= 0) return '—'
+    if (n >= 100) return `${Math.round(n)} ms`
+    if (n >= 10) return `${n.toFixed(1)} ms`
+    return `${n.toFixed(2)} ms`
+  }
 
   const points = data.points || []
   const throughputSeries = [
@@ -133,6 +154,13 @@ function PerformanceBody({ data }: { data: PerfData }) {
   ]
   const reclaimSeries = [
     { key: 'reclaimed', label: 'Reclaimed (orphaned jobs)', color: COLORS.reclaimed, values: points.map((p) => p.reclaimed) },
+  ]
+  const rttSeries = [
+    { key: 'rtt_avg', label: 'Avg RTT', color: COLORS.rttAvg, values: points.map((p) => p.rtt_avg_ms || 0) },
+    { key: 'rtt_max', label: 'Max RTT', color: COLORS.rttMax, values: points.map((p) => p.rtt_max_ms || 0) },
+  ]
+  const rttErrorSeries = [
+    { key: 'rtt_errors', label: 'Probe errors', color: COLORS.rttErrors, values: points.map((p) => p.rtt_errors || 0) },
   ]
 
   const rangeCaption =
@@ -149,6 +177,9 @@ function PerformanceBody({ data }: { data: PerfData }) {
           { label: 'Retried', value: retried, color: COLORS.retried },
           { label: 'Reclaimed', value: reclaimed, color: COLORS.reclaimed },
           { label: 'Success rate', value: pct(processed, processed + failed) },
+          { label: 'Redis RTT (latest)', value: fmtMs(rtt.latest_avg_ms) },
+          { label: 'Redis RTT max (range)', value: fmtMs(rtt.max_ms) },
+          { label: 'RTT probe errors', value: rtt.errors || 0, color: COLORS.rttErrors },
         ]}
       />
 
@@ -158,6 +189,28 @@ function PerformanceBody({ data }: { data: PerfData }) {
           timestamps={points.map((p) => p.t)}
           bucketSeconds={data.bucket_seconds}
           emptyMessage="No processed/failed/retried events recorded in this range yet."
+        />
+      </SectionCard>
+
+      <SectionCard
+        title="Redis RTT"
+        subheader="Cluster-wide PING probes (~one winner every 15s). Avg and max per bucket."
+      >
+        <MultiLineChart
+          series={rttSeries}
+          timestamps={points.map((p) => p.t)}
+          valueUnit="ms"
+          emptyMessage="No Redis RTT probes recorded in this range yet."
+        />
+      </SectionCard>
+
+      <SectionCard title="Redis probe errors" subheader="Timed-out or failed PING probes in each bucket.">
+        <MultiLineChart
+          series={rttErrorSeries}
+          timestamps={points.map((p) => p.t)}
+          height={100}
+          valueUnit="errors"
+          emptyMessage="No probe errors in this range."
         />
       </SectionCard>
 

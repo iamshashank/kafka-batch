@@ -43,7 +43,8 @@ module KafkaBatch
           bucket_seconds: bucket_secs * group_size,
           points: points,
           job_types: build_job_type_rows(job_type_totals, job_type_series, job_types, top_n),
-          totals: totals
+          totals: totals,
+          rtt: rtt_summary(points)
         }
       end
 
@@ -58,6 +59,10 @@ module KafkaBatch
               starts.each do |b|
                 futures[[status, b]] = pipe.hgetall(PerformanceMetrics.bucket_key(status, Time.at(b)))
               end
+            end
+            starts.each do |b|
+              futures[[PerformanceMetrics::RTT_STATUS, b]] =
+                pipe.hgetall(PerformanceMetrics.bucket_key(PerformanceMetrics::RTT_STATUS, Time.at(b)))
             end
           end
         end
@@ -82,8 +87,15 @@ module KafkaBatch
         points = []
 
         starts.each_slice(group_size) do |group|
-          bucket = { t: group.first, processed: 0, failed: 0, retried: 0, reclaimed: 0 }
+          bucket = {
+            t: group.first,
+            processed: 0, failed: 0, retried: 0, reclaimed: 0,
+            rtt_avg_ms: 0.0, rtt_max_ms: 0.0, rtt_errors: 0
+          }
           jt_processed = Hash.new(0)
+          rtt_count = 0
+          rtt_sum_us = 0
+          rtt_max_us = 0
 
           group.each do |b|
             PerformanceMetrics::STATUSES.each do |status|
@@ -103,6 +115,21 @@ module KafkaBatch
                 end
               end
             end
+
+            rtt = raw[[PerformanceMetrics::RTT_STATUS, b]]
+            if rtt && !rtt.empty?
+              c = rtt["count"].to_i
+              rtt_count += c
+              rtt_sum_us += rtt["sum_us"].to_i
+              max_us = rtt["max_us"].to_i
+              rtt_max_us = max_us if max_us > rtt_max_us
+              bucket[:rtt_errors] += rtt["errors"].to_i
+            end
+          end
+
+          if rtt_count.positive?
+            bucket[:rtt_avg_ms] = (rtt_sum_us.to_f / rtt_count / 1000.0).round(3)
+            bucket[:rtt_max_ms] = (rtt_max_us.to_f / 1000.0).round(3)
           end
 
           points << bucket
@@ -130,6 +157,38 @@ module KafkaBatch
             sparkline: job_type_series.map { |h| h[jt] || 0 }
           }
         end
+      end
+
+      def rtt_summary(points)
+        samples = 0
+        sum_avg_weighted = 0.0
+        max_ms = 0.0
+        errors = 0
+        latest_avg = nil
+        latest_max = nil
+
+        points.each do |p|
+          avg = p[:rtt_avg_ms].to_f
+          max = p[:rtt_max_ms].to_f
+          err = p[:rtt_errors].to_i
+          errors += err
+          next unless avg.positive? || max.positive?
+
+          # Weight unknown; treat each non-empty bucket equally for range avg.
+          samples += 1
+          sum_avg_weighted += avg
+          max_ms = max if max > max_ms
+          latest_avg = avg
+          latest_max = max
+        end
+
+        {
+          avg_ms: samples.positive? ? (sum_avg_weighted / samples).round(3) : 0.0,
+          max_ms: max_ms.round(3),
+          errors: errors,
+          latest_avg_ms: latest_avg || 0.0,
+          latest_max_ms: latest_max || 0.0
+        }
       end
     end
   end

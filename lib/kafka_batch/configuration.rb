@@ -491,6 +491,13 @@ module KafkaBatch
     # high-throughput deployments that want to cut write volume. Default 1.0
     # (every event recorded). Env: KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE.
     attr_accessor :performance_metrics_sample_rate
+    # Cluster-wide Redis RTT probe interval (seconds). Only the NX lock winner
+    # issues a PING each tick (~4 probes/min at the default). Used when
+    # performance_metrics_enabled. Env: KAFKA_BATCH_REDIS_RTT_PROBE_INTERVAL.
+    attr_accessor :redis_rtt_probe_interval
+    # Client timeout (seconds) for the RTT PING; timeouts/errors increment the
+    # bucket's errors counter. Env: KAFKA_BATCH_REDIS_RTT_PROBE_TIMEOUT.
+    attr_accessor :redis_rtt_probe_timeout
 
     # ── Handler manifest (Go + Ruby routing) ─────────────────────────────────
     # Optional YAML listing handlers (runtime/topic/retries). Loaded at boot
@@ -654,6 +661,8 @@ module KafkaBatch
       @performance_metrics_max_job_types    = env_positive_int("KAFKA_BATCH_PERFORMANCE_METRICS_MAX_JOB_TYPES", 50)
       @performance_metrics_bucket_seconds   = env_positive_int("KAFKA_BATCH_PERFORMANCE_METRICS_BUCKET_SECONDS", 60)
       @performance_metrics_sample_rate      = env_positive_float("KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE", 1.0)
+      @redis_rtt_probe_interval             = env_positive_float("KAFKA_BATCH_REDIS_RTT_PROBE_INTERVAL", 15.0)
+      @redis_rtt_probe_timeout              = env_positive_float("KAFKA_BATCH_REDIS_RTT_PROBE_TIMEOUT", 0.2)
       @producer_config          = {}
       @consumer_config          = {}
       @validate_topics_on_boot  = false
@@ -775,6 +784,12 @@ module KafkaBatch
         rate = @performance_metrics_sample_rate.to_f
         if rate <= 0 || rate > 1.0
           raise ConfigurationError, "performance_metrics_sample_rate must be in (0, 1.0]"
+        end
+        if @redis_rtt_probe_interval.to_f <= 0
+          raise ConfigurationError, "redis_rtt_probe_interval must be > 0"
+        end
+        if @redis_rtt_probe_timeout.to_f <= 0
+          raise ConfigurationError, "redis_rtt_probe_timeout must be > 0"
         end
       end
     end
