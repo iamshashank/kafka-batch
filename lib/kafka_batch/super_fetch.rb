@@ -106,11 +106,26 @@ module KafkaBatch
         end
       end
 
-      # Stop accepting new claims and wait for in-flight #perform.
+      # Graceful-shutdown drain: stop accepting new claims, wait for in-flight
+      # #perform to finish (up to timeout), and emit super_fetch.drained. After a
+      # drain the executor refuses further claims until #reset! — so this is a
+      # one-way shutdown, NOT a mid-run "wait for the pool" (use #wait_for_idle
+      # for that).
       # @return [Integer] remaining in-flight count (0 = drained cleanly)
       def drain(timeout: 30)
-        deadline = monotonic_now + timeout.to_f
         @mutex.synchronize { @accepting = false }
+        remaining = wait_for_idle(timeout: timeout)
+        KafkaBatch::Instrumentation.super_fetch_drained(remaining: remaining, timeout: timeout)
+        remaining
+      end
+
+      # Wait for the perform pool to go idle WITHOUT disabling new claims. Unlike
+      # #drain this is safe to call repeatedly while the consumer keeps running
+      # (e.g. to observe async results before asserting): it never flips
+      # @accepting, so subsequent dispatches still claim and perform.
+      # @return [Integer] remaining in-flight count (0 = fully idle)
+      def wait_for_idle(timeout: 30)
+        deadline = monotonic_now + timeout.to_f
         loop do
           idle = @mutex.synchronize { @in_flight.empty? && @active_threads.zero? }
           break if idle
@@ -121,10 +136,9 @@ module KafkaBatch
         remaining = @mutex.synchronize { @in_flight.size }
         if remaining.positive?
           KafkaBatch.logger.warn(
-            "[KafkaBatch][SuperFetch] drain timed out with #{remaining} in-flight job(s)"
+            "[KafkaBatch][SuperFetch] wait_for_idle timed out with #{remaining} in-flight job(s)"
           )
         end
-        KafkaBatch::Instrumentation.super_fetch_drained(remaining: remaining, timeout: timeout)
         remaining
       end
 
@@ -339,6 +353,13 @@ module KafkaBatch
       def drain(timeout: nil)
         timeout = KafkaBatch.config.super_fetch_drain_timeout if timeout.nil?
         executor.drain(timeout: timeout)
+      end
+
+      # Wait for in-flight #perform to finish without shutting the executor down.
+      # Safe to call repeatedly mid-run (unlike #drain, which stops accepting).
+      def wait_for_idle(timeout: nil)
+        timeout = KafkaBatch.config.super_fetch_drain_timeout if timeout.nil?
+        executor.wait_for_idle(timeout: timeout)
       end
     end
   end

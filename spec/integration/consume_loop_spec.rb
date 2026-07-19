@@ -130,8 +130,10 @@ RSpec.describe "Full consume loop (integration)", :integration do
 
       consumer.consume
       # SuperFetch marks before #perform; wait for the pool so assertions see
-      # events/retries produced by the async pipeline.
-      KafkaBatch::SuperFetch.drain(timeout: 30) if defined?(KafkaBatch::SuperFetch)
+      # events/retries produced by the async pipeline. Use wait_for_idle (not
+      # drain) so the executor keeps accepting claims for the next polled message
+      # — drain stops accepting for good and would strand messages 2..N.
+      KafkaBatch::SuperFetch.wait_for_idle(timeout: 30) if defined?(KafkaBatch::SuperFetch)
 
       if committed
         commit(rd)
