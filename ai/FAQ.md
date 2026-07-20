@@ -445,7 +445,7 @@ Treated as expired (poison-safe).
 `ai/README.md` §30 and `KafkaBatch::Configuration`.
 
 ### Where is the full Go knob list?
-`ai/README.md` §31 and `kafka-batch-go` `config/daemon.example.yml`.
+`ai/README.md` §32 (Go configuration reference — all `daemon.yml` keys, worker throughput knobs, env overrides, manifest fields, MySQL DDL blocks) and `kafka-batch-go` `config/daemon.example.yml`. §31 is the Ruby reference.
 
 ### Why do README tables disagree with library defaults?
 Install generator often ships production-oriented values (e.g. fairness 1000, lease 7200, max_retries 3) while library `initialize` keeps smaller defaults. Prefer code/YAML as truth; see parity section.
@@ -454,7 +454,13 @@ Install generator often ships production-oriented values (e.g. fairness 1000, le
 Prefixed settings (default topics + consumer group) yes. Explicit worker/manifest topics are typically the final names you configure; priority YAML names go through `resolve_topic`.
 
 ### How do Go YAML env interpolations work?
-Any value may use `${VAR}` or `${VAR:-default}`. Env overrides also applied after YAML for many keys.
+Any value may use `${VAR}` or `${VAR:-default}`. Env overrides also applied after YAML for many keys (see §32 for the complete `applyEnv` list).
+
+### What is Go `execution_mode`?
+`superfetch` (default) claims jobs into a Redis workset and runs `#perform` on a bounded goroutine pool with TTL leases + reclaim. `watermark` is an advanced Redis-free mode that tracks committed offset watermarks instead of a workset — it needs strictly idempotent handlers and one mode per topic. Set per daemon/worker via `execution_mode:` or `KAFKA_BATCH_EXECUTION_MODE`.
+
+### Which Go settings are worker-only vs daemon-only?
+`kbatch worker` reads the throughput/SuperFetch knobs (`jobs_consumer_concurrency`, `fair_ready_consumer_concurrency`, `priority_consumer_concurrency`, `super_fetch_*`, `execution_mode`). `kbatch daemon` (control) reads events/retry/fairness dispatch/schedule/recurring/reconciler/liveness. Both share Kafka/Redis identity, topics, and the handler manifest. See §32.
 
 ### Go MySQL DSN formats?
 Native go-sql-driver **or** `mysql2://` / `mysql://` URLs (converted at connect). Prefer `parseTime=true&loc=UTC`.

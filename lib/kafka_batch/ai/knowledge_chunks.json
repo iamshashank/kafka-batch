@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "built_at": "2026-07-20T12:26:52Z",
+  "built_at": "2026-07-20T13:36:00Z",
   "max_chars": 2800,
-  "readme_sha256": "52e4416f3c7673fcdba92c8e2cd7ac2670d59fd3df3a3bad45c572ebf6b199ca",
-  "faq_sha256": "10d222b41263af36c3dbebd06f4fc656f5b7fecb71d72b9b6581baf8c65fed9d",
-  "chunk_count": 430,
+  "readme_sha256": "54ad5784fc229cd6f85da54104af3de18ad276feb4397dcf709d673b8011ab43",
+  "faq_sha256": "609fdfe10dca80e8f268274085b53b6439029164141bd16e8b861052db21b5ea",
+  "chunk_count": 432,
   "chunks": [
     {
       "id": "readme-introduction-939750e33df47b89",
@@ -1552,8 +1552,8 @@
         "Fairness"
       ],
       "section": "32. Go configuration reference",
-      "text": "32. Go configuration reference › Fairness\n\n| Key | Default | Notes |\n|-----|---------|-------|\n| `fairness_enabled` | **false** | Must set true for fair dispatch |\n| `fairness_time_ingest` / `_ready` / `_ready_go` / `_ready_ruby` | `kafka_batch.fair_time_*` | |\n| `fairness_throughput_ingest` / `_ready` / `_ready_go` / `_ready_ruby` | `kafka_batch.fair_throughput_*` | |\n| `fairness_ready_window` | **100** | ⚠️ Ruby 500 — set 500 for parity |\n| `fairness_global_concurrency` | 50 | |\n| `fairness_max_inflight_per_tenant` | 0 | 0 = dynamic share |\n| `fairness_lease_ttl` | 1800 s | |\n| `fairness_default_weight` | 1.0 | |\n| `fairness_weighted_concurrency` | true | |\n| `fairness_active_count_ttl` | 5 s | |\n| `fairness_active_count_source` | `inflight_plus_ready` | or `inflight` |\n| `fairness_dynamic_tenant_partitions` | true | |\n| `fairness_tenant_partition_cache_ttl` | 30 s | |\n| `fairness_tenant_partitions` | map | static pins win |",
-      "char_count": 940
+      "text": "32. Go configuration reference › Fairness\n\n| Key | Default | Notes |\n|-----|---------|-------|\n| `fairness_enabled` | **false** | Must set true for fair dispatch |\n| `fairness_time_ingest` / `_ready` / `_ready_go` / `_ready_ruby` | `kafka_batch.fair_time_*` | |\n| `fairness_throughput_ingest` / `_ready` / `_ready_go` / `_ready_ruby` | `kafka_batch.fair_throughput_*` | |\n| `fairness_ready_window` | **100** | ⚠️ Ruby 500 — set 500 for parity |\n| `fairness_global_concurrency` | 50 | |\n| `fairness_max_inflight_per_tenant` | 0 | 0 = dynamic share |\n| `fairness_lease_ttl` | 1800 s | |\n| `fairness_default_weight` | 1.0 | |\n| `fairness_weighted_concurrency` | true | |\n| `fairness_active_count_ttl` | 5 s | |\n| `fairness_active_count_source` | `inflight_plus_ready` | or `inflight` |\n| `fairness_reset_vtime_when_idle` | **true** | Clear vtime ledger (weights kept) when a lane goes fully idle |\n| `fairness_vtime_idle_reset_debounce` | 15 s | Lane must stay idle this long before the reset fires |\n| `fairness_dynamic_tenant_partitions` | true | |\n| `fairness_tenant_partition_cache_ttl` | 30 s | |\n| `fairness_tenant_partitions` | map | static pins win |\n\nIdle vtime reset is YAML-only in Go (no env var). In Ruby the same two keys exist plus env `KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE`. Both runtimes default it on; behavior is identical (atomic ring-empty-guarded DEL, fires at most once per idle period, weights preserved).",
+      "char_count": 1432
     },
     {
       "id": "readme-32-go-configuration-reference-store-cancel-consu-675e8351fe817204",
@@ -1588,8 +1588,8 @@
         "Env overrides (`applyEnv` — complete list)"
       ],
       "section": "32. Go configuration reference",
-      "text": "32. Go configuration reference › Env overrides (`applyEnv` — complete list)\n\n`KAFKA_BROKERS`, `KAFKA_PREFIX`, `REDIS_URL`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_SCHEDULE_MYSQL_DSN`, `KAFKA_BATCH_STORE_MYSQL_DSN`, `KAFKA_BATCH_PRIORITY_CONFIG`, `KAFKA_BATCH_PRIORITY_CONFIGS`, `KAFKA_BATCH_METRICS_ENABLED`, `KAFKA_BATCH_METRICS_PREFIX`, `KAFKA_BATCH_METRICS_STATSD_ADDR`, `KAFKA_BATCH_LIVENESS_ENABLED`, `KAFKA_BATCH_LIVENESS_HTTP_ADDR`, `KAFKA_BATCH_LIVENESS_TTL`, `KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL`, `KAFKA_BATCH_PERFORMANCE_METRICS_ENABLED`, `KAFKA_BATCH_PERFORMANCE_METRICS_RETENTION`, `KAFKA_BATCH_PERFORMANCE_METRICS_MAX_JOB_TYPES`, `KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE`, `KAFKA_BATCH_REDIS_RTT_PROBE_INTERVAL`, `KAFKA_BATCH_REDIS_RTT_PROBE_TIMEOUT`, `KAFKA_BATCH_RETRY_MAX_PAUSE`, `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS`, `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_SKIP_CANCELLED_JOBS`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_CANCELLATION_CACHE_TTL`, `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY`, `KAFKA_BATCH_SUPER_FETCH_CLAIM_WINDOW`, `KAFKA_BATCH_EXECUTION_MODE`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS`, `KAFKA_BATCH_CONSUMER_STALL_TIMEOUT`.\n\nMySQL DSNs: go-sql-driver form **or** `mysql2://` / `mysql://` URLs.",
-      "char_count": 1452
+      "text": "32. Go configuration reference › Env overrides (`applyEnv` — complete list)\n\n`KAFKA_BROKERS`, `KAFKA_PREFIX`, `REDIS_URL`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_SCHEDULE_MYSQL_DSN`, `KAFKA_BATCH_STORE_MYSQL_DSN`, `KAFKA_BATCH_PRIORITY_CONFIG`, `KAFKA_BATCH_PRIORITY_CONFIGS`, `KAFKA_BATCH_METRICS_ENABLED`, `KAFKA_BATCH_METRICS_PREFIX`, `KAFKA_BATCH_METRICS_STATSD_ADDR`, `KAFKA_BATCH_LIVENESS_ENABLED`, `KAFKA_BATCH_LIVENESS_HTTP_ADDR`, `KAFKA_BATCH_LIVENESS_TTL`, `KAFKA_BATCH_LIVENESS_HEARTBEAT_INTERVAL`, `KAFKA_BATCH_PERFORMANCE_METRICS_ENABLED`, `KAFKA_BATCH_PERFORMANCE_METRICS_RETENTION`, `KAFKA_BATCH_PERFORMANCE_METRICS_MAX_JOB_TYPES`, `KAFKA_BATCH_PERFORMANCE_METRICS_BUCKET_SECONDS`, `KAFKA_BATCH_PERFORMANCE_METRICS_SAMPLE_RATE`, `KAFKA_BATCH_REDIS_RTT_PROBE_INTERVAL`, `KAFKA_BATCH_REDIS_RTT_PROBE_TIMEOUT`, `KAFKA_BATCH_RETRY_MAX_PAUSE`, `KAFKA_BATCH_PRODUCER_REQUIRED_ACKS`, `KAFKA_BATCH_JOBS_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_FAIR_READY_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_PRIORITY_CONSUMER_CONCURRENCY`, `KAFKA_BATCH_SKIP_CANCELLED_JOBS`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_CANCELLATION_CACHE_TTL`, `KAFKA_BATCH_SUPER_FETCH_CONCURRENCY`, `KAFKA_BATCH_SUPER_FETCH_CLAIM_WINDOW`, `KAFKA_BATCH_EXECUTION_MODE`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_BYTES`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_PARTITION_BYTES`, `KAFKA_BATCH_CONSUMER_FETCH_MAX_WAIT_MS`, `KAFKA_BATCH_CONSUMER_STALL_TIMEOUT`.\n\nMySQL DSNs: go-sql-driver form **or** `mysql2://` / `mysql://` URLs.",
+      "char_count": 1502
     },
     {
       "id": "readme-32-go-configuration-reference-handler-manifest-k-62a65d8d89fd6134",
@@ -3340,8 +3340,8 @@
         "Where is the full Go knob list?"
       ],
       "section": "O. Configuration and defaults",
-      "text": "FAQ: Where is the full Go knob list?\n\n`ai/README.md` §31 and `kafka-batch-go` `config/daemon.example.yml`.",
-      "char_count": 106
+      "text": "FAQ: Where is the full Go knob list?\n\n`ai/README.md` §32 (Go configuration reference — all `daemon.yml` keys, worker throughput knobs, env overrides, manifest fields, MySQL DDL blocks) and `kafka-batch-go` `config/daemon.example.yml`. §31 is the Ruby reference.",
+      "char_count": 261
     },
     {
       "id": "faq-o-configuration-and-defaults-why-do-readme-table-80aeb51b3ab56e24",
@@ -3376,8 +3376,32 @@
         "How do Go YAML env interpolations work?"
       ],
       "section": "O. Configuration and defaults",
-      "text": "FAQ: How do Go YAML env interpolations work?\n\nAny value may use `${VAR}` or `${VAR:-default}`. Env overrides also applied after YAML for many keys.",
-      "char_count": 147
+      "text": "FAQ: How do Go YAML env interpolations work?\n\nAny value may use `${VAR}` or `${VAR:-default}`. Env overrides also applied after YAML for many keys (see §32 for the complete `applyEnv` list).",
+      "char_count": 190
+    },
+    {
+      "id": "faq-o-configuration-and-defaults-what-is-go-executio-01edb930cba1d184",
+      "source": "faq",
+      "title": "What is Go `execution_mode`?",
+      "heading_path": [
+        "O. Configuration and defaults",
+        "What is Go `execution_mode`?"
+      ],
+      "section": "O. Configuration and defaults",
+      "text": "FAQ: What is Go `execution_mode`?\n\n`superfetch` (default) claims jobs into a Redis workset and runs `#perform` on a bounded goroutine pool with TTL leases + reclaim. `watermark` is an advanced Redis-free mode that tracks committed offset watermarks instead of a workset — it needs strictly idempotent handlers and one mode per topic. Set per daemon/worker via `execution_mode:` or `KAFKA_BATCH_EXECUTION_MODE`.",
+      "char_count": 410
+    },
+    {
+      "id": "faq-o-configuration-and-defaults-which-go-settings-a-c110b582b40cca0c",
+      "source": "faq",
+      "title": "Which Go settings are worker-only vs daemon-only?",
+      "heading_path": [
+        "O. Configuration and defaults",
+        "Which Go settings are worker-only vs daemon-only?"
+      ],
+      "section": "O. Configuration and defaults",
+      "text": "FAQ: Which Go settings are worker-only vs daemon-only?\n\n`kbatch worker` reads the throughput/SuperFetch knobs (`jobs_consumer_concurrency`, `fair_ready_consumer_concurrency`, `priority_consumer_concurrency`, `super_fetch_*`, `execution_mode`). `kbatch daemon` (control) reads events/retry/fairness dispatch/schedule/recurring/reconciler/liveness. Both share Kafka/Redis identity, topics, and the handler manifest. See §32.",
+      "char_count": 422
     },
     {
       "id": "faq-o-configuration-and-defaults-go-mysql-dsn-format-d1925aa030f45406",
@@ -5132,5 +5156,5 @@
       "char_count": 58
     }
   ],
-  "corpus_version": "3956b106a33c6b9ff69f9a5976431704"
+  "corpus_version": "c1c24797275919b00c7eec60f074e199"
 }
