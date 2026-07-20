@@ -44,6 +44,10 @@ module KafkaBatch
           live
         elsif method == "GET" && path == "/api/lag"
           lag(params)
+        elsif method == "GET" && path == "/api/browse/topics"
+          browse_topics
+        elsif method == "GET" && path == "/api/browse/messages"
+          browse_messages(params)
         elsif method == "POST" && path == "/api/lag/pause"
           lag_control(:pause, params, env)
         elsif method == "POST" && path == "/api/lag/resume"
@@ -384,6 +388,129 @@ module KafkaBatch
           pause_tooltip: @web.lag_pause_tooltip(KafkaBatch.config.consumption_control_refresh_interval),
           schedule_consumer_group: "#{KafkaBatch.config.consumer_group}-schedule"
         )
+      end
+
+      def browse_topics
+        unless defined?(KafkaBatch::Browse::Reader)
+          return Json.error(503, "Browse not loaded")
+        end
+        unless KafkaBatch::Lag.available?
+          return Json.ok(
+            ok: true, available: false,
+            message: "Topic browse requires Karafka::Admin (broker lag/offsets).",
+            topics: []
+          )
+        end
+
+        reader = KafkaBatch::Browse::Reader.new
+        begin
+          topics = reader.list_topics.map { |t| serialize_browse_topic(t) }
+          Json.ok(ok: true, available: true, topics: topics)
+        ensure
+          reader.close
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch::Web] browse_topics: #{e.message}")
+        Json.error(500, e.message)
+      end
+
+      def browse_messages(params)
+        unless defined?(KafkaBatch::Browse::Reader)
+          return Json.error(503, "Browse not loaded")
+        end
+        unless KafkaBatch::Lag.available?
+          return Json.ok(
+            ok: true, available: false,
+            message: "Message browse requires Karafka::Admin and broker access.",
+            messages: [], has_next: false, cursor: nil
+          )
+        end
+
+        topic = @web.non_empty(params["topic"])
+        group = @web.non_empty(params["group"])
+        return Json.error(400, "topic and group are required") if topic.nil? || group.nil?
+
+        partition = @web.non_empty(params["partition"])
+        start_offset = @web.non_empty(params["start_offset"])
+        cursor = @web.non_empty(params["cursor"])
+        limit = params["limit"].to_i
+        limit = KafkaBatch::Browse::Reader::PAGE_SIZE if limit <= 0
+
+        reader = KafkaBatch::Browse::Reader.new
+        begin
+          page = reader.fetch_page(
+            topic: topic,
+            group: group,
+            partition: partition,
+            start_offset: start_offset,
+            cursor: cursor,
+            limit: limit
+          )
+          Json.ok(
+            ok: true,
+            available: true,
+            topic: page[:topic],
+            group: page[:group],
+            partition: page[:partition],
+            start_offset: page[:start_offset],
+            commits: page[:commits],
+            messages: page[:messages].map { |m| serialize_browse_message(m) },
+            has_next: page[:has_next],
+            cursor: page[:cursor],
+            limit: page[:limit]
+          )
+        ensure
+          reader.close
+        end
+      rescue ArgumentError => e
+        Json.error(400, e.message)
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch::Web] browse_messages: #{e.message}")
+        Json.error(500, e.message)
+      end
+
+      def serialize_browse_topic(t)
+        {
+          group: t[:group],
+          topic: t[:topic],
+          partitions: t[:partitions],
+          lag: t[:lag],
+          partition_meta: Array(t[:partition_meta]).map do |p|
+            {
+              partition: p[:partition],
+              committed: p[:committed],
+              end_offset: p[:end_offset],
+              lag: p[:lag]
+            }
+          end
+        }
+      end
+
+      def serialize_browse_message(m)
+        ts = m[:timestamp]
+        ts_label =
+          if ts.nil?
+            nil
+          elsif ts.is_a?(Numeric)
+            @web.fmt_time(Time.at(ts.to_i))
+          else
+            @web.fmt_time(ts)
+          end
+        {
+          topic: m[:topic],
+          partition: m[:partition],
+          offset: m[:offset],
+          timestamp: ts,
+          timestamp_label: ts_label,
+          job_id: m[:job_id],
+          batch_id: m[:batch_id],
+          job_type: m[:job_type],
+          worker_class: m[:worker_class],
+          tenant_id: m[:tenant_id],
+          attempt: m[:attempt],
+          payload_preview: m[:payload_preview],
+          payload_bytes: m[:payload_bytes]
+        }
       end
 
       def lag_control(action, params, env)

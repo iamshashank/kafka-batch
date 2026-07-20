@@ -13,6 +13,7 @@ import { BatchDetailPage } from './pages/BatchDetailPage'
 import { FailuresPage } from './pages/FailuresPage'
 import { LivePage } from './pages/LivePage'
 import { LagPage } from './pages/LagPage'
+import { BrowsePage } from './pages/BrowsePage'
 import { FairnessPage } from './pages/FairnessPage'
 import { WeightsPage } from './pages/WeightsPage'
 import { ScheduledPage } from './pages/ScheduledPage'
@@ -63,6 +64,7 @@ function AppRoutes({
         <Route path="failures" element={<FailuresPage />} />
         <Route path="live" element={<LivePage />} />
         <Route path="lag" element={<LagPage />} />
+        <Route path="browse" element={<BrowsePage />} />
         <Route path="scheduled" element={<ScheduledPage />} />
         <Route path="recurring" element={<RecurringPage />} />
         <Route path="reconciler" element={<ReconcilerPage />} />

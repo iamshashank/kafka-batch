@@ -349,6 +349,64 @@ RSpec.describe KafkaBatch::Web do
     end
   end
 
+  describe "GET /api/browse/topics" do
+    it "returns unavailable when lag admin is missing" do
+      payload = json_body(get("/api/browse/topics"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["available"]).to eq(false)
+      expect(payload["topics"]).to eq([])
+    end
+
+    it "lists topics from the lag map" do
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      reader = instance_double(KafkaBatch::Browse::Reader, close: nil)
+      allow(KafkaBatch::Browse::Reader).to receive(:new).and_return(reader)
+      allow(reader).to receive(:list_topics).and_return(
+        [{
+          group: "cg", topic: "jobs", partitions: 2, lag: 5,
+          partition_meta: [
+            { partition: 0, committed: 10, end_offset: 12, lag: 2 },
+            { partition: 1, committed: 0, end_offset: 3, lag: 3 }
+          ]
+        }]
+      )
+      payload = json_body(get("/api/browse/topics"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["available"]).to eq(true)
+      expect(payload["topics"].size).to eq(1)
+      expect(payload["topics"][0]["topic"]).to eq("jobs")
+      expect(payload["topics"][0]["lag"]).to eq(5)
+    end
+  end
+
+  describe "GET /api/browse/messages" do
+    it "requires topic and group" do
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      status, = get("/api/browse/messages")
+      expect(status).to eq(400)
+    end
+
+    it "returns a page of broker messages" do
+      allow(KafkaBatch::Lag).to receive(:available?).and_return(true)
+      reader = instance_double(KafkaBatch::Browse::Reader, close: nil)
+      allow(KafkaBatch::Browse::Reader).to receive(:new).and_return(reader)
+      allow(reader).to receive(:fetch_page).and_return(
+        topic: "jobs", group: "cg", partition: 0, start_offset: nil,
+        commits: { "0" => 10 }, messages: [{
+          topic: "jobs", partition: 0, offset: 10, timestamp: 1_700_000_000,
+          job_id: "j1", batch_id: "b1", job_type: "W", worker_class: "W",
+          tenant_id: "t1", attempt: 1, payload_preview: "{}", payload_bytes: 2
+        }],
+        has_next: false, cursor: nil, limit: 50
+      )
+      payload = json_body(get("/api/browse/messages", query: "topic=jobs&group=cg&partition=0"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["messages"].size).to eq(1)
+      expect(payload["messages"][0]["job_id"]).to eq("j1")
+      expect(payload["has_next"]).to eq(false)
+    end
+  end
+
   describe "POST /api/retries/delete" do
     it "adds job ids to the cancel set" do
       KafkaBatch::RetryCancel.reset!
