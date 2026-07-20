@@ -627,6 +627,13 @@ Enqueue full → Dispatcher pauses ingest partition briefly; durable backlog sta
 
 Lease ZSETs are authoritative in-flight count (self-healing on TTL). Weighted cap ≈ `floor(budget * w_t / Σw)`. Work-conserving two-pass selection. Complete removes lease by slot id (idempotent).
 
+### Virtual-time (vtime) fairness & idle reset
+
+`vtime` is the durable per-tenant fairness ledger: checkout always picks the ready tenant with the smallest vtime. Two safeguards keep it fair over time:
+
+- **Min-vtime re-admission floor** (`ENQUEUE_LUA`): a tenant returning after being idle is re-admitted at `max(its stored vtime, current min ring vtime)`, so it enters at the active frontier and **cannot burst ahead** of tenants that stayed busy while it was gone.
+- **Idle vtime reset** (`fairness_reset_vtime_when_idle`, default **true**): once a lane is fully quiescent — empty `ring`, no live `leases`, empty `forwarding`, and zero ingest lag — held for `fairness_vtime_idle_reset_debounce` (default **15s**), the Forwarder clears the `vtime` hash (weights preserved) via `RESET_VTIME_IF_QUIESCENT_LUA`. This gives **fresh per-active-period fairness** (a busy period never carries vtime debt/credit into the next) and **bounds unbounded vtime growth**. The DEL is atomic under a ring-empty guard, so a tenant re-enqueuing mid-check is never wiped. It never fires mid-run (no fixed-interval reset). Go: `Scheduler.ResetVtimeIfQuiescent` on the forwarder loop; Ruby: `Scheduler#reset_vtime_if_quiescent!` from `Forwarder#maybe_reset_vtime_idle`.
+
 ### TenantPartitions
 
 | Mode | Behavior |
@@ -652,6 +659,8 @@ Keys: `kafka_batch:tenant_partitions:{lane}`, `:free`, `:partition_count`.
 Time lane requires `fairness_global_concurrency > 0` **or** `fairness_max_inflight_per_tenant > 0` (Ruby boot validate).
 
 Weights live in Redis per lane regardless of `config.store`. UI: `/weights/time`, `/weights/throughput`. Cache TTL `fairness_weight_cache_ttl` (60s).
+
+Idle vtime reset: `fairness_reset_vtime_when_idle` (default true, both runtimes; Ruby env `KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE`, Go YAML `fairness_reset_vtime_when_idle`) and `fairness_vtime_idle_reset_debounce` (default 15s).
 
 ---
 
@@ -1281,7 +1290,7 @@ See sections 10, 14, 20, 22, 21.
 
 ### Schedule / fairness / priority / reconciler / producer / audit / metrics / recurring
 
-See respective sections. Notable fairness defaults: `fairness_global_concurrency=50`, `fairness_ready_window=500`, `fairness_lease_ttl=1800`, `fairness_weighted_concurrency=true`, `fairness_dynamic_tenant_partitions=true`, `fairness_min_ingest_partitions=2`, `fairness_dispatcher_batch_size=50`, `fairness_dispatcher_concurrency=5`, `fairness_forwarder_idle_sleep=0.05`, `fairness_forwarding_recovery_grace=5.0`, `fairness_slot_dedup_ttl=0`, `fairness_active_count_ttl=5`, `fairness_active_count_source=:inflight_plus_ready`, `fairness_weight_cache_ttl=60`, `fairness_default_weight=1.0`, `fairness_max_inflight_per_tenant=0`.
+See respective sections. Notable fairness defaults: `fairness_global_concurrency=50`, `fairness_ready_window=500`, `fairness_lease_ttl=1800`, `fairness_weighted_concurrency=true`, `fairness_dynamic_tenant_partitions=true`, `fairness_min_ingest_partitions=2`, `fairness_dispatcher_batch_size=50`, `fairness_dispatcher_concurrency=5`, `fairness_forwarder_idle_sleep=0.05`, `fairness_forwarding_recovery_grace=5.0`, `fairness_slot_dedup_ttl=0`, `fairness_active_count_ttl=5`, `fairness_active_count_source=:inflight_plus_ready`, `fairness_weight_cache_ttl=60`, `fairness_default_weight=1.0`, `fairness_max_inflight_per_tenant=0`, `fairness_reset_vtime_when_idle=true`, `fairness_vtime_idle_reset_debounce=15`.
 
 ### Recurring cron (full table in §17)
 
@@ -1736,6 +1745,7 @@ Chunks preserve contiguous `batch_seq` while pipelining `produce_many_sync`.
 | Time checkout / `COMPLETE_LUA_TIME_LEASE` | Time lane: advance vtime at completion by duration/weight |
 | Tenant partition `CHECKOUT_LUA` | Exclusive partition assignment from free pool |
 | Forward confirm / reclaim paths | Clear forwarding HASH; recover stale forwards after grace |
+| `RESET_VTIME_IF_QUIESCENT_LUA` | Clear vtime hash (weights kept) iff ring empty + no live leases + empty forwarding |
 
 In-flight is **derived from lease ZSETs**, not a brittle counter — expired leases self-heal concurrency budget after crashes.
 

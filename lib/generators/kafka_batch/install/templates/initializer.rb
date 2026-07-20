@@ -115,6 +115,12 @@ KafkaBatch.configure do |config|
   # config.fairness_weighted_concurrency = false
   # config.fairness_weight_cache_ttl = 60   # secs before a weight change propagates across pods
 
+  # Once a lane goes fully idle (empty ring, no in-flight leases, no forwards, zero
+  # ingest lag) for the debounce window, the virtual-time ledger is cleared (weights
+  # kept) so each active period starts fair and vtime can't grow forever. On by default.
+  # config.fairness_reset_vtime_when_idle = false
+  # config.fairness_vtime_idle_reset_debounce = 15   # secs a lane must stay idle first
+
   # Dynamic exclusive ingest partitions are ON by default (one partition per tenant
   # until the ingest topic is full). Pin whales explicitly if you want fixed mapping:
   # config.fairness_tenant_partitions = { "acme" => 0, "globex" => 1 }

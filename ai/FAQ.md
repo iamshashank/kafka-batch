@@ -731,6 +731,12 @@ Active tenants ordered by virtual time (ascending = most deprived). Checkout pic
 ### What happens when an idle tenant returns?
 Re-admitted at max(its vtime, current min vtime) so it cannot hoard idle credit.
 
+### Does vtime reset, or grow forever?
+When a lane goes fully idle — empty ring, no live leases, empty forwarding buffer, and zero ingest lag — held for `fairness_vtime_idle_reset_debounce` (default 15s), the Forwarder clears the `vtime` hash (weights preserved). This gives fresh per-active-period fairness (a busy period never carries vtime debt/credit into the next) and bounds vtime growth. Controlled by `fairness_reset_vtime_when_idle` (default true; Ruby env `KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE`, Go YAML `fairness_reset_vtime_when_idle`).
+
+### Can the idle vtime reset disrupt a running lane or lose fairness state?
+No. The DEL runs atomically only when the ring is empty (`RESET_VTIME_IF_QUIESCENT_LUA` / `Scheduler#reset_vtime_if_quiescent!`), so a tenant re-enqueuing mid-check is never wiped. It fires at most once per idle period and never mid-run — there is no fixed-interval reset. Weights are untouched.
+
 ### What is work-conserving checkout?
 First pass respects fair caps; second pass fills slack so capacity is not wasted when some tenants are idle.
 
@@ -745,6 +751,9 @@ Raw ring membership flickers as tenants briefly drain; TTL floors volatility so 
 
 ### Forwarder idle sleep?
 `fairness_forwarder_idle_sleep` (default 0.05s) when checkout yields nothing.
+
+### Idle vtime reset debounce?
+`fairness_vtime_idle_reset_debounce` (default 15s) — how long a lane must stay fully quiescent before the vtime ledger is cleared. Prevents resets during transient empty-ring lulls; the Kafka ingest-lag check runs only at the moment of reset, not every idle tick.
 
 ### What is forwarding recovery grace?
 Seconds after forwarding lease expiry before reclaiming orphaned checkout (avoids racing a slow produce).

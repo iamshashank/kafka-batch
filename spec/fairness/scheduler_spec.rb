@@ -580,4 +580,38 @@ RSpec.describe KafkaBatch::Fairness::Scheduler do
       expect(scheduler.send(:weight_for, "unknown")).to eq(KafkaBatch.config.fairness_default_weight)
     end
   end
+
+  # ── Idle virtual-time reset (fresh fairness per active period) ──────────────
+  describe "#reset_vtime_if_quiescent!" do
+    let(:redis) { Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL) }
+
+    def build_vtime(tenant)
+      scheduler.enqueue(tenant, "job-#{tenant}")
+      job = scheduler.checkout
+      scheduler.confirm_forward(job[:slot_id])
+      scheduler.complete(tenant, slot_id: job[:slot_id])
+      job
+    end
+
+    it "clears the vtime ledger when the lane is fully idle and preserves weights" do
+      scheduler.set_weight("acme", 3.5)
+      build_vtime("acme")
+      expect(redis.hget(scheduler.vtime, "acme").to_f).to be > 0
+
+      expect(scheduler.reset_vtime_if_quiescent!).to be(true)
+      expect(redis.hget(scheduler.vtime, "acme")).to be_nil
+      expect(redis.hget(scheduler.weight, "acme").to_f).to eq(3.5)
+    end
+
+    it "does not reset while a tenant is in the ring (active backlog)" do
+      scheduler.enqueue("acme", "a0")  # tenant sits in the ring
+      expect(scheduler.reset_vtime_if_quiescent!).to be(false)
+    end
+
+    it "does not reset while a lease / forwarding entry is in flight" do
+      scheduler.enqueue("acme", "a0")
+      scheduler.checkout  # live lease + forwarding entry, not confirmed/completed
+      expect(scheduler.reset_vtime_if_quiescent!).to be(false)
+    end
+  end
 end

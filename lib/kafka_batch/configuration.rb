@@ -398,6 +398,21 @@ module KafkaBatch
     # full) before polling the scheduler again.
     attr_accessor :fairness_forwarder_idle_sleep    # Float – seconds; default 0.05
 
+    # When true (default), the Forwarder clears the lane's per-tenant virtual-time
+    # ledger (weights preserved) once the lane is fully quiescent — empty ring, no
+    # live leases, empty forwarding buffer, and zero ingest lag — for a sustained
+    # debounce window. This yields fresh per-active-period fairness (a busy period
+    # does not carry vtime debt/credit into the next) and bounds unbounded vtime
+    # growth, WITHOUT the mid-run disruption a fixed-interval reset would cause.
+    # The min-vtime re-admission floor already prevents idle tenants from bursting;
+    # this only governs cross-idle-period carryover. Disable with
+    # config.fairness_reset_vtime_when_idle = false.
+    attr_accessor :fairness_reset_vtime_when_idle   # Boolean – default true
+
+    # How long a lane must stay fully quiescent before the idle vtime reset fires,
+    # preventing resets during transient empty-ring lulls. Default 15s.
+    attr_accessor :fairness_vtime_idle_reset_debounce # Float – seconds; default 15.0
+
     # Explicit tenant → ingest-partition map. When a tenant_id is present, jobs
     # are produced directly to that partition (bypassing the hash partitioner).
     # Out-of-range values are ignored. Default {}.
@@ -651,6 +666,14 @@ module KafkaBatch
       @fairness_default_weight          = 1.0
       @fairness_weight_cache_ttl        = 60
       @fairness_forwarder_idle_sleep    = 0.05
+      # Default on; set KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE=false to disable.
+      @fairness_reset_vtime_when_idle   =
+        if ENV.key?("KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE")
+          truthy_env?("KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE")
+        else
+          true
+        end
+      @fairness_vtime_idle_reset_debounce = 15.0 # seconds a lane must stay idle before reset
       @fairness_tenant_partitions       = {}
       # Exclusive ingest partitions for hot tenants (static map still wins).
       # Default on; set KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS=false to disable.

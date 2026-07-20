@@ -458,6 +458,30 @@ module KafkaBatch
         return 1
       LUA
 
+      # Clear the per-tenant virtual-time hash (KEYS[2]) ONLY when the lane's Redis
+      # state proves there is no active or in-flight work:
+      #   * ring (KEYS[1]) has no tenants (no ready backlog),
+      #   * leases (KEYS[3]) has no live entry (score > now),
+      #   * forwarding buffer (KEYS[4]) is empty (no in-progress checkout→confirm).
+      # Weights (a separate hash) are intentionally preserved. Checking + deleting
+      # in one script closes the race where a tenant enqueues (and seeds its vtime)
+      # between a Ruby-side quiescence check and the DEL — if the ring is non-empty
+      # we skip. Returns 1 when vtime was reset, 0 otherwise.
+      #   KEYS[1]=ring KEYS[2]=vtime KEYS[3]=global leases KEYS[4]=forwarding
+      RESET_VTIME_IF_QUIESCENT_LUA = <<~LUA.freeze
+        local ring   = KEYS[1]
+        local vth    = KEYS[2]
+        local leases = KEYS[3]
+        local fwd    = KEYS[4]
+        local t      = redis.call('TIME')
+        local now    = tonumber(t[1]) + tonumber(t[2]) / 1000000.0
+        if redis.call('ZCARD', ring) > 0 then return 0 end
+        if redis.call('ZCOUNT', leases, '(' .. now, '+inf') > 0 then return 0 end
+        if redis.call('HLEN', fwd) > 0 then return 0 end
+        redis.call('DEL', vth)
+        return 1
+      LUA
+
       # @param type [Symbol] :time | :throughput — the fairness lane this
       #   scheduler instance drives. Determines the Redis namespace, the vtime
       #   accounting mode, and which tenant-weight set is used.
@@ -771,6 +795,35 @@ module KafkaBatch
       rescue StandardError => e
         KafkaBatch.logger.warn("[KafkaBatch][Scheduler] reclaim_expired_leases! failed: #{e.message}")
         0
+      end
+
+      # Clear the lane's per-tenant virtual-time ledger (weights preserved) iff the
+      # lane is fully quiescent on the Redis side: empty ring, no live leases, and an
+      # empty forwarding buffer. The check and delete run atomically in one script,
+      # so a tenant enqueuing mid-check cannot have its freshly-seeded vtime wiped.
+      #
+      # This gives "fresh fairness per active period" — once a lane drains fully, the
+      # next burst of work starts every tenant even, so a busy period does not carry
+      # virtual-time debt/credit into the next one. It also bounds unbounded vtime
+      # growth over long uptimes. Callers gate this on a debounce and (when a lag
+      # reader is available) zero ingest lag so it never fires during a transient lull.
+      # @return [Boolean] true when the reset was applied
+      def reset_vtime_if_quiescent!
+        with do |r|
+          r.eval(RESET_VTIME_IF_QUIESCENT_LUA,
+            keys: [@ring, @vtime, @leases, @forwarding]) == 1
+        end
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch][Scheduler] reset_vtime_if_quiescent! failed: #{e.message}")
+        false
+      end
+
+      # Whether this lane's ingest topic still has undispatched backlog (any
+      # partition with consumer-group lag > 0). Returns false when no lag reader is
+      # available, so callers fall back to Redis-only quiescence.
+      # @return [Boolean]
+      def ingest_pending?
+        ingest_active_count.positive?
       end
 
       # Set a per-tenant weight override for THIS lane.

@@ -102,6 +102,7 @@ module KafkaBatch
             forwarded += 1 while forwarded < burst && running? && forward_once
             maybe_reclaim_leases
             maybe_reclaim_stale_forwards
+            maybe_reset_vtime_idle
             sleep(idle) if forwarded.zero?
           rescue StandardError => e
             KafkaBatch.logger.error(
@@ -188,6 +189,82 @@ module KafkaBatch
         return unless sched
 
         sched.list_stale_forwards.each { |entry| reclaim_stale_forward!(sched, entry) }
+      end
+
+      # Interval (seconds) between idle-quiescence checks for the vtime reset.
+      IDLE_CHECK_INTERVAL = 5.0
+
+      # Clear the lane's virtual-time ledger (weights preserved) once the lane has
+      # been fully quiescent for the configured debounce window.
+      #
+      # "Quiescent" means no active or in-flight work anywhere: no active tenants
+      # (empty ring), nothing in flight (no live leases), no in-progress forwards,
+      # and — when a lag reader is available — zero ingest backlog. Because the ready
+      # ring is continuously fed from ingest, a ring that stays empty across the
+      # debounce already implies ingest has drained; the ingest-lag gate is an extra
+      # guard, evaluated only at the moment of reset (not every idle tick).
+      #
+      # The check re-arms on any observed activity and the final DEL is done
+      # atomically under a ring-empty guard in Scheduler#reset_vtime_if_quiescent!,
+      # so this can never wipe a tenant that just re-enqueued. It fires at most once
+      # per idle period.
+      def maybe_reset_vtime_idle
+        return unless KafkaBatch.config.fairness_reset_vtime_when_idle
+
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        @last_idle_check_at ||= 0.0
+        return unless (now - @last_idle_check_at) >= IDLE_CHECK_INTERVAL
+
+        @last_idle_check_at = now
+        sched = KafkaBatch.scheduler(@type)
+        return unless sched
+
+        # Cheap Redis snapshot only: any active/in-flight work re-arms the debounce
+        # for the next idle period (and clears the once-per-idle reset latch).
+        unless redis_idle?(sched)
+          @quiescent_since  = nil
+          @vtime_reset_done = false
+          return
+        end
+        # Already reset for this idle period — nothing to do until activity resumes.
+        return if @vtime_reset_done
+
+        if @quiescent_since.nil?
+          @quiescent_since = now
+          return
+        end
+        return if (now - @quiescent_since) < idle_reset_debounce
+
+        # Final gate, evaluated only at the moment of reset (not every idle tick): if
+        # the ingest topic still has backlog the lane is not truly idle — keep waiting.
+        if sched.ingest_pending?
+          @quiescent_since = nil
+          return
+        end
+
+        reset = sched.reset_vtime_if_quiescent!
+        @vtime_reset_done = true
+        if reset
+          KafkaBatch.logger.info(
+            "[KafkaBatch][Fairness::Forwarder] lane=#{@type} reset virtual-time ledger on idle (weights preserved)"
+          )
+        end
+      end
+
+      # Fast, read-only Redis snapshot: no active tenants, no live leases, no
+      # in-progress forwards. The authoritative atomic recheck happens inside
+      # Scheduler#reset_vtime_if_quiescent!.
+      def redis_idle?(sched)
+        s = sched.stats
+        s[:active_tenants].to_i.zero? && s[:inflight_total].to_i.zero? && s[:forwarding_depth].to_i.zero?
+      rescue StandardError => e
+        KafkaBatch.logger.warn("[KafkaBatch][Fairness::Forwarder] lane=#{@type} idle check failed: #{e.message}")
+        false
+      end
+
+      def idle_reset_debounce
+        v = KafkaBatch.config.fairness_vtime_idle_reset_debounce.to_f
+        v >= 1.0 ? v : 15.0
       end
 
       def reclaim_stale_forward!(sched, entry)

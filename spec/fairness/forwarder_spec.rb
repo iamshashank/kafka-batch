@@ -85,6 +85,72 @@ RSpec.describe KafkaBatch::Fairness::Forwarder do
     end
   end
 
+  describe "#maybe_reset_vtime_idle" do
+    subject(:forwarder) { described_class.new }
+
+    let(:idle_stats) { { active_tenants: 0, inflight_total: 0, forwarding_depth: 0 } }
+    let(:busy_stats) { { active_tenants: 1, inflight_total: 0, forwarding_depth: 0 } }
+
+    before do
+      KafkaBatch.config.fairness_reset_vtime_when_idle    = true
+      KafkaBatch.config.fairness_vtime_idle_reset_debounce = 15.0
+    end
+
+    it "resets vtime after the lane stays idle for the debounce window" do
+      t = 10.0
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { t }
+      allow(scheduler).to receive(:stats).and_return(idle_stats)
+      allow(scheduler).to receive(:ingest_pending?).and_return(false)
+      allow(scheduler).to receive(:reset_vtime_if_quiescent!).and_return(true)
+
+      forwarder.send(:maybe_reset_vtime_idle)  # arms the debounce
+      expect(scheduler).not_to have_received(:reset_vtime_if_quiescent!)
+
+      t = 30.0                                 # past both the 5s check interval and 15s debounce
+      forwarder.send(:maybe_reset_vtime_idle)
+      expect(scheduler).to have_received(:reset_vtime_if_quiescent!).once
+    end
+
+    it "does not reset while ingest still has backlog" do
+      t = 10.0
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { t }
+      allow(scheduler).to receive(:stats).and_return(idle_stats)
+      allow(scheduler).to receive(:ingest_pending?).and_return(true)
+      allow(scheduler).to receive(:reset_vtime_if_quiescent!)
+
+      forwarder.send(:maybe_reset_vtime_idle)
+      t = 30.0
+      forwarder.send(:maybe_reset_vtime_idle)
+      expect(scheduler).not_to have_received(:reset_vtime_if_quiescent!)
+    end
+
+    it "re-arms the debounce when activity reappears" do
+      t = 10.0
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { t }
+      allow(scheduler).to receive(:ingest_pending?).and_return(false)
+      allow(scheduler).to receive(:reset_vtime_if_quiescent!).and_return(true)
+
+      allow(scheduler).to receive(:stats).and_return(idle_stats)
+      forwarder.send(:maybe_reset_vtime_idle)  # arm at t=10
+
+      t = 16.0
+      allow(scheduler).to receive(:stats).and_return(busy_stats)  # activity → re-arm
+      forwarder.send(:maybe_reset_vtime_idle)
+
+      t = 40.0
+      allow(scheduler).to receive(:stats).and_return(idle_stats)  # arms again, debounce restarts
+      forwarder.send(:maybe_reset_vtime_idle)
+      expect(scheduler).not_to have_received(:reset_vtime_if_quiescent!)
+    end
+
+    it "does nothing when disabled" do
+      KafkaBatch.config.fairness_reset_vtime_when_idle = false
+      allow(scheduler).to receive(:stats)
+      forwarder.send(:maybe_reset_vtime_idle)
+      expect(scheduler).not_to have_received(:stats)
+    end
+  end
+
   describe "lifecycle" do
     it "ensure_running! is idempotent and running? reflects the thread state" do
       allow(scheduler).to receive(:checkout).and_return(nil)  # idle loop

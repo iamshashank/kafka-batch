@@ -1144,9 +1144,18 @@ config.fairness_global_concurrency      = 1000   # in-flight window per lane
 config.fairness_weighted_concurrency    = true   # default; false = equal cap per tenant
 config.fairness_lease_ttl               = 7200   # must exceed longest job
 config.fairness_min_ingest_partitions   = 300    # boot check (match ingest topic size)
+config.fairness_reset_vtime_when_idle   = true   # default; fresh fairness per active period
+config.fairness_vtime_idle_reset_debounce = 15   # secs a lane must stay idle before reset
 ```
 
 Tune live weights at `/kafka_batch/weights` (stored in Redis per fairness lane, regardless of `config.store`).
+
+### Virtual-time fairness over time
+
+Each tenant has a *virtual time* (vtime) — the fairness ledger; checkout always serves the ready tenant with the smallest vtime. Two safeguards keep it fair across idle/busy cycles:
+
+- **Returning-tenant floor:** a tenant coming back from idle is re-admitted at `max(its vtime, current minimum vtime)`, so it can never burst ahead of tenants that stayed busy.
+- **Idle vtime reset** (`fairness_reset_vtime_when_idle`, default on): once a lane goes fully quiescent — empty ring, no in-flight leases, no pending forwards, and zero ingest lag — for `fairness_vtime_idle_reset_debounce` seconds (default 15s), the vtime ledger is cleared (weights preserved). This gives **fresh fairness per active period** (a busy period never carries debt/credit into the next) and bounds vtime growth. The reset is atomic under a ring-empty guard, fires at most once per idle period, and never interrupts a running lane. Disable with `config.fairness_reset_vtime_when_idle = false` (or `KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE=false`). The Go daemon mirrors this via the `fairness_reset_vtime_when_idle` / `fairness_vtime_idle_reset_debounce` YAML keys.
 
 ### Tenant → ingest partition
 

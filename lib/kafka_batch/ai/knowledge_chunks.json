@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "built_at": "2026-07-18T08:59:21Z",
+  "built_at": "2026-07-20T12:26:52Z",
   "max_chars": 2800,
-  "readme_sha256": "f828a098d9f99b0761b5980e7d0be561f14bbafadcfa714b54edd72cba67f036",
-  "faq_sha256": "2a045381ed0e653091e6678681706dba77b784b9e6013487b0b3eac69f4f4104",
-  "chunk_count": 426,
+  "readme_sha256": "52e4416f3c7673fcdba92c8e2cd7ac2670d59fd3df3a3bad45c572ebf6b199ca",
+  "faq_sha256": "10d222b41263af36c3dbebd06f4fc656f5b7fecb71d72b9b6581baf8c65fed9d",
+  "chunk_count": 430,
   "chunks": [
     {
       "id": "readme-introduction-939750e33df47b89",
@@ -707,6 +707,18 @@
       "char_count": 273
     },
     {
+      "id": "readme-13-fairness-dispatcher-scheduler-forwarder-tenan-214dca74890baf04",
+      "source": "readme",
+      "title": "Virtual-time (vtime) fairness & idle reset",
+      "heading_path": [
+        "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions",
+        "Virtual-time (vtime) fairness & idle reset"
+      ],
+      "section": "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions",
+      "text": "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions › Virtual-time (vtime) fairness & idle reset\n\n`vtime` is the durable per-tenant fairness ledger: checkout always picks the ready tenant with the smallest vtime. Two safeguards keep it fair over time:\n\n- **Min-vtime re-admission floor** (`ENQUEUE_LUA`): a tenant returning after being idle is re-admitted at `max(its stored vtime, current min ring vtime)`, so it enters at the active frontier and **cannot burst ahead** of tenants that stayed busy while it was gone.\n- **Idle vtime reset** (`fairness_reset_vtime_when_idle`, default **true**): once a lane is fully quiescent — empty `ring`, no live `leases`, empty `forwarding`, and zero ingest lag — held for `fairness_vtime_idle_reset_debounce` (default **15s**), the Forwarder clears the `vtime` hash (weights preserved) via `RESET_VTIME_IF_QUIESCENT_LUA`. This gives **fresh per-active-period fairness** (a busy period never carries vtime debt/credit into the next) and **bounds unbounded vtime growth**. The DEL is atomic under a ring-empty guard, so a tenant re-enqueuing mid-check is never wiped. It never fires mid-run (no fixed-interval reset). Go: `Scheduler.ResetVtimeIfQuiescent` on the forwarder loop; Ruby: `Scheduler#reset_vtime_if_quiescent!` from `Forwarder#maybe_reset_vtime_idle`.",
+      "char_count": 1314
+    },
+    {
       "id": "readme-13-fairness-dispatcher-scheduler-forwarder-tenan-56476db6342dc1aa",
       "source": "readme",
       "title": "TenantPartitions",
@@ -727,8 +739,8 @@
         "Critical settings"
       ],
       "section": "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions",
-      "text": "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions › Critical settings\n\n| Setting | Ruby default | Go default | Notes |\n|---------|--------------|------------|-------|\n| `fairness_global_concurrency` | 50 | 50 | Install template often 1000 |\n| `fairness_ready_window` | **500** | **100** | ⚠️ set Go to 500 for parity |\n| `fairness_lease_ttl` | 1800 | 1800 | Install often 7200 |\n| `fairness_weighted_concurrency` | true | true | |\n| `fairness_dynamic_tenant_partitions` | true | true | |\n| `fairness_min_ingest_partitions` | 2 | (internal) | README/ops often target 300 |\n| `fairness_enabled` (Go only) | — | false | Must enable on Go daemon |\n\nTime lane requires `fairness_global_concurrency > 0` **or** `fairness_max_inflight_per_tenant > 0` (Ruby boot validate).\n\nWeights live in Redis per lane regardless of `config.store`. UI: `/weights/time`, `/weights/throughput`. Cache TTL `fairness_weight_cache_ttl` (60s).\n\n---",
-      "char_count": 937
+      "text": "13. Fairness — Dispatcher, Scheduler, Forwarder, TenantPartitions › Critical settings\n\n| Setting | Ruby default | Go default | Notes |\n|---------|--------------|------------|-------|\n| `fairness_global_concurrency` | 50 | 50 | Install template often 1000 |\n| `fairness_ready_window` | **500** | **100** | ⚠️ set Go to 500 for parity |\n| `fairness_lease_ttl` | 1800 | 1800 | Install often 7200 |\n| `fairness_weighted_concurrency` | true | true | |\n| `fairness_dynamic_tenant_partitions` | true | true | |\n| `fairness_min_ingest_partitions` | 2 | (internal) | README/ops often target 300 |\n| `fairness_enabled` (Go only) | — | false | Must enable on Go daemon |\n\nTime lane requires `fairness_global_concurrency > 0` **or** `fairness_max_inflight_per_tenant > 0` (Ruby boot validate).\n\nWeights live in Redis per lane regardless of `config.store`. UI: `/weights/time`, `/weights/throughput`. Cache TTL `fairness_weight_cache_ttl` (60s).\n\nIdle vtime reset: `fairness_reset_vtime_when_idle` (default true, both runtimes; Ruby env `KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE`, Go YAML `fairness_reset_vtime_when_idle`) and `fairness_vtime_idle_reset_debounce` (default 15s).\n\n---",
+      "char_count": 1172
     },
     {
       "id": "readme-14-uniqueness-eb7f360f3b98a479",
@@ -1397,8 +1409,8 @@
         "Schedule / fairness / priority / reconciler / producer / audit / metrics / recurring"
       ],
       "section": "31. Ruby configuration reference",
-      "text": "31. Ruby configuration reference › Schedule / fairness / priority / reconciler / producer / audit / metrics / recurring\n\nSee respective sections. Notable fairness defaults: `fairness_global_concurrency=50`, `fairness_ready_window=500`, `fairness_lease_ttl=1800`, `fairness_weighted_concurrency=true`, `fairness_dynamic_tenant_partitions=true`, `fairness_min_ingest_partitions=2`, `fairness_dispatcher_batch_size=50`, `fairness_dispatcher_concurrency=5`, `fairness_forwarder_idle_sleep=0.05`, `fairness_forwarding_recovery_grace=5.0`, `fairness_slot_dedup_ttl=0`, `fairness_active_count_ttl=5`, `fairness_active_count_source=:inflight_plus_ready`, `fairness_weight_cache_ttl=60`, `fairness_default_weight=1.0`, `fairness_max_inflight_per_tenant=0`.",
-      "char_count": 747
+      "text": "31. Ruby configuration reference › Schedule / fairness / priority / reconciler / producer / audit / metrics / recurring\n\nSee respective sections. Notable fairness defaults: `fairness_global_concurrency=50`, `fairness_ready_window=500`, `fairness_lease_ttl=1800`, `fairness_weighted_concurrency=true`, `fairness_dynamic_tenant_partitions=true`, `fairness_min_ingest_partitions=2`, `fairness_dispatcher_batch_size=50`, `fairness_dispatcher_concurrency=5`, `fairness_forwarder_idle_sleep=0.05`, `fairness_forwarding_recovery_grace=5.0`, `fairness_slot_dedup_ttl=0`, `fairness_active_count_ttl=5`, `fairness_active_count_source=:inflight_plus_ready`, `fairness_weight_cache_ttl=60`, `fairness_default_weight=1.0`, `fairness_max_inflight_per_tenant=0`, `fairness_reset_vtime_when_idle=true`, `fairness_vtime_idle_reset_debounce=15`.",
+      "char_count": 827
     },
     {
       "id": "readme-31-ruby-configuration-reference-recurring-cron-f-e344360f0fba7b66",
@@ -1760,8 +1772,8 @@
         "41. Fairness Lua responsibilities (summary)"
       ],
       "section": "41. Fairness Lua responsibilities (summary)",
-      "text": "41. Fairness Lua responsibilities (summary)\n\n| Script | Role |\n|--------|------|\n| `ENQUEUE_LUA` | Bound window; admit tenant to ring; RPUSH ready list |\n| `CHECKOUT_LUA_COUNT` | Throughput lane: advance vtime at dispatch; lease slots |\n| Time checkout / `COMPLETE_LUA_TIME_LEASE` | Time lane: advance vtime at completion by duration/weight |\n| Tenant partition `CHECKOUT_LUA` | Exclusive partition assignment from free pool |\n| Forward confirm / reclaim paths | Clear forwarding HASH; recover stale forwards after grace |\n\nIn-flight is **derived from lease ZSETs**, not a brittle counter — expired leases self-heal concurrency budget after crashes.\n\n---",
-      "char_count": 654
+      "text": "41. Fairness Lua responsibilities (summary)\n\n| Script | Role |\n|--------|------|\n| `ENQUEUE_LUA` | Bound window; admit tenant to ring; RPUSH ready list |\n| `CHECKOUT_LUA_COUNT` | Throughput lane: advance vtime at dispatch; lease slots |\n| Time checkout / `COMPLETE_LUA_TIME_LEASE` | Time lane: advance vtime at completion by duration/weight |\n| Tenant partition `CHECKOUT_LUA` | Exclusive partition assignment from free pool |\n| Forward confirm / reclaim paths | Clear forwarding HASH; recover stale forwards after grace |\n| `RESET_VTIME_IF_QUIESCENT_LUA` | Clear vtime hash (weights kept) iff ring empty + no live leases + empty forwarding |\n\nIn-flight is **derived from lease ZSETs**, not a brittle counter — expired leases self-heal concurrency budget after crashes.\n\n---",
+      "char_count": 774
     },
     {
       "id": "readme-42-consumptiongate-and-prioritygate-interaction-6d9a8c7ad4d5d20c",
@@ -4100,6 +4112,30 @@
       "char_count": 128
     },
     {
+      "id": "faq-ad-fairness-deep-dive-does-vtime-reset-or-grow-f-927843394ce40479",
+      "source": "faq",
+      "title": "Does vtime reset, or grow forever?",
+      "heading_path": [
+        "AD. Fairness deep dive",
+        "Does vtime reset, or grow forever?"
+      ],
+      "section": "AD. Fairness deep dive",
+      "text": "FAQ: Does vtime reset, or grow forever?\n\nWhen a lane goes fully idle — empty ring, no live leases, empty forwarding buffer, and zero ingest lag — held for `fairness_vtime_idle_reset_debounce` (default 15s), the Forwarder clears the `vtime` hash (weights preserved). This gives fresh per-active-period fairness (a busy period never carries vtime debt/credit into the next) and bounds vtime growth. Controlled by `fairness_reset_vtime_when_idle` (default true; Ruby env `KAFKA_BATCH_FAIRNESS_RESET_VTIME_WHEN_IDLE`, Go YAML `fairness_reset_vtime_when_idle`).",
+      "char_count": 556
+    },
+    {
+      "id": "faq-ad-fairness-deep-dive-can-the-idle-vtime-reset-d-d8d7172d0b070c23",
+      "source": "faq",
+      "title": "Can the idle vtime reset disrupt a running lane or lose fairness state?",
+      "heading_path": [
+        "AD. Fairness deep dive",
+        "Can the idle vtime reset disrupt a running lane or lose fairness state?"
+      ],
+      "section": "AD. Fairness deep dive",
+      "text": "FAQ: Can the idle vtime reset disrupt a running lane or lose fairness state?\n\nNo. The DEL runs atomically only when the ring is empty (`RESET_VTIME_IF_QUIESCENT_LUA` / `Scheduler#reset_vtime_if_quiescent!`), so a tenant re-enqueuing mid-check is never wiped. It fires at most once per idle period and never mid-run — there is no fixed-interval reset. Weights are untouched.",
+      "char_count": 373
+    },
+    {
       "id": "faq-ad-fairness-deep-dive-what-is-work-conserving-ch-f1084256dfeaab1c",
       "source": "faq",
       "title": "What is work-conserving checkout?",
@@ -4158,6 +4194,18 @@
       "section": "AD. Fairness deep dive",
       "text": "FAQ: Forwarder idle sleep?\n\n`fairness_forwarder_idle_sleep` (default 0.05s) when checkout yields nothing.",
       "char_count": 105
+    },
+    {
+      "id": "faq-ad-fairness-deep-dive-idle-vtime-reset-debounce-888de764bbfc0282",
+      "source": "faq",
+      "title": "Idle vtime reset debounce?",
+      "heading_path": [
+        "AD. Fairness deep dive",
+        "Idle vtime reset debounce?"
+      ],
+      "section": "AD. Fairness deep dive",
+      "text": "FAQ: Idle vtime reset debounce?\n\n`fairness_vtime_idle_reset_debounce` (default 15s) — how long a lane must stay fully quiescent before the vtime ledger is cleared. Prevents resets during transient empty-ring lulls; the Kafka ingest-lag check runs only at the moment of reset, not every idle tick.",
+      "char_count": 296
     },
     {
       "id": "faq-ad-fairness-deep-dive-what-is-forwarding-recover-f4978da099edd1fa",
@@ -5084,5 +5132,5 @@
       "char_count": 58
     }
   ],
-  "corpus_version": "b4eb4c9211212020304597105dcd30b6"
+  "corpus_version": "3956b106a33c6b9ff69f9a5976431704"
 }
