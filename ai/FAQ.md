@@ -990,13 +990,92 @@ Uniq fingerprint parity, partition murmur2 parity, Ruby client → Go poller →
 
 ---
 
+## AS. Health alerts
+
+### What are health alerts?
+An opt-in in-gem evaluator (`KafkaBatch::Alerts`) that samples lag, Redis RTT, liveness, reconciler, fairness ingest, DLT rate, schedule depth, and stale cron; applies hysteresis in Redis; notifies Slack / webhook / email / metrics. Dashboard: `/alerts`.
+
+### Are alerts on by default?
+**No.** `alerts_enabled` defaults false. Enable on `/alerts` (Save) or via `config.alerts_enabled` / `KAFKA_BATCH_ALERTS_ENABLED=true`.
+
+### Where do settings live?
+**Redis** HASH `kafka_batch:alerts:settings` (v1 — not MySQL). Version stamp `kafka_batch:alerts:settings:version` hot-reloads the evaluator. Merge order: library defaults ← env ← Redis (wins).
+
+### How do I enable alerts step by step?
+1. Ensure Redis is configured. 2. Set `ai_encryption_salt` if using Slack/webhook/email secrets. 3. Open `/alerts`, turn **Alerts enabled** on, Save. 4. Configure a channel + Send test. 5. Run Karafka control/execution (evaluator does not run on UI-only pods unless `alerts_run_on_ui`).
+
+### Why does the UI say Alerts are disabled?
+Master switch is off (or Redis unavailable). Toggle **Alerts enabled** and Save. Optional bootstrap: `KAFKA_BATCH_ALERTS_ENABLED=true` before first UI save.
+
+### Why can’t I save Slack/webhook secrets?
+Need `config.ai_encryption_salt` (same as AI Settings). Thresholds/toggles still save without it.
+
+### Which process runs the evaluator?
+**Control plane only:** Ruby Karafka with `-control` / `-dispatch-*` groups, or Go `kbatch daemon`. Not execution-only Karafka jobs pods, not `kbatch worker`, not UI (unless `alerts_run_on_ui`). Ruby and Go share Redis NX lock + open/notify dedupe — Slack fires once.
+
+### What is hysteresis (for_ticks / resolve_ticks / cooldown)?
+`for_ticks` (default 3): consecutive breach ticks before fire. `resolve_ticks` (2): consecutive healthy before resolve. `cooldown_seconds` (900): min gap between re-notifies for the same fingerprint. `interval` (60): tick period.
+
+### What is lag_stuck_growing?
+Lag ≥ `lag_threshold`, committed offsets stuck across ticks, and lag grew by ≥ `lag_growth_min` (or end offset advanced). Skips paused partitions. Link `/lag`. Defaults: threshold 1000, growth 100. Severity critical.
+
+### What is redis_rtt_high?
+PerformanceMetrics Redis RTT avg/max/error_rate above `rtt_avg_ms` / `rtt_max_ms` / `rtt_error_rate`. Requires `performance_metrics_enabled`. Link `/performance`.
+
+### What is no_live_consumers?
+Kafka pending work > 0 but live consumer heartbeats = 0. Requires liveness Redis backend. Link `/live`.
+
+### What is reconciler_stale?
+No reconciler summary, last run older than `reconciler_max_age` (900s), or produce_failed / many found_stale. Link `/reconciler`.
+
+### What is fairness_ingest_backed_up?
+Per lane: ingest_lag ≥ `fairness_ingest_lag` (5000) and ready_lag ≤ `fairness_ready_max_when_stuck` (10) — forwarder/checkout likely stuck. Link `/fairness/{lane}`.
+
+### What is dlt_rate_high?
+Dead-letter publishes in the last minute ≥ `dlt_per_minute` (50). Link `/dead_letter`.
+
+### What is schedule_depth_high?
+`sched:pending` ZCARD ≥ `schedule_pending_max` (10000). Often poller off/undersized. Link `/scheduled`.
+
+### What is Recurring schedule stale (cron_stale)?
+Enabled cron idle longer than `recurring_stale_factor` × its interval (default factor 2). Requires `recurring_scheduler_enabled`. Link `/recurring`. Check ticker pods and MySQL ledger.
+
+### How do I configure Slack?
+Set salt → `/alerts` → Slack → paste Incoming Webhook URL → enable → Save → Send test. URL stored encrypted; API shows masked preview.
+
+### How do I configure a generic webhook (NR / PagerDuty)?
+Same as Slack but Webhook channel; one or more HTTPS URLs (comma/newline). JSON payload includes rule_id, title, summary, severity, fingerprint, link, fired_at.
+
+### How do I configure email?
+Set salt, email_to, SMTP host/port/user/password, enable Email channel, Save, Send test. Ruby 3.4+ may need the `net-smtp` gem.
+
+### How do metrics alerts work?
+Enable `config.metrics_enabled` and the Metrics channel. Emits `alert.fired` / `alert.resolved` through your StatsD/Datadog/proc adapter.
+
+### How do I silence one noisy rule?
+On `/alerts` turn that rule’s switch off and Save (global disable). Per-user mutes are out of scope for v1.
+
+### How do I reduce alert noise without disabling?
+Raise the rule’s threshold, increase `for_ticks`, increase `cooldown_seconds`, or lower severity to warning.
+
+### What API endpoints exist?
+`GET /api/alerts`, `GET/PUT /api/alerts/settings`, `POST /api/alerts/test` `{channel}`, `DELETE /api/alerts/settings/secrets`. CSRF required on mutations.
+
+### Can the assistant mutate alert Redis keys?
+**No.** Explain UI/config steps only. Do not suggest KEYS/DEL on `kafka_batch:alerts:*`.
+
+### Example: enable Slack + lag alert for production
+1. `ai_encryption_salt` set. 2. `/alerts` enable alerts, lag_threshold=5000, lag_growth_min=500, for_ticks=3. 3. Slack webhook + enable. 4. Save + test. 5. Confirm Karafka control is running so evaluator ticks.
+
+---
+
 ## AP. Assistant corpus hygiene
 
 ### Should the assistant cite live lag numbers?
-No — it has no cluster access. Tell operators which UI page to open.
+No — it has no cluster access. Tell operators which UI page to open. For alert configuration, point to `/alerts` and FAQ **AS**.
 
 ### Should the assistant invent Redis KEYS commands?
-No — and never suggest mutating operational keys via the assistant path.
+No — and never suggest mutating operational keys via the assistant path (including `kafka_batch:alerts:*`).
 
 ### How to extend the corpus?
 Edit `ai/README.md` + `ai/FAQ.md`, then rebuild chunks/embeddings.
@@ -1023,6 +1102,9 @@ Edit `ai/README.md` + `ai/FAQ.md`, then rebuild chunks/embeddings.
 | Seal | Open batch completion gate |
 | Daemon mode | Ruby API without Karafka consumers |
 | Members | Go in-process Kafka group members |
+| Health alerts | Opt-in Redis-backed evaluator + `/alerts` UI (§46 / FAQ AS) |
+| `for_ticks` | Consecutive breach ticks before an alert fires |
+| `cron_stale` | Enabled recurring schedule idle beyond stale_factor × interval |
 
 ---
 
@@ -1042,3 +1124,6 @@ Edit `ai/README.md` + `ai/FAQ.md`, then rebuild chunks/embeddings.
 ### Go fairness daemon switch? `fairness_enabled`.
 ### Ledger in MySQL when store mysql? No — still Redis.
 ### Assistant can fix my lag? No — docs only; use UI/ops.
+### Health alerts default? Off — enable on `/alerts` or `KAFKA_BATCH_ALERTS_ENABLED`.
+### Alert settings store? Redis (encrypted secrets via `ai_encryption_salt`).
+### Recurring schedule stale? Cron idle > stale_factor × interval — see `/recurring`.

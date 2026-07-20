@@ -2,8 +2,8 @@
 
 Editable docs live at the gem repo root under `ai/`:
 
-- `ai/README.md` — deep architecture / config / atomicity reference
-- `ai/FAQ.md` — curated Q&A
+- `ai/README.md` — deep architecture / config / atomicity reference (includes §46 Health alerts)
+- `ai/FAQ.md` — curated Q&A (includes section **AS. Health alerts** for `/alerts` configuration)
 
 Boot-time pods **do not** parse those markdown files. They load the packaged
 artifact `knowledge_chunks.json` (next to this README) into Redis.

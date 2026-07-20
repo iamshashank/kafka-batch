@@ -100,6 +100,7 @@ RSpec.describe KafkaBatch::Web do
       expect(payload).to have_key("ai_enabled")
       expect(payload).to have_key("ai_live_data_enabled")
       expect(payload).to have_key("ai_suggested_prompts")
+      expect(payload).to have_key("alerts_ui_enabled")
       expect(payload["version"]).to eq(KafkaBatch::VERSION)
     end
 
@@ -458,6 +459,38 @@ RSpec.describe KafkaBatch::Web do
 
       payload = json_body(get("/api/performance", query: "job_types=Beta"))
       expect(payload["job_types"].map { |r| r["job_type"] }).to eq(["Beta"])
+    end
+  end
+
+  describe "Alerts API" do
+    it "returns settings, channels, and rules" do
+      skip "Redis unavailable" unless KafkaBatchSpec::RedisHelper.available?
+      KafkaBatch.config.redis_url = KafkaBatchSpec::RedisHelper::TEST_URL
+      KafkaBatch.config.ai_encryption_salt = "web-alerts-salt"
+      KafkaBatch::Alerts::Settings.reset_pool!
+      KafkaBatchSpec::RedisHelper.flush!
+
+      payload = json_body(get("/api/alerts/settings"))
+      expect(payload["ok"]).to eq(true)
+      expect(payload["settings"]).to include("enabled", "lag_threshold")
+      expect(payload["channels"].map { |c| c["id"] }).to include("slack", "webhook", "email", "metrics")
+      expect(payload["rules"]).not_to be_empty
+
+      updated = json_body(put("/api/alerts/settings", json: {
+        enabled: true,
+        lag_threshold: 1234,
+        channel_slack: true,
+        slack_webhook_url: "https://hooks.example/test"
+      }))
+      expect(updated["settings"]["lag_threshold"]).to eq(1234)
+      expect(updated["settings"]["secrets"]["slack_webhook_url"]["set"]).to eq(true)
+
+      status = json_body(get("/api/alerts"))
+      expect(status["ok"]).to eq(true)
+      expect(status).to have_key("open")
+    ensure
+      KafkaBatch::Alerts.reset! if defined?(KafkaBatch::Alerts)
+      KafkaBatch.config.ai_encryption_salt = ""
     end
   end
 

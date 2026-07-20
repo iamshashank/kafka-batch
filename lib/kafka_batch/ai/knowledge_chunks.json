@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "built_at": "2026-07-20T14:16:49Z",
+  "built_at": "2026-07-20T15:25:42Z",
   "max_chars": 2800,
-  "readme_sha256": "a739a72c50568d1f39a9bbdf5a81592c85c98919ac52437ad52e78544c03b21a",
-  "faq_sha256": "5ea9e16c293981279dbbda1c177b1ef5aa5a6aaeda79313987fdbad3c392eb5d",
-  "chunk_count": 433,
+  "readme_sha256": "13eb2988364594c60263954e9d4fd0a1f50c48532cb630f13b2f9ab3a9de5eb7",
+  "faq_sha256": "ebb301c6c968b1ee3651e6d0dc6cd5fc6da9c145833581625765b808d26b8f53",
+  "chunk_count": 472,
   "chunks": [
     {
       "id": "readme-introduction-939750e33df47b89",
@@ -1268,8 +1268,8 @@
         "Pages"
       ],
       "section": "28. Web UI and JSON API",
-      "text": "28. Web UI and JSON API › Pages\n\n`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/recurring`, `/reconciler`, `/system`, `/audit`, `/performance`, `/ai`\n\nLive refresh: localStorage `kafka_batch_live`, 5s.",
-      "char_count": 266
+      "text": "28. Web UI and JSON API › Pages\n\n`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/recurring`, `/reconciler`, `/alerts`, `/system`, `/audit`, `/performance`, `/ai`\n\nLive refresh: localStorage `kafka_batch_live`, 5s.",
+      "char_count": 277
     },
     {
       "id": "readme-28-web-ui-and-json-api-dashboard-metrics-get-api-ff5a43114a87cd24",
@@ -1308,6 +1308,18 @@
       "char_count": 283
     },
     {
+      "id": "readme-28-web-ui-and-json-api-health-alerts-page-5ad90500ff383b48",
+      "source": "readme",
+      "title": "Health alerts page",
+      "heading_path": [
+        "28. Web UI and JSON API",
+        "Health alerts page"
+      ],
+      "section": "28. Web UI and JSON API",
+      "text": "28. Web UI and JSON API › Health alerts page\n\n`/alerts` — open incidents + Redis-backed settings (channels, rules, thresholds). Full reference: **§46**. Settings mutations: `GET/PUT /api/alerts/settings`, `POST /api/alerts/test`, `GET /api/alerts`. Secrets reuse `ai_encryption_salt`.",
+      "char_count": 284
+    },
+    {
       "id": "readme-28-web-ui-and-json-api-mutating-api-csrf-cookie-525fde72906284bb",
       "source": "readme",
       "title": "Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)",
@@ -1316,8 +1328,8 @@
         "Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)"
       ],
       "section": "28. Web UI and JSON API",
-      "text": "28. Web UI and JSON API › Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)\n\nBatch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; recurring upsert/pause/resume/delete/run-now (§17); AI settings/chat/history.\n\nOptional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.\n\n---",
-      "char_count": 351
+      "text": "28. Web UI and JSON API › Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)\n\nBatch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; recurring upsert/pause/resume/delete/run-now (§17); AI settings/chat/history; alerts settings/test (§46).\n\nOptional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.\n\n---",
+      "char_count": 379
     },
     {
       "id": "readme-29-redis-key-namespace-catalog-f8bb9428393d3b52",
@@ -1327,8 +1339,8 @@
         "29. Redis key namespace catalog"
       ],
       "section": "29. Redis key namespace catalog",
-      "text": "29. Redis key namespace catalog\n\n| Prefix / pattern | Subsystem |\n|------------------|-----------|\n| `kafka_batch:b:{id}` | Batch hash |\n| `kafka_batch:b:seq:{id}` | batch_seq allocator |\n| `kafka_batch:b:bitmap:{id}` | Touch bitmap |\n| `kafka_batch:b:okbit:{id}` | Success bitmap |\n| `kafka_batch:b:failbit:{id}` | Fail bitmap |\n| `kafka_batch:b:reconciler_lock` | Reconciler lock |\n| `kafka_batch:index:running` | Running ZSET |\n| `kafka_batch:index:done` | Done / callback-pending ZSET |\n| `kafka_batch:index:all` | UI listing ZSET |\n| `kafka_batch:index:cancelled` | Cancelled ZSET |\n| `kafka_batch:counts` | Status counters HASH |\n| `kafka_batch:uniq:{digest}` | Uniqueness locks |\n| `kafka_batch:sched:pending` | Schedule index |\n| `kafka_batch:sched:inflight` | Schedule leases |\n| `kafka_batch:sched:read_miss` | Schedule read failures |\n| `kafka_batch:cron:leader_lock` | Recurring ticker leader lease (§17) |\n| `kafka_batch:fair_time:*` / `fair_throughput:*` | WFQ per lane |\n| `kafka_batch:tenant_partitions:{lane}` (+ `:free`, `:partition_count`) | Dynamic partitions |\n| `kafka_batch:work:job:*` | SuperFetch workset |\n| `kafka_batch:work:by_consumer:*` | Workset by consumer |\n| `kafka_batch:work:index` | Workset ZSET |\n| `kafka_batch:work:reclaiming:*` | Reclaim state |\n| `kafka_batch:work:produced:*` | Re-produce dedup |\n| `kafka_batch:live:job:*` / `live:consumer:*` | Liveness |\n| `kafka_batch:consumption:topics` / `partitions` | Pause state |\n| `kafka_batch:retry:cancel` / `retry:skip` | Retry UI cancel |\n| `kafka_batch:reconciler:last` / `last_skip` | Sweep summary |\n| `kafka_batch:perf:min:*` | Performance metrics |\n| `kafka_batch:dlt:stats` | DLT stats |\n\nAssistant must not touch these operational keys.\n\n---",
-      "char_count": 1739
+      "text": "29. Redis key namespace catalog\n\n| Prefix / pattern | Subsystem |\n|------------------|-----------|\n| `kafka_batch:b:{id}` | Batch hash |\n| `kafka_batch:b:seq:{id}` | batch_seq allocator |\n| `kafka_batch:b:bitmap:{id}` | Touch bitmap |\n| `kafka_batch:b:okbit:{id}` | Success bitmap |\n| `kafka_batch:b:failbit:{id}` | Fail bitmap |\n| `kafka_batch:b:reconciler_lock` | Reconciler lock |\n| `kafka_batch:index:running` | Running ZSET |\n| `kafka_batch:index:done` | Done / callback-pending ZSET |\n| `kafka_batch:index:all` | UI listing ZSET |\n| `kafka_batch:index:cancelled` | Cancelled ZSET |\n| `kafka_batch:counts` | Status counters HASH |\n| `kafka_batch:uniq:{digest}` | Uniqueness locks |\n| `kafka_batch:sched:pending` | Schedule index |\n| `kafka_batch:sched:inflight` | Schedule leases |\n| `kafka_batch:sched:read_miss` | Schedule read failures |\n| `kafka_batch:cron:leader_lock` | Recurring ticker leader lease (§17) |\n| `kafka_batch:fair_time:*` / `fair_throughput:*` | WFQ per lane |\n| `kafka_batch:tenant_partitions:{lane}` (+ `:free`, `:partition_count`) | Dynamic partitions |\n| `kafka_batch:work:job:*` | SuperFetch workset |\n| `kafka_batch:work:by_consumer:*` | Workset by consumer |\n| `kafka_batch:work:index` | Workset ZSET |\n| `kafka_batch:work:reclaiming:*` | Reclaim state |\n| `kafka_batch:work:produced:*` | Re-produce dedup |\n| `kafka_batch:live:job:*` / `live:consumer:*` | Liveness |\n| `kafka_batch:consumption:topics` / `partitions` | Pause state |\n| `kafka_batch:retry:cancel` / `retry:skip` | Retry UI cancel |\n| `kafka_batch:reconciler:last` / `last_skip` | Sweep summary |\n| `kafka_batch:perf:min:*` | Performance metrics |\n| `kafka_batch:dlt:stats` | DLT stats |\n| `kafka_batch:alerts:settings` (+ `:version`) | Alert settings HASH + hot-reload stamp (§46) |\n| `kafka_batch:alerts:lock` / `open` / `breach` / `last` | Evaluator lock + incident state (§46) |\n| `kafka_batch:alerts:cron_stale` | Recent cron.stale markers for alert rule |\n\nAssistant must not touch these operational keys (except documenting them). Alert channel secrets live encrypted inside `alerts:settings`, same salt as AI.\n\n---",
+      "char_count": 2119
     },
     {
       "id": "readme-30-kafka-topic-catalog-3ba4b1769502c34d",
@@ -1425,6 +1437,18 @@
       "char_count": 698
     },
     {
+      "id": "readme-31-ruby-configuration-reference-health-alerts-de-e31ef557fda33e4a",
+      "source": "readme",
+      "title": "Health alerts (defaults; Redis UI wins after save — full §46)",
+      "heading_path": [
+        "31. Ruby configuration reference",
+        "Health alerts (defaults; Redis UI wins after save — full §46)"
+      ],
+      "section": "31. Ruby configuration reference",
+      "text": "31. Ruby configuration reference › Health alerts (defaults; Redis UI wins after save — full §46)\n\n| Option | Default | Env |\n|--------|---------|-----|\n| `alerts_enabled` | false | `KAFKA_BATCH_ALERTS_ENABLED` |\n| `alerts_interval` | 60 | `KAFKA_BATCH_ALERTS_INTERVAL` |\n| `alerts_for_ticks` | 3 | `KAFKA_BATCH_ALERTS_FOR_TICKS` |\n| `alerts_resolve_ticks` | 2 | `KAFKA_BATCH_ALERTS_RESOLVE_TICKS` |\n| `alerts_cooldown_seconds` | 900 | `KAFKA_BATCH_ALERTS_COOLDOWN_SECONDS` |\n| `alerts_run_on_ui` | false | `KAFKA_BATCH_ALERTS_RUN_ON_UI` |\n| `alerts_lag_threshold` | 1000 | `KAFKA_BATCH_ALERTS_LAG_THRESHOLD` |\n| `alerts_lag_growth_min` | 100 | `KAFKA_BATCH_ALERTS_LAG_GROWTH_MIN` |\n| `alerts_rtt_avg_ms` | 50.0 | `KAFKA_BATCH_ALERTS_RTT_AVG_MS` |\n| `alerts_rtt_max_ms` | 200.0 | `KAFKA_BATCH_ALERTS_RTT_MAX_MS` |\n| `alerts_rtt_error_rate` | 0.25 | `KAFKA_BATCH_ALERTS_RTT_ERROR_RATE` |\n| `alerts_reconciler_max_age` | 900 | `KAFKA_BATCH_ALERTS_RECONCILER_MAX_AGE` |\n| `alerts_schedule_pending_max` | 10000 | `KAFKA_BATCH_ALERTS_SCHEDULE_PENDING_MAX` |\n| `alerts_dlt_per_minute` | 50 | `KAFKA_BATCH_ALERTS_DLT_PER_MINUTE` |\n| `alerts_fairness_ingest_lag` | 5000 | `KAFKA_BATCH_ALERTS_FAIRNESS_INGEST_LAG` |\n| `alerts_fairness_ready_max_when_stuck` | 10 | `KAFKA_BATCH_ALERTS_FAIRNESS_READY_MAX_WHEN_STUCK` |\n\nSecrets reuse `ai_encryption_salt` / `KAFKA_BATCH_AI_ENCRYPTION_SALT`.",
+      "char_count": 1378
+    },
+    {
       "id": "readme-31-ruby-configuration-reference-env-overrides-se-2c0f7708b5a351e3",
       "source": "readme",
       "title": "Env overrides (selected)",
@@ -1433,8 +1457,8 @@
         "Env overrides (selected)"
       ],
       "section": "31. Ruby configuration reference",
-      "text": "31. Ruby configuration reference › Env overrides (selected)\n\n`KAFKA_BATCH_SUPER_FETCH_*`, `KAFKA_BATCH_LIVENESS_*`, `KAFKA_BATCH_REDIS_POOL_SIZE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_PERFORMANCE_METRICS_*`, `KAFKA_BATCH_RECURRING_*` (all twelve knobs in §17), `KB_ROLE`, `KB_SCHEDULE_POLLER`.\n\n---",
-      "char_count": 417
+      "text": "31. Ruby configuration reference › Env overrides (selected)\n\n`KAFKA_BATCH_SUPER_FETCH_*`, `KAFKA_BATCH_LIVENESS_*`, `KAFKA_BATCH_REDIS_POOL_SIZE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_PERFORMANCE_METRICS_*`, `KAFKA_BATCH_RECURRING_*` (all twelve knobs in §17), `KAFKA_BATCH_ALERTS_*` (§46), `KB_ROLE`, `KB_SCHEDULE_POLLER`.\n\n---",
+      "char_count": 447
     },
     {
       "id": "readme-32-go-configuration-reference-9f5390d88b733c69",
@@ -1816,8 +1840,115 @@
         "45. README drift vs library defaults (operators)"
       ],
       "section": "45. README drift vs library defaults (operators)",
-      "text": "45. README drift vs library defaults (operators)\n\n| Topic | Library default | Often documented / install |\n|-------|-----------------|----------------------------|\n| `max_retries` | 7 | 3 in install / some tables |\n| `fairness_global_concurrency` | 50 | 1000 install / fairness examples |\n| `fairness_lease_ttl` | 1800 | 7200 install |\n| `fairness_min_ingest_partitions` | 2 | 300 ops target |\n| Bitmaps | touch + ok + fail | Older docs mentioned only touch |\n| Completion dedup | `batch_seq` bitmaps | Not Kafka offset keys |\n\nWhen answering “what is the default?”, prefer `Configuration#initialize` / Go `DefaultDaemon` over marketing tables.",
-      "char_count": 644
+      "text": "45. README drift vs library defaults (operators)\n\n| Topic | Library default | Often documented / install |\n|-------|-----------------|----------------------------|\n| `max_retries` | 7 | 3 in install / some tables |\n| `fairness_global_concurrency` | 50 | 1000 install / fairness examples |\n| `fairness_lease_ttl` | 1800 | 7200 install |\n| `fairness_min_ingest_partitions` | 2 | 300 ops target |\n| Bitmaps | touch + ok + fail | Older docs mentioned only touch |\n| Completion dedup | `batch_seq` bitmaps | Not Kafka offset keys |\n\nWhen answering “what is the default?”, prefer `Configuration#initialize` / Go `DefaultDaemon` over marketing tables.\n\n---",
+      "char_count": 649
+    },
+    {
+      "id": "readme-46-health-alerts-14ff96dc6005c334",
+      "source": "readme",
+      "title": "46. Health alerts",
+      "heading_path": [
+        "46. Health alerts"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts\n\nIn-gem **control-plane** evaluator (`KafkaBatch::Alerts`). Opt-in (default off). Dashboard: **`/alerts`**. Persistence: **Redis only** (v1). Secrets encrypted with **`ai_encryption_salt`** (same as AI OpenRouter key).",
+      "char_count": 236
+    },
+    {
+      "id": "readme-46-health-alerts-effective-config-merge-716f9283a99c7a36",
+      "source": "readme",
+      "title": "Effective config merge",
+      "heading_path": [
+        "46. Health alerts",
+        "Effective config merge"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts › Effective config merge\n\n```\nlibrary Configuration defaults ← env (KAFKA_BATCH_ALERTS_*) ← Redis HASH kafka_batch:alerts:settings (wins)\n```\n\nUI Save bumps `kafka_batch:alerts:settings:version`; evaluator reloads on next tick. `POST /api/alerts/test` uses current Redis settings immediately.",
+      "char_count": 310
+    },
+    {
+      "id": "readme-46-health-alerts-lifecycle-055de58ce7843f7b",
+      "source": "readme",
+      "title": "Lifecycle",
+      "heading_path": [
+        "46. Health alerts",
+        "Lifecycle"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts › Lifecycle\n\n- Starts from Railtie / Karafka `app.running` when effective `enabled` is true.\n- UI pods skip evaluator unless `alerts_run_on_ui`.\n- Thread sleeps on `interval`; no-ops when disabled; never raises into job hot path.\n- `KafkaBatch.reset!` stops thread + clears pools.",
+      "char_count": 298
+    },
+    {
+      "id": "readme-46-health-alerts-hysteresis-f52e3db1101b2464",
+      "source": "readme",
+      "title": "Hysteresis",
+      "heading_path": [
+        "46. Health alerts",
+        "Hysteresis"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts › Hysteresis\n\n| Knob | Default | Meaning |\n|------|---------|---------|\n| `interval` | 60s | Tick period |\n| `for_ticks` | 3 | Consecutive breaches before fire |\n| `resolve_ticks` | 2 | Consecutive healthy before resolve |\n| `cooldown_seconds` | 900 | Min re-notify gap per fingerprint |\n\nFingerprints: `rule_id` + topic/group/lane/schedule keys.",
+      "char_count": 364
+    },
+    {
+      "id": "readme-46-health-alerts-channels-a071e9ba8de29f1d",
+      "source": "readme",
+      "title": "Channels",
+      "heading_path": [
+        "46. Health alerts",
+        "Channels"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts › Channels\n\n| Channel | Secret fields | Ready when |\n|---------|---------------|------------|\n| Slack | `slack_webhook_url` | salt + URL + channel enabled |\n| Webhook | `webhook_urls` (list) | salt + ≥1 URL + enabled |\n| Email | `email_smtp_password`; plaintext `email_to` / SMTP host | salt + to + host + enabled |\n| Metrics | none | `metrics_enabled` + channel enabled |\n\nUnavailable channels show a one-line reason in the UI (“Add Slack webhook URL”, “Configure ai_encryption_salt”, …).",
+      "char_count": 507
+    },
+    {
+      "id": "readme-46-health-alerts-rules-catalog-assistants-use-th-6597b3470b030352",
+      "source": "readme",
+      "title": "Rules catalog (assistants: use this when helping configure)",
+      "heading_path": [
+        "46. Health alerts",
+        "Rules catalog (assistants: use this when helping configure)"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts › Rules catalog (assistants: use this when helping configure)\n\n| id | Title | Requires | Settings | Fires when | UI link |\n|----|-------|----------|----------|------------|---------|\n| `lag_stuck_growing` | Lag growing without consumption | — | `lag_threshold` (1000), `lag_growth_min` (100) | Lag ≥ threshold, committed stuck across ticks, lag/end still growing; skips paused partitions | `/lag` |\n| `redis_rtt_high` | Redis RTT elevated | `performance_metrics_enabled` | `rtt_avg_ms` (50), `rtt_max_ms` (200), `rtt_error_rate` (0.25) | Probe avg/max/error rate above thresholds | `/performance` |\n| `no_live_consumers` | No live consumers with lag | liveness `:redis` | — | pending > 0 and live_consumers = 0 | `/live` |\n| `reconciler_stale` | Reconciler stale or failing | — | `reconciler_max_age` (900) | Missing summary, age > max, or produce_failed / found_stale ≥ 10 | `/reconciler` |\n| `fairness_ingest_backed_up` | Fairness ingest backed up | — | `fairness_ingest_lag` (5000), `fairness_ready_max_when_stuck` (10) | High ingest + ready ≤ max (forwarder stuck) | `/fairness/{lane}` |\n| `dlt_rate_high` | Dead-letter rate high | — | `dlt_per_minute` (50) | DLT publishes last minute ≥ threshold | `/dead_letter` |\n| `schedule_depth_high` | Delayed-job schedule depth high | — | `schedule_pending_max` (10000) | `sched:pending` ZCARD ≥ max | `/scheduled` |\n| `cron_stale` | Recurring schedule stale | `recurring_scheduler_enabled` | uses `recurring_stale_factor` × interval | Enabled cron idle beyond stale window (`cron.stale` events) | `/recurring` |",
+      "char_count": 1576
+    },
+    {
+      "id": "readme-46-health-alerts-operator-enable-checklist-tell-abd148102850804b",
+      "source": "readme",
+      "title": "Operator enable checklist (tell users this)",
+      "heading_path": [
+        "46. Health alerts",
+        "Operator enable checklist (tell users this)"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts › Operator enable checklist (tell users this)\n\n1. Redis reachable (`config.redis_url`).\n2. For Slack/webhook/email secrets: set `ai_encryption_salt`.\n3. Open `/alerts` → enable master switch → Save.\n4. Enable a channel + paste secrets → Send test.\n5. Ensure a **Karafka** (or `alerts_run_on_ui`) process runs so the evaluator ticks.\n6. For RTT rule: `performance_metrics_enabled = true`. For cron rule: recurring scheduler on. For live consumers: liveness redis backend.",
+      "char_count": 488
+    },
+    {
+      "id": "readme-46-health-alerts-example-answers-c888a7747b86cc2d",
+      "source": "readme",
+      "title": "Example answers",
+      "heading_path": [
+        "46. Health alerts",
+        "Example answers"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts › Example answers\n\n- “Why is Alerts disabled?” → Master toggle off or Redis unavailable; enable on `/alerts` and Save.\n- “Slack not ready” → Need salt + webhook URL + channel enabled.\n- “Recurring schedule stale” → Enabled cron idle > `stale_factor × interval`; check `/recurring` and ticker pods.\n- “How to reduce noise?” → Raise thresholds, raise `for_ticks`, raise `cooldown_seconds`, or disable a single rule.",
+      "char_count": 431
+    },
+    {
+      "id": "readme-46-health-alerts-out-of-scope-v1-8ac7b271cfe88ae3",
+      "source": "readme",
+      "title": "Out of scope (v1)",
+      "heading_path": [
+        "46. Health alerts",
+        "Out of scope (v1)"
+      ],
+      "section": "46. Health alerts",
+      "text": "46. Health alerts › Out of scope (v1)\n\nMySQL settings store, auto-remediation, Go-side evaluator, per-user mutes (disable rule globally instead).",
+      "char_count": 145
     },
     {
       "id": "faq-a-product-basics-what-is-kafka-batch-68b131730affc07e",
@@ -4964,6 +5095,306 @@
       "char_count": 114
     },
     {
+      "id": "faq-as-health-alerts-what-are-health-alerts-8c6db5ce07366283",
+      "source": "faq",
+      "title": "What are health alerts?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What are health alerts?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What are health alerts?\n\nAn opt-in in-gem evaluator (`KafkaBatch::Alerts`) that samples lag, Redis RTT, liveness, reconciler, fairness ingest, DLT rate, schedule depth, and stale cron; applies hysteresis in Redis; notifies Slack / webhook / email / metrics. Dashboard: `/alerts`.",
+      "char_count": 284
+    },
+    {
+      "id": "faq-as-health-alerts-are-alerts-on-by-default-6566176bf372c3d2",
+      "source": "faq",
+      "title": "Are alerts on by default?",
+      "heading_path": [
+        "AS. Health alerts",
+        "Are alerts on by default?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: Are alerts on by default?\n\n**No.** `alerts_enabled` defaults false. Enable on `/alerts` (Save) or via `config.alerts_enabled` / `KAFKA_BATCH_ALERTS_ENABLED=true`.",
+      "char_count": 167
+    },
+    {
+      "id": "faq-as-health-alerts-where-do-settings-live-7414e5ffc7e45084",
+      "source": "faq",
+      "title": "Where do settings live?",
+      "heading_path": [
+        "AS. Health alerts",
+        "Where do settings live?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: Where do settings live?\n\n**Redis** HASH `kafka_batch:alerts:settings` (v1 — not MySQL). Version stamp `kafka_batch:alerts:settings:version` hot-reloads the evaluator. Merge order: library defaults ← env ← Redis (wins).",
+      "char_count": 223
+    },
+    {
+      "id": "faq-as-health-alerts-how-do-i-enable-alerts-step-by-d5a03c45f551876e",
+      "source": "faq",
+      "title": "How do I enable alerts step by step?",
+      "heading_path": [
+        "AS. Health alerts",
+        "How do I enable alerts step by step?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: How do I enable alerts step by step?\n\n1. Ensure Redis is configured. 2. Set `ai_encryption_salt` if using Slack/webhook/email secrets. 3. Open `/alerts`, turn **Alerts enabled** on, Save. 4. Configure a channel + Send test. 5. Run Karafka control/execution (evaluator does not run on UI-only pods unless `alerts_run_on_ui`).",
+      "char_count": 329
+    },
+    {
+      "id": "faq-as-health-alerts-why-does-the-ui-say-alerts-are-38213489eec72b4e",
+      "source": "faq",
+      "title": "Why does the UI say Alerts are disabled?",
+      "heading_path": [
+        "AS. Health alerts",
+        "Why does the UI say Alerts are disabled?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: Why does the UI say Alerts are disabled?\n\nMaster switch is off (or Redis unavailable). Toggle **Alerts enabled** and Save. Optional bootstrap: `KAFKA_BATCH_ALERTS_ENABLED=true` before first UI save.",
+      "char_count": 203
+    },
+    {
+      "id": "faq-as-health-alerts-why-can-t-i-save-slack-webhook-a58d7305ef77e914",
+      "source": "faq",
+      "title": "Why can’t I save Slack/webhook secrets?",
+      "heading_path": [
+        "AS. Health alerts",
+        "Why can’t I save Slack/webhook secrets?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: Why can’t I save Slack/webhook secrets?\n\nNeed `config.ai_encryption_salt` (same as AI Settings). Thresholds/toggles still save without it.",
+      "char_count": 143
+    },
+    {
+      "id": "faq-as-health-alerts-which-process-runs-the-evaluato-081584cd1d030d3e",
+      "source": "faq",
+      "title": "Which process runs the evaluator?",
+      "heading_path": [
+        "AS. Health alerts",
+        "Which process runs the evaluator?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: Which process runs the evaluator?\n\nKarafka processes when effective enabled is true. UI-only: set `alerts_run_on_ui` / `KAFKA_BATCH_ALERTS_RUN_ON_UI`. Go daemon does **not** run this Ruby evaluator (v1).",
+      "char_count": 208
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-hysteresis-for-ticks-re-5b53867bfbc789de",
+      "source": "faq",
+      "title": "What is hysteresis (for_ticks / resolve_ticks / cooldown)?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is hysteresis (for_ticks / resolve_ticks / cooldown)?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is hysteresis (for_ticks / resolve_ticks / cooldown)?\n\n`for_ticks` (default 3): consecutive breach ticks before fire. `resolve_ticks` (2): consecutive healthy before resolve. `cooldown_seconds` (900): min gap between re-notifies for the same fingerprint. `interval` (60): tick period.",
+      "char_count": 294
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-lag-stuck-growing-0c1f19db82871e52",
+      "source": "faq",
+      "title": "What is lag_stuck_growing?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is lag_stuck_growing?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is lag_stuck_growing?\n\nLag ≥ `lag_threshold`, committed offsets stuck across ticks, and lag grew by ≥ `lag_growth_min` (or end offset advanced). Skips paused partitions. Link `/lag`. Defaults: threshold 1000, growth 100. Severity critical.",
+      "char_count": 249
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-redis-rtt-high-df367d8591dcd19f",
+      "source": "faq",
+      "title": "What is redis_rtt_high?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is redis_rtt_high?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is redis_rtt_high?\n\nPerformanceMetrics Redis RTT avg/max/error_rate above `rtt_avg_ms` / `rtt_max_ms` / `rtt_error_rate`. Requires `performance_metrics_enabled`. Link `/performance`.",
+      "char_count": 192
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-no-live-consumers-9377fecfa27e3929",
+      "source": "faq",
+      "title": "What is no_live_consumers?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is no_live_consumers?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is no_live_consumers?\n\nKafka pending work > 0 but live consumer heartbeats = 0. Requires liveness Redis backend. Link `/live`.",
+      "char_count": 136
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-reconciler-stale-3cd12bad05991fd1",
+      "source": "faq",
+      "title": "What is reconciler_stale?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is reconciler_stale?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is reconciler_stale?\n\nNo reconciler summary, last run older than `reconciler_max_age` (900s), or produce_failed / many found_stale. Link `/reconciler`.",
+      "char_count": 161
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-fairness-ingest-backed-421aa9d8e6046f5c",
+      "source": "faq",
+      "title": "What is fairness_ingest_backed_up?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is fairness_ingest_backed_up?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is fairness_ingest_backed_up?\n\nPer lane: ingest_lag ≥ `fairness_ingest_lag` (5000) and ready_lag ≤ `fairness_ready_max_when_stuck` (10) — forwarder/checkout likely stuck. Link `/fairness/{lane}`.",
+      "char_count": 205
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-dlt-rate-high-7760561da5385228",
+      "source": "faq",
+      "title": "What is dlt_rate_high?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is dlt_rate_high?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is dlt_rate_high?\n\nDead-letter publishes in the last minute ≥ `dlt_per_minute` (50). Link `/dead_letter`.",
+      "char_count": 115
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-schedule-depth-high-4f4293bb2b15deee",
+      "source": "faq",
+      "title": "What is schedule_depth_high?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is schedule_depth_high?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is schedule_depth_high?\n\n`sched:pending` ZCARD ≥ `schedule_pending_max` (10000). Often poller off/undersized. Link `/scheduled`.",
+      "char_count": 138
+    },
+    {
+      "id": "faq-as-health-alerts-what-is-recurring-schedule-stal-2cf6fa02835de5e2",
+      "source": "faq",
+      "title": "What is Recurring schedule stale (cron_stale)?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What is Recurring schedule stale (cron_stale)?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What is Recurring schedule stale (cron_stale)?\n\nEnabled cron idle longer than `recurring_stale_factor` × its interval (default factor 2). Requires `recurring_scheduler_enabled`. Link `/recurring`. Check ticker pods and MySQL ledger.",
+      "char_count": 237
+    },
+    {
+      "id": "faq-as-health-alerts-how-do-i-configure-slack-6b0556c6e737921e",
+      "source": "faq",
+      "title": "How do I configure Slack?",
+      "heading_path": [
+        "AS. Health alerts",
+        "How do I configure Slack?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: How do I configure Slack?\n\nSet salt → `/alerts` → Slack → paste Incoming Webhook URL → enable → Save → Send test. URL stored encrypted; API shows masked preview.",
+      "char_count": 166
+    },
+    {
+      "id": "faq-as-health-alerts-how-do-i-configure-a-generic-we-58db36a2e3efdc1e",
+      "source": "faq",
+      "title": "How do I configure a generic webhook (NR / PagerDuty)?",
+      "heading_path": [
+        "AS. Health alerts",
+        "How do I configure a generic webhook (NR / PagerDuty)?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: How do I configure a generic webhook (NR / PagerDuty)?\n\nSame as Slack but Webhook channel; one or more HTTPS URLs (comma/newline). JSON payload includes rule_id, title, summary, severity, fingerprint, link, fired_at.",
+      "char_count": 221
+    },
+    {
+      "id": "faq-as-health-alerts-how-do-i-configure-email-b5320e12df2abdca",
+      "source": "faq",
+      "title": "How do I configure email?",
+      "heading_path": [
+        "AS. Health alerts",
+        "How do I configure email?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: How do I configure email?\n\nSet salt, email_to, SMTP host/port/user/password, enable Email channel, Save, Send test. Ruby 3.4+ may need the `net-smtp` gem.",
+      "char_count": 159
+    },
+    {
+      "id": "faq-as-health-alerts-how-do-metrics-alerts-work-aff47edd24f45171",
+      "source": "faq",
+      "title": "How do metrics alerts work?",
+      "heading_path": [
+        "AS. Health alerts",
+        "How do metrics alerts work?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: How do metrics alerts work?\n\nEnable `config.metrics_enabled` and the Metrics channel. Emits `alert.fired` / `alert.resolved` through your StatsD/Datadog/proc adapter.",
+      "char_count": 171
+    },
+    {
+      "id": "faq-as-health-alerts-how-do-i-silence-one-noisy-rule-28c701bc8f84e515",
+      "source": "faq",
+      "title": "How do I silence one noisy rule?",
+      "heading_path": [
+        "AS. Health alerts",
+        "How do I silence one noisy rule?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: How do I silence one noisy rule?\n\nOn `/alerts` turn that rule’s switch off and Save (global disable). Per-user mutes are out of scope for v1.",
+      "char_count": 146
+    },
+    {
+      "id": "faq-as-health-alerts-how-do-i-reduce-alert-noise-wit-e5ae2de5d6e43a8f",
+      "source": "faq",
+      "title": "How do I reduce alert noise without disabling?",
+      "heading_path": [
+        "AS. Health alerts",
+        "How do I reduce alert noise without disabling?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: How do I reduce alert noise without disabling?\n\nRaise the rule’s threshold, increase `for_ticks`, increase `cooldown_seconds`, or lower severity to warning.",
+      "char_count": 161
+    },
+    {
+      "id": "faq-as-health-alerts-what-api-endpoints-exist-d05cdcfa875c3dec",
+      "source": "faq",
+      "title": "What API endpoints exist?",
+      "heading_path": [
+        "AS. Health alerts",
+        "What API endpoints exist?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: What API endpoints exist?\n\n`GET /api/alerts`, `GET/PUT /api/alerts/settings`, `POST /api/alerts/test` `{channel}`, `DELETE /api/alerts/settings/secrets`. CSRF required on mutations.",
+      "char_count": 186
+    },
+    {
+      "id": "faq-as-health-alerts-can-the-assistant-mutate-alert-a51858c7c6307c75",
+      "source": "faq",
+      "title": "Can the assistant mutate alert Redis keys?",
+      "heading_path": [
+        "AS. Health alerts",
+        "Can the assistant mutate alert Redis keys?"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: Can the assistant mutate alert Redis keys?\n\n**No.** Explain UI/config steps only. Do not suggest KEYS/DEL on `kafka_batch:alerts:*`.",
+      "char_count": 137
+    },
+    {
+      "id": "faq-as-health-alerts-example-enable-slack-lag-alert-2ce42861fe24c18c",
+      "source": "faq",
+      "title": "Example: enable Slack + lag alert for production",
+      "heading_path": [
+        "AS. Health alerts",
+        "Example: enable Slack + lag alert for production"
+      ],
+      "section": "AS. Health alerts",
+      "text": "FAQ: Example: enable Slack + lag alert for production\n\n1. `ai_encryption_salt` set. 2. `/alerts` enable alerts, lag_threshold=5000, lag_growth_min=500, for_ticks=3. 3. Slack webhook + enable. 4. Save + test. 5. Confirm Karafka control is running so evaluator ticks.\n\n---",
+      "char_count": 270
+    },
+    {
       "id": "faq-ap-assistant-corpus-hygiene-should-the-assistant-4f2e6ab5c39cd3eb",
       "source": "faq",
       "title": "Should the assistant cite live lag numbers?",
@@ -4972,8 +5403,8 @@
         "Should the assistant cite live lag numbers?"
       ],
       "section": "AP. Assistant corpus hygiene",
-      "text": "FAQ: Should the assistant cite live lag numbers?\n\nNo — it has no cluster access. Tell operators which UI page to open.",
-      "char_count": 118
+      "text": "FAQ: Should the assistant cite live lag numbers?\n\nNo — it has no cluster access. Tell operators which UI page to open. For alert configuration, point to `/alerts` and FAQ **AS**.",
+      "char_count": 178
     },
     {
       "id": "faq-ap-assistant-corpus-hygiene-should-the-assistant-51fc4612af584af8",
@@ -4984,8 +5415,8 @@
         "Should the assistant invent Redis KEYS commands?"
       ],
       "section": "AP. Assistant corpus hygiene",
-      "text": "FAQ: Should the assistant invent Redis KEYS commands?\n\nNo — and never suggest mutating operational keys via the assistant path.",
-      "char_count": 127
+      "text": "FAQ: Should the assistant invent Redis KEYS commands?\n\nNo — and never suggest mutating operational keys via the assistant path (including `kafka_batch:alerts:*`).",
+      "char_count": 162
     },
     {
       "id": "faq-ap-assistant-corpus-hygiene-how-to-extend-the-co-48c640a68958ab71",
@@ -5166,7 +5597,43 @@
       "section": "AR. One-line answers operators love",
       "text": "FAQ: Assistant can fix my lag? No — docs only; use UI/ops.",
       "char_count": 58
+    },
+    {
+      "id": "faq-ar-one-line-answers-operators-love-health-alerts-68a4efd055b0e1fe",
+      "source": "faq",
+      "title": "Health alerts default? Off — enable on `/alerts` or `KAFKA_BATCH_ALERTS_ENABLED`.",
+      "heading_path": [
+        "AR. One-line answers operators love",
+        "Health alerts default? Off — enable on `/alerts` or `KAFKA_BATCH_ALERTS_ENABLED`."
+      ],
+      "section": "AR. One-line answers operators love",
+      "text": "FAQ: Health alerts default? Off — enable on `/alerts` or `KAFKA_BATCH_ALERTS_ENABLED`.",
+      "char_count": 86
+    },
+    {
+      "id": "faq-ar-one-line-answers-operators-love-alert-setting-3f1235a67f74a1ca",
+      "source": "faq",
+      "title": "Alert settings store? Redis (encrypted secrets via `ai_encryption_salt`).",
+      "heading_path": [
+        "AR. One-line answers operators love",
+        "Alert settings store? Redis (encrypted secrets via `ai_encryption_salt`)."
+      ],
+      "section": "AR. One-line answers operators love",
+      "text": "FAQ: Alert settings store? Redis (encrypted secrets via `ai_encryption_salt`).",
+      "char_count": 78
+    },
+    {
+      "id": "faq-ar-one-line-answers-operators-love-recurring-sch-71ab7a84c896b7a9",
+      "source": "faq",
+      "title": "Recurring schedule stale? Cron idle > stale_factor × interval — see `/recurring`.",
+      "heading_path": [
+        "AR. One-line answers operators love",
+        "Recurring schedule stale? Cron idle > stale_factor × interval — see `/recurring`."
+      ],
+      "section": "AR. One-line answers operators love",
+      "text": "FAQ: Recurring schedule stale? Cron idle > stale_factor × interval — see `/recurring`.",
+      "char_count": 86
     }
   ],
-  "corpus_version": "d8df9320b9fe8e9e6f874b52c9ec43e5"
+  "corpus_version": "aa1f7d45f736ec72c22d0fe8be6f76eb"
 }

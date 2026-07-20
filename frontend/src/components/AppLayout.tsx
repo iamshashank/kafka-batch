@@ -34,6 +34,7 @@ import BoltOutlinedIcon from '@mui/icons-material/BoltOutlined'
 import TuneOutlinedIcon from '@mui/icons-material/TuneOutlined'
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
 import SmartToyOutlinedIcon from '@mui/icons-material/SmartToyOutlined'
+import NotificationsActiveOutlinedIcon from '@mui/icons-material/NotificationsActiveOutlined'
 import FiberManualRecordIcon from '@mui/icons-material/FiberManualRecord'
 import DarkModeOutlinedIcon from '@mui/icons-material/DarkModeOutlined'
 import LightModeOutlinedIcon from '@mui/icons-material/LightModeOutlined'
@@ -125,6 +126,7 @@ export function AppLayout({
         title: 'Platform',
         items: [
           { to: '/reconciler', label: 'Reconciler', icon: <SyncOutlinedIcon fontSize="small" /> },
+          { to: '/alerts', label: 'Alerts', icon: <NotificationsActiveOutlinedIcon fontSize="small" /> },
           { to: '/audit', label: 'Audit log', icon: <HistoryOutlinedIcon fontSize="small" />, auditOnly: true },
           { to: '/ai', label: 'AI Settings', icon: <SmartToyOutlinedIcon fontSize="small" />, aiOnly: true },
           { to: '/system', label: 'System', icon: <SettingsOutlinedIcon fontSize="small" /> },

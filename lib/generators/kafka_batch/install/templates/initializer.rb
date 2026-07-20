@@ -203,6 +203,27 @@ KafkaBatch.configure do |config|
   # OpenRouter tool-calling (often 400 on some providers) — leave off; use prefetch:
   # config.ai_live_data_model_tools = false
 
+  # ── Health alerts (dashboard /alerts; Redis settings, encrypted secrets) ─────
+  # Opt-in evaluator: lag stuck/growing, Redis RTT, no live consumers, reconciler
+  # stale, fairness ingest backup, DLT rate, schedule depth, recurring cron stale.
+  # Library/env are bootstrap only — UI Save wins in Redis and hot-reloads next tick.
+  # Secrets (Slack/webhook/SMTP password) reuse config.ai_encryption_salt.
+  # Docs: README "Health alerts"; AI corpus ai/README.md §46 + ai/FAQ.md section AS.
+  # config.alerts_enabled = false
+  # config.alerts_interval = 60
+  # config.alerts_for_ticks = 3
+  # config.alerts_resolve_ticks = 2
+  # config.alerts_cooldown_seconds = 900
+  # config.alerts_run_on_ui = false   # set true only if UI pods should evaluate
+  # config.alerts_lag_threshold = 1000
+  # config.alerts_lag_growth_min = 100
+  # config.alerts_rtt_avg_ms = 50.0
+  # config.alerts_rtt_max_ms = 200.0
+  # config.alerts_dlt_per_minute = 50
+  # config.alerts_schedule_pending_max = 10_000
+  # config.alerts_reconciler_max_age = 900
+  # config.alerts_fairness_ingest_lag = 5000
+
   # ── Metrics (StatsD / Datadog / custom proc) ────────────────────────────────
   # config.metrics_enabled = true
   # config.metrics_adapter = :statsd   # :datadog or :proc

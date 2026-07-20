@@ -28,6 +28,21 @@ module KafkaBatch
       KafkaBatch::PerformanceMetrics.install! if KafkaBatch.config.performance_metrics_enabled
     end
 
+    initializer "kafka_batch.alerts", after: "kafka_batch.validate_config" do
+      config.after_initialize do
+        begin
+          if defined?(KafkaBatch::Alerts)
+            KafkaBatch::Alerts.install_subscriptions!
+            if KafkaBatch.config.alerts_run_on_ui && KafkaBatch::Alerts.enabled?
+              KafkaBatch::Alerts.start!
+            end
+          end
+        rescue => e
+          KafkaBatch.logger.warn("[KafkaBatch] alerts init skipped: #{e.message}")
+        end
+      end
+    end
+
     # Load prebuilt AI knowledge chunks into Redis; refresh config snapshot
     # at most every 24h. Safe for many UI pods: one writer, version-gated corpus.
     initializer "kafka_batch.ai_knowledge", after: "kafka_batch.validate_config" do
@@ -101,6 +116,19 @@ module KafkaBatch
             KafkaBatch.logger.warn("[KafkaBatch] liveness heartbeat loop start skipped: #{e.message}")
           end
 
+          # Health alerts evaluator: control-plane only (not execution-only pods).
+          # Shares Redis NX lock with Go kbatch daemon; UI Send test stays in Web API.
+          begin
+            if defined?(KafkaBatch::Alerts)
+              KafkaBatch::Alerts.install_subscriptions!
+              if KafkaBatch::Alerts.enabled? && KafkaBatch::Alerts.control_plane_process?
+                KafkaBatch::Alerts.start!
+              end
+            end
+          rescue => e
+            KafkaBatch.logger.warn("[KafkaBatch] alerts evaluator start skipped: #{e.message}")
+          end
+
           # SuperFetch orphan reclaim (parity with Go kbatch daemon). NX-locked
           # so multiple control/execution replicas can safely share the loop.
           # Watermark mode owns durability via Kafka offset commits and writes
@@ -136,6 +164,7 @@ module KafkaBatch
           # Stop the background threads (if this process ran them) before closing
           # the producer, so no in-flight work is cut off mid-produce.
           KafkaBatch::Workset::ReclaimScheduler.stop! if defined?(KafkaBatch::Workset::ReclaimScheduler)
+          KafkaBatch::Alerts.stop! if defined?(KafkaBatch::Alerts)
           KafkaBatch::Liveness.stop_heartbeat_loop! if defined?(KafkaBatch::Liveness)
 
           # If drain timed out with leftovers, drop the live key so reclaim does

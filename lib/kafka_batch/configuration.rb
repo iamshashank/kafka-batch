@@ -600,6 +600,26 @@ module KafkaBatch
     # Env: KAFKA_BATCH_AI_LIVE_DATA_MODEL_TOOLS=true
     attr_accessor :ai_live_data_model_tools
 
+    # ── Health alerts (control-plane evaluator + Redis settings / UI) ────────
+    # Library/env defaults only — Redis kafka_batch:alerts:settings wins when set.
+    # Master switch for evaluator boot; UI can also enable via Redis.
+    attr_accessor :alerts_enabled
+    attr_accessor :alerts_interval              # seconds between ticks; default 60
+    attr_accessor :alerts_for_ticks             # consecutive breaches before fire; default 3
+    attr_accessor :alerts_resolve_ticks         # consecutive healthy ticks before resolve; default 2
+    attr_accessor :alerts_cooldown_seconds      # min seconds between re-notify; default 900
+    attr_accessor :alerts_run_on_ui             # start evaluator on UI-only pods; default false
+    attr_accessor :alerts_lag_threshold
+    attr_accessor :alerts_lag_growth_min
+    attr_accessor :alerts_rtt_avg_ms
+    attr_accessor :alerts_rtt_max_ms
+    attr_accessor :alerts_rtt_error_rate
+    attr_accessor :alerts_reconciler_max_age
+    attr_accessor :alerts_schedule_pending_max
+    attr_accessor :alerts_dlt_per_minute
+    attr_accessor :alerts_fairness_ingest_lag
+    attr_accessor :alerts_fairness_ready_max_when_stuck
+
     # ── Logging ──────────────────────────────────────────────────────────────
     attr_accessor :logger
 
@@ -757,6 +777,22 @@ module KafkaBatch
         end
       @ai_live_data_max_calls = env_positive_int("KAFKA_BATCH_AI_LIVE_DATA_MAX_CALLS", 3)
       @ai_live_data_model_tools = truthy_env?("KAFKA_BATCH_AI_LIVE_DATA_MODEL_TOOLS")
+      @alerts_enabled = truthy_env?("KAFKA_BATCH_ALERTS_ENABLED")
+      @alerts_interval = env_positive_int("KAFKA_BATCH_ALERTS_INTERVAL", 60)
+      @alerts_for_ticks = env_positive_int("KAFKA_BATCH_ALERTS_FOR_TICKS", 3)
+      @alerts_resolve_ticks = env_positive_int("KAFKA_BATCH_ALERTS_RESOLVE_TICKS", 2)
+      @alerts_cooldown_seconds = env_positive_int("KAFKA_BATCH_ALERTS_COOLDOWN_SECONDS", 900)
+      @alerts_run_on_ui = truthy_env?("KAFKA_BATCH_ALERTS_RUN_ON_UI")
+      @alerts_lag_threshold = env_positive_int("KAFKA_BATCH_ALERTS_LAG_THRESHOLD", 1000)
+      @alerts_lag_growth_min = env_positive_int("KAFKA_BATCH_ALERTS_LAG_GROWTH_MIN", 100)
+      @alerts_rtt_avg_ms = env_positive_float("KAFKA_BATCH_ALERTS_RTT_AVG_MS", 50.0)
+      @alerts_rtt_max_ms = env_positive_float("KAFKA_BATCH_ALERTS_RTT_MAX_MS", 200.0)
+      @alerts_rtt_error_rate = env_positive_float("KAFKA_BATCH_ALERTS_RTT_ERROR_RATE", 0.25)
+      @alerts_reconciler_max_age = env_positive_int("KAFKA_BATCH_ALERTS_RECONCILER_MAX_AGE", 900)
+      @alerts_schedule_pending_max = env_positive_int("KAFKA_BATCH_ALERTS_SCHEDULE_PENDING_MAX", 10_000)
+      @alerts_dlt_per_minute = env_positive_int("KAFKA_BATCH_ALERTS_DLT_PER_MINUTE", 50)
+      @alerts_fairness_ingest_lag = env_positive_int("KAFKA_BATCH_ALERTS_FAIRNESS_INGEST_LAG", 5000)
+      @alerts_fairness_ready_max_when_stuck = env_positive_int("KAFKA_BATCH_ALERTS_FAIRNESS_READY_MAX_WHEN_STUCK", 10)
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 

@@ -14,6 +14,7 @@ export type Bootstrap = {
   ai_enabled: boolean
   ai_live_data_enabled?: boolean
   ai_suggested_prompts?: SuggestedPrompt[]
+  alerts_ui_enabled?: boolean
   fairness_types: string[]
   version: string
 }

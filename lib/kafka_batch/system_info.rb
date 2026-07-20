@@ -31,6 +31,7 @@ module KafkaBatch
           metrics_section(config),
           audit_section(config),
           ai_section(config),
+          alerts_section(config),
           rdkafka_section("Producer", config.producer_config, accent: "#8b5cf6"),
           rdkafka_section("Consumer", config.consumer_config, accent: "#ec4899")
         ].compact
@@ -423,6 +424,37 @@ module KafkaBatch
             row("Chat history max lines", config.ai_chat_history_max_lines),
             row("Chat context chunks", config.ai_chat_context_chunks),
             row("Default OpenRouter model", blank_or(config.ai_openrouter_default_model))
+          ]
+        )
+      end
+
+      def alerts_section(config)
+        eff =
+          if defined?(KafkaBatch::Alerts)
+            KafkaBatch::Alerts.effective_config
+          else
+            {}
+          end
+        last =
+          if defined?(KafkaBatch::Alerts::State)
+            KafkaBatch::Alerts::State.load_last
+          end
+        open_n =
+          if defined?(KafkaBatch::Alerts::State)
+            KafkaBatch::Alerts::State.open_alerts.size
+          else
+            0
+          end
+        Section.new(
+          id: "alerts", title: "Health alerts", icon: "!", accent: "#b45309",
+          rows: [
+            row("Library default enabled", fmt_bool(config.alerts_enabled)),
+            row("Effective enabled", fmt_bool(eff["enabled"])),
+            row("Evaluator running", fmt_bool(defined?(KafkaBatch::Alerts) && KafkaBatch::Alerts.running?)),
+            row("Interval (s)", eff["interval"] || config.alerts_interval),
+            row("Open incidents", open_n),
+            row("Last evaluation", last.is_a?(Hash) ? (last["ran_at"] || "—") : "—"),
+            row("Run on UI pods", fmt_bool(config.alerts_run_on_ui))
           ]
         )
       end

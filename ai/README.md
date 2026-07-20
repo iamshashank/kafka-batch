@@ -56,6 +56,7 @@ Both runtimes share **Kafka topics** and **Redis** contracts. Pick one language 
 35. [Scaling and tuning](#35-scaling-and-tuning)
 36. [Operator cheat sheet](#36-operator-cheat-sheet)
 37. [Document maintenance](#37-document-maintenance)
+46. [Health alerts](#46-health-alerts)
 
 ---
 
@@ -1175,7 +1176,7 @@ Mount `KafkaBatch::Web` at `/kafka_batch` behind host auth.
 
 ### Pages
 
-`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/recurring`, `/reconciler`, `/system`, `/audit`, `/performance`, `/ai`
+`/`, `/batches/:id`, `/lag`, `/live`, `/weights/*`, `/fairness/*`, `/failures`, `/dead_letter`, `/scheduled`, `/recurring`, `/reconciler`, `/alerts`, `/system`, `/audit`, `/performance`, `/ai`
 
 Live refresh: localStorage `kafka_batch_live`, 5s.
 
@@ -1198,9 +1199,13 @@ Read-only `KafkaBatch::SystemInfo` sections: Overview, Kafka, Redis, MySQL (if s
 
 Settings + shared chat at `/ai`. RAG over packaged `knowledge_chunks.json` + live config snapshot (`config:live`). OpenRouter key encrypted in Redis (`kafka_batch:ai:settings`). Never touches operational ledger/fairness/workset/cron-lock keys.
 
+### Health alerts page
+
+`/alerts` — open incidents + Redis-backed settings (channels, rules, thresholds). Full reference: **§46**. Settings mutations: `GET/PUT /api/alerts/settings`, `POST /api/alerts/test`, `GET /api/alerts`. Secrets reuse `ai_encryption_salt`.
+
 ### Mutating API (CSRF cookie `_kb_csrf` + `X-CSRF-Token`)
 
-Batch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; recurring upsert/pause/resume/delete/run-now (§17); AI settings/chat/history.
+Batch cancel/delete/bulk; lag pause/resume; weights set/reset; retries delete/delete_all; recurring upsert/pause/resume/delete/run-now (§17); AI settings/chat/history; alerts settings/test (§46).
 
 Optional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets masked on `/system`.
 
@@ -1239,8 +1244,11 @@ Optional `web_authenticator`, `audit_enabled` (MySQL audit table). Secrets maske
 | `kafka_batch:reconciler:last` / `last_skip` | Sweep summary |
 | `kafka_batch:perf:min:*` | Performance metrics |
 | `kafka_batch:dlt:stats` | DLT stats |
+| `kafka_batch:alerts:settings` (+ `:version`) | Alert settings HASH + hot-reload stamp (§46) |
+| `kafka_batch:alerts:lock` / `open` / `breach` / `last` | Evaluator lock + incident state (§46) |
+| `kafka_batch:alerts:cron_stale` | Recent cron.stale markers for alert rule |
 
-Assistant must not touch these operational keys.
+Assistant must not touch these operational keys (except documenting them). Alert channel secrets live encrypted inside `alerts:settings`, same salt as AI.
 
 ---
 
@@ -1314,9 +1322,32 @@ See respective sections. Notable fairness defaults: `fairness_global_concurrency
 
 Also: `schedule_store_database_connection` (shared with MySQL delayed-job index + recurring tables).
 
+### Health alerts (defaults; Redis UI wins after save — full §46)
+
+| Option | Default | Env |
+|--------|---------|-----|
+| `alerts_enabled` | false | `KAFKA_BATCH_ALERTS_ENABLED` |
+| `alerts_interval` | 60 | `KAFKA_BATCH_ALERTS_INTERVAL` |
+| `alerts_for_ticks` | 3 | `KAFKA_BATCH_ALERTS_FOR_TICKS` |
+| `alerts_resolve_ticks` | 2 | `KAFKA_BATCH_ALERTS_RESOLVE_TICKS` |
+| `alerts_cooldown_seconds` | 900 | `KAFKA_BATCH_ALERTS_COOLDOWN_SECONDS` |
+| `alerts_run_on_ui` | false | `KAFKA_BATCH_ALERTS_RUN_ON_UI` |
+| `alerts_lag_threshold` | 1000 | `KAFKA_BATCH_ALERTS_LAG_THRESHOLD` |
+| `alerts_lag_growth_min` | 100 | `KAFKA_BATCH_ALERTS_LAG_GROWTH_MIN` |
+| `alerts_rtt_avg_ms` | 50.0 | `KAFKA_BATCH_ALERTS_RTT_AVG_MS` |
+| `alerts_rtt_max_ms` | 200.0 | `KAFKA_BATCH_ALERTS_RTT_MAX_MS` |
+| `alerts_rtt_error_rate` | 0.25 | `KAFKA_BATCH_ALERTS_RTT_ERROR_RATE` |
+| `alerts_reconciler_max_age` | 900 | `KAFKA_BATCH_ALERTS_RECONCILER_MAX_AGE` |
+| `alerts_schedule_pending_max` | 10000 | `KAFKA_BATCH_ALERTS_SCHEDULE_PENDING_MAX` |
+| `alerts_dlt_per_minute` | 50 | `KAFKA_BATCH_ALERTS_DLT_PER_MINUTE` |
+| `alerts_fairness_ingest_lag` | 5000 | `KAFKA_BATCH_ALERTS_FAIRNESS_INGEST_LAG` |
+| `alerts_fairness_ready_max_when_stuck` | 10 | `KAFKA_BATCH_ALERTS_FAIRNESS_READY_MAX_WHEN_STUCK` |
+
+Secrets reuse `ai_encryption_salt` / `KAFKA_BATCH_AI_ENCRYPTION_SALT`.
+
 ### Env overrides (selected)
 
-`KAFKA_BATCH_SUPER_FETCH_*`, `KAFKA_BATCH_LIVENESS_*`, `KAFKA_BATCH_REDIS_POOL_SIZE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_PERFORMANCE_METRICS_*`, `KAFKA_BATCH_RECURRING_*` (all twelve knobs in §17), `KB_ROLE`, `KB_SCHEDULE_POLLER`.
+`KAFKA_BATCH_SUPER_FETCH_*`, `KAFKA_BATCH_LIVENESS_*`, `KAFKA_BATCH_REDIS_POOL_SIZE`, `KAFKA_BATCH_DAEMON_MODE`, `KAFKA_BATCH_HANDLER_MANIFEST`, `KAFKA_BATCH_PRIORITY_CONFIG(S)`, `KAFKA_BATCH_FAIRNESS_DYNAMIC_TENANT_PARTITIONS`, `KAFKA_BATCH_PERFORMANCE_METRICS_*`, `KAFKA_BATCH_RECURRING_*` (all twelve knobs in §17), `KAFKA_BATCH_ALERTS_*` (§46), `KB_ROLE`, `KB_SCHEDULE_POLLER`.
 
 ---
 
@@ -1804,3 +1835,79 @@ BatchOptions: OnSuccess, OnComplete, Meta, CallbackArgs, Description, TenantID. 
 | Completion dedup | `batch_seq` bitmaps | Not Kafka offset keys |
 
 When answering “what is the default?”, prefer `Configuration#initialize` / Go `DefaultDaemon` over marketing tables.
+
+---
+
+## 46. Health alerts
+
+In-gem **control-plane** evaluator (`KafkaBatch::Alerts`). Opt-in (default off). Dashboard: **`/alerts`**. Persistence: **Redis only** (v1). Secrets encrypted with **`ai_encryption_salt`** (same as AI OpenRouter key).
+
+### Effective config merge
+
+```
+library Configuration defaults ← env (KAFKA_BATCH_ALERTS_*) ← Redis HASH kafka_batch:alerts:settings (wins)
+```
+
+UI Save bumps `kafka_batch:alerts:settings:version`; evaluator reloads on next tick. `POST /api/alerts/test` uses current Redis settings immediately.
+
+### Lifecycle
+
+- Starts from Railtie / Karafka `app.running` when effective `enabled` is true.
+- UI pods skip evaluator unless `alerts_run_on_ui`.
+- Thread sleeps on `interval`; no-ops when disabled; never raises into job hot path.
+- `KafkaBatch.reset!` stops thread + clears pools.
+
+### Hysteresis
+
+| Knob | Default | Meaning |
+|------|---------|---------|
+| `interval` | 60s | Tick period |
+| `for_ticks` | 3 | Consecutive breaches before fire |
+| `resolve_ticks` | 2 | Consecutive healthy before resolve |
+| `cooldown_seconds` | 900 | Min re-notify gap per fingerprint |
+
+Fingerprints: `rule_id` + topic/group/lane/schedule keys.
+
+### Channels
+
+| Channel | Secret fields | Ready when |
+|---------|---------------|------------|
+| Slack | `slack_webhook_url` | salt + URL + channel enabled |
+| Webhook | `webhook_urls` (list) | salt + ≥1 URL + enabled |
+| Email | `email_smtp_password`; plaintext `email_to` / SMTP host | salt + to + host + enabled |
+| Metrics | none | `metrics_enabled` + channel enabled |
+
+Unavailable channels show a one-line reason in the UI (“Add Slack webhook URL”, “Configure ai_encryption_salt”, …).
+
+### Rules catalog (assistants: use this when helping configure)
+
+| id | Title | Requires | Settings | Fires when | UI link |
+|----|-------|----------|----------|------------|---------|
+| `lag_stuck_growing` | Lag growing without consumption | — | `lag_threshold` (1000), `lag_growth_min` (100) | Lag ≥ threshold, committed stuck across ticks, lag/end still growing; skips paused partitions | `/lag` |
+| `redis_rtt_high` | Redis RTT elevated | `performance_metrics_enabled` | `rtt_avg_ms` (50), `rtt_max_ms` (200), `rtt_error_rate` (0.25) | Probe avg/max/error rate above thresholds | `/performance` |
+| `no_live_consumers` | No live consumers with lag | liveness `:redis` | — | pending > 0 and live_consumers = 0 | `/live` |
+| `reconciler_stale` | Reconciler stale or failing | — | `reconciler_max_age` (900) | Missing summary, age > max, or produce_failed / found_stale ≥ 10 | `/reconciler` |
+| `fairness_ingest_backed_up` | Fairness ingest backed up | — | `fairness_ingest_lag` (5000), `fairness_ready_max_when_stuck` (10) | High ingest + ready ≤ max (forwarder stuck) | `/fairness/{lane}` |
+| `dlt_rate_high` | Dead-letter rate high | — | `dlt_per_minute` (50) | DLT publishes last minute ≥ threshold | `/dead_letter` |
+| `schedule_depth_high` | Delayed-job schedule depth high | — | `schedule_pending_max` (10000) | `sched:pending` ZCARD ≥ max | `/scheduled` |
+| `cron_stale` | Recurring schedule stale | `recurring_scheduler_enabled` | uses `recurring_stale_factor` × interval | Enabled cron idle beyond stale window (`cron.stale` events) | `/recurring` |
+
+### Operator enable checklist (tell users this)
+
+1. Redis reachable (`config.redis_url`).
+2. For Slack/webhook/email secrets: set `ai_encryption_salt`.
+3. Open `/alerts` → enable master switch → Save.
+4. Enable a channel + paste secrets → Send test.
+5. Ensure a **Karafka** (or `alerts_run_on_ui`) process runs so the evaluator ticks.
+6. For RTT rule: `performance_metrics_enabled = true`. For cron rule: recurring scheduler on. For live consumers: liveness redis backend.
+
+### Example answers
+
+- “Why is Alerts disabled?” → Master toggle off or Redis unavailable; enable on `/alerts` and Save.
+- “Slack not ready” → Need salt + webhook URL + channel enabled.
+- “Recurring schedule stale” → Enabled cron idle > `stale_factor × interval`; check `/recurring` and ticker pods.
+- “How to reduce noise?” → Raise thresholds, raise `for_ticks`, raise `cooldown_seconds`, or disable a single rule.
+
+### Out of scope (v1)
+
+MySQL settings store, auto-remediation, Go-side evaluator, per-user mutes (disable rule globally instead).

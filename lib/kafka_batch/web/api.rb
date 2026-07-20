@@ -90,6 +90,16 @@ module KafkaBatch
           ai_history_clear
         elsif method == "POST" && path == "/api/ai/chat"
           ai_chat(env)
+        elsif method == "GET" && path == "/api/alerts"
+          alerts_status
+        elsif method == "GET" && path == "/api/alerts/settings"
+          alerts_settings_show
+        elsif method == "PUT" && path == "/api/alerts/settings"
+          alerts_settings_update(env)
+        elsif method == "POST" && path == "/api/alerts/test"
+          alerts_test(env)
+        elsif method == "DELETE" && path == "/api/alerts/settings/secrets"
+          alerts_clear_secret(env)
         else
           Json.error(404, "Not found")
         end
@@ -112,6 +122,7 @@ module KafkaBatch
           performance_metrics_enabled: defined?(KafkaBatch::PerformanceMetrics) && KafkaBatch::PerformanceMetrics.enabled?,
           ai_enabled: KafkaBatch.config.ai_knowledge_enabled,
           ai_live_data_enabled: KafkaBatch.config.ai_knowledge_enabled && KafkaBatch.config.ai_live_data_enabled,
+          alerts_ui_enabled: true,
           ai_suggested_prompts: (
             if KafkaBatch.config.ai_knowledge_enabled && defined?(KafkaBatch::Ai::LiveData)
               KafkaBatch::Ai::LiveData.suggested_prompts
@@ -1125,6 +1136,131 @@ module KafkaBatch
           KafkaBatch.logger.error("[KafkaBatch::Web] ai_chat: #{e.class}: #{e.message}")
           Json.error(500, e.message)
         end
+      end
+
+      def alerts_status
+        unless defined?(KafkaBatch::Alerts)
+          return Json.error(503, "Alerts not loaded")
+        end
+
+        unless KafkaBatch.config.redis_configured?
+          return Json.ok(
+            ok: true,
+            enabled: false,
+            available: false,
+            running: false,
+            open: [],
+            last_evaluation: nil,
+            message: alerts_redis_required_message
+          )
+        end
+
+        st = KafkaBatch::Alerts.status
+        Json.ok(st.merge("ok" => true, "available" => true))
+      end
+
+      def alerts_settings_show
+        unless defined?(KafkaBatch::Alerts)
+          return Json.error(503, "Alerts not loaded")
+        end
+
+        unless KafkaBatch.config.redis_configured?
+          return Json.ok(
+            ok: true,
+            available: false,
+            message: alerts_redis_required_message,
+            settings: KafkaBatch::Alerts::Settings.show,
+            channels: KafkaBatch::Alerts::Availability.channels,
+            rules: KafkaBatch::Alerts::Availability.rules,
+            status: {
+              "enabled" => false,
+              "running" => false,
+              "open" => [],
+              "last_evaluation" => nil
+            }
+          )
+        end
+
+        settings = KafkaBatch::Alerts::Settings.show
+        Json.ok(
+          ok: true,
+          available: true,
+          settings: settings,
+          channels: KafkaBatch::Alerts::Availability.channels,
+          rules: KafkaBatch::Alerts::Availability.rules,
+          status: KafkaBatch::Alerts.status
+        )
+      end
+
+      def alerts_settings_update(env)
+        unless defined?(KafkaBatch::Alerts)
+          return Json.error(503, "Alerts not loaded")
+        end
+        return Json.error(503, alerts_redis_required_message) unless KafkaBatch.config.redis_configured?
+
+        body = json_body(env).merge(@web.body_params(env))
+        begin
+          settings = KafkaBatch::Alerts::Settings.update!(body)
+          # Hot-apply only on control-plane processes (not UI/execution).
+          if settings["enabled"] && KafkaBatch::Alerts.control_plane_process?
+            KafkaBatch::Alerts.start!
+          end
+          Json.ok(
+            ok: true,
+            available: true,
+            settings: settings,
+            channels: KafkaBatch::Alerts::Availability.channels,
+            rules: KafkaBatch::Alerts::Availability.rules,
+            status: KafkaBatch::Alerts.status
+          )
+        rescue KafkaBatch::ConfigurationError => e
+          Json.error(400, e.message)
+        rescue ArgumentError => e
+          Json.error(400, e.message)
+        rescue StandardError => e
+          KafkaBatch.logger.error("[KafkaBatch::Web] alerts_settings_update: #{e.class}: #{e.message}")
+          Json.error(500, e.message)
+        end
+      end
+
+      def alerts_test(env)
+        unless defined?(KafkaBatch::Alerts)
+          return Json.error(503, "Alerts not loaded")
+        end
+        return Json.error(503, alerts_redis_required_message) unless KafkaBatch.config.redis_configured?
+
+        body = json_body(env).merge(@web.body_params(env))
+        channel = @web.non_empty(body["channel"])
+        return Json.error(400, "channel required") if channel.nil?
+
+        ok = KafkaBatch::Alerts.test_channel!(channel)
+        if ok
+          Json.ok(ok: true, sent: true, channel: channel)
+        else
+          Json.error(400, "Channel not ready or delivery failed")
+        end
+      end
+
+      def alerts_clear_secret(env)
+        unless defined?(KafkaBatch::Alerts)
+          return Json.error(503, "Alerts not loaded")
+        end
+        return Json.error(503, alerts_redis_required_message) unless KafkaBatch.config.redis_configured?
+
+        body = json_body(env).merge(@web.body_params(env))
+        field = @web.non_empty(body["field"])
+        return Json.error(400, "field required") if field.nil?
+
+        begin
+          settings = KafkaBatch::Alerts::Settings.clear_secret!(field)
+          Json.ok(ok: true, settings: settings)
+        rescue ArgumentError => e
+          Json.error(400, e.message)
+        end
+      end
+
+      def alerts_redis_required_message
+        "Alerts require Redis. Set config.redis_url (or REDIS_URL) and ensure Redis is reachable, then reload."
       end
 
       def performance_range(params)

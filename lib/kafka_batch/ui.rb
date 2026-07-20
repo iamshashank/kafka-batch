@@ -77,6 +77,7 @@ require_relative "ai/retriever"
 require_relative "ai/open_router"
 require_relative "ai/live_data"
 require_relative "ai/chat"
+require_relative "alerts"
 require_relative "web"
 
 require_relative "railtie" if defined?(Rails::Railtie)

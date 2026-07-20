@@ -27,6 +27,7 @@ Built on [Karafka](https://karafka.io) (WaterDrop + consumers). **Go runtime:** 
 - [Retries & dead letter](#retries--dead-letter)
 - [Scaling & partitions](#scaling--partitions)
 - [Web UI & reconciler](#web-ui--reconciler)
+- [Health alerts](#health-alerts)
 - [Instrumentation](#instrumentation)
 - [Migrating from Sidekiq Pro](#migrating-from-sidekiq-pro)
 - [Reference](#reference)
@@ -1351,6 +1352,7 @@ Mount `KafkaBatch::Web` at `/kafka_batch`. The dashboard is a **React + Material
 | `/dead_letter` | Kafka dead-letter topic (paginated, newest first) |
 | `/scheduled` | Delayed jobs in the schedule store |
 | `/reconciler` | Last reconciler sweep + recovery counts |
+| `/alerts` | Health alerts: open incidents + Redis-backed channel/threshold settings |
 | `/system` | Masked configuration snapshot |
 | `/audit` | Web UI audit log (when enabled) |
 
@@ -1364,6 +1366,8 @@ cd frontend && npm ci && npm run build
 
 **Reconciler** (inside `EventConsumer`, periodic): recovers stuck `running` batches and re-dispatches lost callbacks. Summary is persisted in Redis for `/reconciler`. Manual: `rake kafka_batch:reconcile`.
 
+See [Health alerts](#health-alerts) for the full `/alerts` guide (rules, channels, Redis keys, examples).
+
 ### JSON API (same mount)
 
 All mutating calls require the `_kb_csrf` cookie **and** a matching `X-CSRF-Token` header (or body `_csrf`). Obtain the token from `GET /api/bootstrap` (or the SPA shell bootstrap).
@@ -1372,7 +1376,8 @@ All mutating calls require the `_kb_csrf` cookie **and** a matching `X-CSRF-Toke
 |---|---|
 | GET | `/api/bootstrap`, `/api/dashboard`, `/api/batches`, `/api/batches/:id` |
 | POST / DELETE | `/api/batches/:id/cancel`, `/api/batches/:id`, `/api/batches/bulk` |
-| GET | `/api/failures`, `/api/live`, `/api/lag`, `/api/scheduled`, `/api/system`, `/api/reconciler`, `/api/dead_letter`, `/api/audit` |
+| GET | `/api/failures`, `/api/live`, `/api/lag`, `/api/scheduled`, `/api/system`, `/api/reconciler`, `/api/dead_letter`, `/api/audit`, `/api/alerts`, `/api/alerts/settings` |
+| PUT / POST | `/api/alerts/settings`, `/api/alerts/test` |
 | GET | `/api/fairness/:type`, `/api/weights/:type` (`time` \| `throughput`) |
 | POST | `/api/lag/pause`, `/api/lag/resume` |
 | PUT / DELETE | `/api/weights/:type`, `/api/weights/:type/:tenant_id` |
@@ -1446,6 +1451,135 @@ The `/lag` page shows a tooltip on Pause/Resume buttons explaining the delay. Pa
 **Priority queues:** pausing a higher topic (e.g. p0) via `/lag` stops draining that topic but does **not** block lower ranks (p1 keeps processing). Strict priority only applies while higher topics are actively consuming.
 
 ---
+
+## Health alerts
+
+Opt-in control-plane evaluator that samples health signals, applies hysteresis in Redis, and notifies Slack / webhook / email / metrics. Configure from the dashboard at **`/alerts`** (settings hot-reload on the next tick). Default **off**.
+
+### How it works
+
+```
+library defaults (Configuration) ← env bootstrap ← Redis settings (wins)
+```
+
+1. Enable alerts on `/alerts` (or `config.alerts_enabled` / `KAFKA_BATCH_ALERTS_ENABLED=true`) and **Save**.
+2. Configure at least one channel (Slack webhook, generic webhook, email SMTP, or metrics).
+3. The evaluator runs on **Karafka control/execution** processes when effective `enabled` is true. UI-only pods do **not** evaluate unless `config.alerts_run_on_ui = true`.
+4. Each tick: reload Redis settings if `settings:version` changed → sample signals → require `for_ticks` consecutive breaches → **notify once on open** → resolve after `resolve_ticks` healthy ticks → **notify once on resolve**. No reminder spam while open. Cross-runtime: shared NX evaluator lock + `HSETNX` open claim + notify dedupe keys so Ruby and Go never double-fire the same fingerprint.
+
+Secrets (Slack/webhook URLs, SMTP password) are AES-GCM encrypted with the same `config.ai_encryption_salt` as AI Settings. Without the salt, thresholds still save; channel secrets cannot.
+
+### Quick enable (UI)
+
+1. Open `/alerts`.
+2. Turn on **Alerts enabled** → **Save settings**.
+3. Set `ai_encryption_salt` in the initializer if you need Slack/webhook/email secrets.
+4. Paste a Slack incoming webhook URL, enable the Slack channel, **Send test**.
+5. Tune rules/thresholds; leave advanced hysteresis alone unless you need less noise.
+
+### Bootstrap from env / initializer
+
+```ruby
+# config/initializers/kafka_batch.rb
+KafkaBatch.configure do |config|
+  config.ai_encryption_salt = ENV.fetch("KAFKA_BATCH_AI_ENCRYPTION_SALT") # also used for alert secrets
+  config.alerts_enabled = false          # prefer enabling in the UI after first deploy
+  config.alerts_interval = 60            # seconds between ticks
+  config.alerts_for_ticks = 3            # consecutive breaches before fire
+  config.alerts_resolve_ticks = 2
+  config.alerts_cooldown_seconds = 900
+  config.alerts_run_on_ui = false        # true only if UI pods should evaluate
+  # Optional threshold bootstrap (Redis UI values win after first save):
+  # config.alerts_lag_threshold = 1000
+  # config.alerts_rtt_avg_ms = 50.0
+end
+```
+
+```bash
+export KAFKA_BATCH_ALERTS_ENABLED=true
+export KAFKA_BATCH_ALERTS_INTERVAL=60
+export KAFKA_BATCH_AI_ENCRYPTION_SALT=your-long-random-salt
+```
+
+### Channels
+
+| Channel | Needs | Notes |
+|---------|-------|-------|
+| **Slack** | encryption salt + webhook URL | Incoming webhook; UI masks URL after save |
+| **Webhook** | encryption salt + URL(s) | Comma/newline list — New Relic Events, PagerDuty, custom |
+| **Email** | encryption salt + `to` + SMTP host (+ password) | Lazy `net/smtp` (Ruby 3.4+ may need `net-smtp` gem) |
+| **Metrics** | `config.metrics_enabled` | Emits `alert.fired` / `alert.resolved` via your metrics adapter |
+
+`POST /api/alerts/test` with `{ "channel": "slack" }` (CSRF required) sends a synthetic payload using **current** Redis settings.
+
+### Alert rules (v1)
+
+Shared hysteresis: `interval`, `for_ticks`, `resolve_ticks`, `cooldown_seconds`. Paused lag partitions are skipped via ConsumptionControl.
+
+| Rule id | Default severity | Requires | Key settings | Meaning / when it fires |
+|---------|------------------|----------|--------------|-------------------------|
+| `lag_stuck_growing` | critical | — | `lag_threshold` (1000), `lag_growth_min` (100) | Lag ≥ threshold, committed stuck across ticks, backlog still growing. → `/lag` |
+| `redis_rtt_high` | warning | `performance_metrics_enabled` | `rtt_avg_ms` (50), `rtt_max_ms` (200), `rtt_error_rate` (0.25) | Redis probe avg/max/error rate high. → `/performance` |
+| `no_live_consumers` | critical | liveness `:redis` | — | Kafka pending > 0 but live consumers = 0. → `/live` |
+| `reconciler_stale` | warning | — | `reconciler_max_age` (900s) | No summary, last run too old, or produce_failed / many stale. → `/reconciler` |
+| `fairness_ingest_backed_up` | warning | — | `fairness_ingest_lag` (5000), `fairness_ready_max_when_stuck` (10) | High ingest lag + near-zero ready (forwarder stuck). → `/fairness/*` |
+| `dlt_rate_high` | warning | — | `dlt_per_minute` (50) | Dead-letter publishes in last minute ≥ threshold. → `/dead_letter` |
+| `schedule_depth_high` | warning | — | `schedule_pending_max` (10000) | `sched:pending` ZCARD too high. → `/scheduled` |
+| `cron_stale` | warning | `recurring_scheduler_enabled` | (uses `recurring_stale_factor` × interval) | Enabled cron idle beyond staleness window. → `/recurring` |
+
+Disable a noisy rule on `/alerts` (per-rule toggle) without turning the whole system off.
+
+### Example: Slack + lag alert
+
+```ruby
+# After salt is set, either configure in UI or bootstrap then refine in Redis UI:
+KafkaBatch.configure do |c|
+  c.ai_encryption_salt = ENV.fetch("KAFKA_BATCH_AI_ENCRYPTION_SALT")
+  c.alerts_enabled = true
+  c.alerts_lag_threshold = 5_000
+  c.alerts_lag_growth_min = 500
+  c.alerts_for_ticks = 3
+end
+```
+
+Then on `/alerts`: enable Slack → paste `https://hooks.slack.com/services/...` → Save → Send test. When lag grows without commits for 3 ticks, Slack receives a payload with rule title, fingerprint, summary, and deep link to `/lag`.
+
+### Example: webhook to a custom sink
+
+On `/alerts` → Webhook channel → paste one or more HTTPS URLs → enable → Save → Send test. Payload is JSON with fields such as `rule_id`, `title`, `summary`, `severity`, `fingerprint`, `link`, `fired_at`.
+
+### Redis keys
+
+| Key | Role |
+|-----|------|
+| `kafka_batch:alerts:settings` | HASH — non-secret knobs + ciphertext secrets |
+| `kafka_batch:alerts:settings:version` | Monotonic stamp; evaluator reloads when changed |
+| `kafka_batch:alerts:lock` | NX single-flight evaluator lock |
+| `kafka_batch:alerts:open` | Open incidents |
+| `kafka_batch:alerts:breach` | Consecutive breach counters |
+| `kafka_batch:alerts:last` | Last evaluation summary |
+
+Settings are **Redis-only** in v1 (no MySQL store).
+
+### API
+
+| Method | Path | Role |
+|--------|------|------|
+| GET | `/api/alerts` | Open incidents, last evaluation, evaluator status |
+| GET | `/api/alerts/settings` | Masked settings + channel/rule availability + metadata |
+| PUT | `/api/alerts/settings` | Partial update; encrypt secrets; bump version |
+| POST | `/api/alerts/test` | `{ "channel": "slack"\|"webhook"\|"email"\|"metrics" }` |
+| DELETE | `/api/alerts/settings/secrets` | Clear one secret field |
+
+All mutations need CSRF (`_kb_csrf` + `X-CSRF-Token`).
+
+### Ops notes
+
+- Turning alerts off in the UI stops firing; the evaluator thread may keep sleeping and re-check `enabled`.
+- `KafkaBatch.reset!` stops the thread and clears settings pools (tests).
+- Never raises into the job hot path.
+- **Go control plane:** `kbatch daemon` runs the same evaluator (shared Redis settings + NX lock). `kbatch worker` does not. UI Send-test stays Ruby-only.
+- For deeper operator Q&A, see `ai/FAQ.md` section **AS. Health alerts** and `ai/README.md` §46.
 
 ## Instrumentation
 
