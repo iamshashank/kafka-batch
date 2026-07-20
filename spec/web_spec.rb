@@ -98,6 +98,8 @@ RSpec.describe KafkaBatch::Web do
       expect(payload).to have_key("audit_enabled")
       expect(payload).to have_key("performance_metrics_enabled")
       expect(payload).to have_key("ai_enabled")
+      expect(payload).to have_key("ai_live_data_enabled")
+      expect(payload).to have_key("ai_suggested_prompts")
       expect(payload["version"]).to eq(KafkaBatch::VERSION)
     end
 
@@ -491,9 +493,13 @@ RSpec.describe KafkaBatch::Web do
       expect(shown["settings"]["api_key_set"]).to eq(true)
       expect(shown["settings"]["api_key_masked"]).to include("test")
 
+      KafkaBatch.config.ai_live_data_enabled = false
       fake = instance_double(KafkaBatch::Ai::OpenRouter)
       allow(KafkaBatch::Ai::OpenRouter).to receive(:new).and_return(fake)
-      allow(fake).to receive(:chat).and_return("Docs say SuperFetch leases work.")
+      allow(fake).to receive(:chat).and_return(
+        "content" => "Docs say SuperFetch leases work.",
+        "tool_calls" => nil
+      )
 
       chat = json_body(post("/api/ai/chat", json: { message: "What is SuperFetch?" }))
       expect(chat["ok"]).to eq(true)

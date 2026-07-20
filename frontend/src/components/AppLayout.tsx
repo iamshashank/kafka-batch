@@ -340,7 +340,11 @@ export function AppLayout({
       >
         <Outlet />
       </Box>
-      <ChatBubble enabled={!!bootstrap?.ai_enabled} />
+      <ChatBubble
+        enabled={!!bootstrap?.ai_enabled}
+        liveDataEnabled={!!bootstrap?.ai_live_data_enabled}
+        suggestedPrompts={bootstrap?.ai_suggested_prompts || []}
+      />
     </Box>
   )
 }

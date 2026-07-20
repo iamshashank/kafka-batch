@@ -18,9 +18,10 @@ module KafkaBatch
         @base_url = base_url.to_s.sub(%r{/+\z}, "")
       end
 
-      # @param messages [Array<Hash>] role/content pairs
-      # @return [String] assistant text
-      def chat(messages:, temperature: 0.2, max_tokens: 1200)
+      # @param messages [Array<Hash>] role/content pairs (and optional tool messages)
+      # @param tools [Array<Hash>, nil] OpenAI-style tool schemas
+      # @return [Hash] "content" => String|nil, "tool_calls" => Array|nil
+      def chat(messages:, temperature: 0.2, max_tokens: 1200, tools: nil)
         raise Error, "OpenRouter API key is not set" if @api_key.empty?
         raise Error, "model is blank" if @model.empty?
 
@@ -31,7 +32,30 @@ module KafkaBatch
           "temperature" => temperature,
           "max_tokens" => max_tokens
         }
+        if tools && !tools.empty?
+          body["tools"] = tools
+          body["tool_choice"] = "auto"
+        end
 
+        payload = request!(uri, body)
+        message = payload.dig("choices", 0, "message") || {}
+        content = message["content"]
+        tool_calls = message["tool_calls"]
+        tool_calls = nil if tool_calls.nil? || tool_calls.empty?
+
+        if (content.nil? || content.to_s.strip.empty?) && tool_calls.nil?
+          raise Error, "OpenRouter returned empty content"
+        end
+
+        {
+          "content" => content.nil? ? nil : content.to_s,
+          "tool_calls" => tool_calls
+        }
+      end
+
+      private
+
+      def request!(uri, body)
         http = Net::HTTP.new(uri.host, uri.port)
         http.use_ssl = (uri.scheme == "https")
         http.open_timeout = 10
@@ -48,19 +72,35 @@ module KafkaBatch
         res = http.request(req)
         payload = Oj.load(res.body.to_s) rescue {}
         unless res.is_a?(Net::HTTPSuccess)
-          msg = payload.dig("error", "message") || payload["error"] || res.body.to_s[0, 300]
-          raise Error, "OpenRouter HTTP #{res.code}: #{msg}"
+          raise Error, "OpenRouter HTTP #{res.code}: #{format_error(payload, res)}"
         end
-
-        content = payload.dig("choices", 0, "message", "content")
-        raise Error, "OpenRouter returned empty content" if content.nil? || content.to_s.strip.empty?
-
-        content.to_s
+        payload
       rescue OpenSSL::SSL::SSLError => e
         raise Error, ssl_error_message(e)
       end
 
-      private
+      def format_error(payload, res)
+        err = payload.is_a?(Hash) ? payload["error"] : nil
+        parts = []
+        if err.is_a?(Hash)
+          parts << err["message"].to_s if err["message"]
+          meta = err["metadata"]
+          if meta.is_a?(Hash)
+            raw = meta["raw"].to_s
+            if !raw.empty?
+              nested = (Oj.load(raw) rescue nil)
+              nested_msg = nested.is_a?(Hash) ? nested.dig("error", "message") : nil
+              parts << nested_msg if nested_msg && !parts.include?(nested_msg)
+              parts << "provider=#{meta['provider_name']}" if meta["provider_name"]
+            end
+          end
+          parts << "type=#{err['type']}" if err["type"]
+        elsif err
+          parts << err.to_s
+        end
+        parts << res.body.to_s[0, 300] if parts.empty?
+        parts.reject { |p| p.nil? || p.to_s.empty? }.join(" — ")
+      end
 
       # Provide an explicit CA store so ruby/openssl does not apply
       # V_FLAG_CRL_CHECK_ALL (OpenSSL 3.6 + macOS fails with "unable to get

@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import { Link as RouterLink } from 'react-router-dom'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Link as RouterLink, useLocation, useParams } from 'react-router-dom'
 import Box from '@mui/material/Box'
 import Fab from '@mui/material/Fab'
 import Paper from '@mui/material/Paper'
@@ -8,6 +8,7 @@ import Stack from '@mui/material/Stack'
 import TextField from '@mui/material/TextField'
 import Typography from '@mui/material/Typography'
 import Button from '@mui/material/Button'
+import Chip from '@mui/material/Chip'
 import Divider from '@mui/material/Divider'
 import CircularProgress from '@mui/material/CircularProgress'
 import Tooltip from '@mui/material/Tooltip'
@@ -17,13 +18,14 @@ import CloseIcon from '@mui/icons-material/Close'
 import SendIcon from '@mui/icons-material/Send'
 import DeleteOutlinedIcon from '@mui/icons-material/DeleteOutlined'
 import SettingsOutlinedIcon from '@mui/icons-material/SettingsOutlined'
-import { apiGet, apiMutate } from '../api/client'
+import { apiGet, apiMutate, type SuggestedPrompt } from '../api/client'
 
 type ChatMessage = {
   id?: string
   role: string
   content: string
   at?: string
+  live_lookups?: Array<{ tool: string; label: string; ok: boolean }>
 }
 
 type HistoryResponse = {
@@ -38,10 +40,42 @@ type ChatResponse = {
   reply: string
   model?: string
   history_size?: number
+  live_lookups?: Array<{ tool: string; label: string; ok: boolean }>
+  live_data_enabled?: boolean
   error?: string
 }
 
-export function ChatBubble({ enabled }: { enabled: boolean }) {
+function pageContext(pathname: string, params: Record<string, string | undefined>): Record<string, string> {
+  const ctx: Record<string, string> = {}
+  const batchMatch = pathname.match(/\/batches\/([^/]+)/)
+  if (batchMatch?.[1]) ctx.batch_id = decodeURIComponent(batchMatch[1])
+  if (params.id && pathname.includes('/batches/')) ctx.batch_id = params.id
+
+  const fairMatch = pathname.match(/\/fairness\/(time|throughput)/)
+  if (fairMatch?.[1]) ctx.lane = fairMatch[1]
+  const weightMatch = pathname.match(/\/weights\/(time|throughput)/)
+  if (weightMatch?.[1]) ctx.lane = weightMatch[1]
+  if (params.type === 'time' || params.type === 'throughput') ctx.lane = params.type
+
+  return ctx
+}
+
+export function ChatBubble({
+  enabled,
+  liveDataEnabled = false,
+  suggestedPrompts = [],
+}: {
+  enabled: boolean
+  liveDataEnabled?: boolean
+  suggestedPrompts?: SuggestedPrompt[]
+}) {
+  const location = useLocation()
+  const params = useParams()
+  const context = useMemo(
+    () => pageContext(location.pathname, params as Record<string, string | undefined>),
+    [location.pathname, params],
+  )
+
   const [open, setOpen] = useState(false)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
@@ -49,6 +83,34 @@ export function ChatBubble({ enabled }: { enabled: boolean }) {
   const [error, setError] = useState<string | null>(null)
   const [maxLines, setMaxLines] = useState(500)
   const bottomRef = useRef<HTMLDivElement | null>(null)
+
+  const chips = useMemo(() => {
+    const fromBootstrap = suggestedPrompts || []
+    const out = [...fromBootstrap]
+    if (context.batch_id && !out.some((p) => p.id === 'batch_context')) {
+      out.unshift({
+        id: 'batch_context',
+        label: 'Inspect this batch',
+        message: `What is the status of batch ${context.batch_id}?`,
+        context: { batch_id: context.batch_id },
+      })
+    }
+    if (context.lane && !out.some((p) => p.id === 'fairness_context')) {
+      out.unshift({
+        id: 'fairness_context',
+        label: 'Fairness on this lane',
+        message: `How much fairness pressure is on the ${context.lane} lane right now?`,
+        context: { lane: context.lane },
+      })
+    }
+    // Dedupe by id, keep first
+    const seen = new Set<string>()
+    return out.filter((p) => {
+      if (seen.has(p.id)) return false
+      seen.add(p.id)
+      return true
+    }).slice(0, 6)
+  }, [suggestedPrompts, context])
 
   const loadHistory = useCallback(async () => {
     try {
@@ -71,21 +133,26 @@ export function ChatBubble({ enabled }: { enabled: boolean }) {
 
   if (!enabled) return null
 
-  const send = async () => {
-    const text = input.trim()
+  const send = async (textOverride?: string, contextOverride?: Record<string, string>) => {
+    const text = (textOverride ?? input).trim()
     if (!text || loading) return
-    setInput('')
+    if (!textOverride) setInput('')
     setLoading(true)
     setError(null)
     setMessages((prev) => [...prev, { role: 'user', content: text, at: new Date().toISOString() }])
     try {
-      const res = await apiMutate<ChatResponse>('POST', '/api/ai/chat', { message: text })
+      const ctx = { ...context, ...(contextOverride || {}) }
+      const res = await apiMutate<ChatResponse>('POST', '/api/ai/chat', {
+        message: text,
+        context: Object.keys(ctx).length ? ctx : undefined,
+      })
       setMessages((prev) => [
         ...prev,
         {
           role: 'assistant',
           content: res.reply,
           at: new Date().toISOString(),
+          live_lookups: res.live_lookups,
         },
       ])
     } catch (e) {
@@ -168,21 +235,38 @@ export function ChatBubble({ enabled }: { enabled: boolean }) {
 
           <Box sx={{ px: 1.5, py: 0.75 }}>
             <Typography variant="caption" color="text.secondary">
-              Shared admin history (max {maxLines}). Answers use docs + live config only.
+              Shared admin history (max {maxLines}). Docs + live config
+              {liveDataEnabled ? ' + allowlisted live Redis reads' : ''}.
             </Typography>
           </Box>
           <Divider />
 
           <Box sx={{ flex: 1, overflow: 'auto', px: 1.5, py: 1.5 }}>
             {messages.length === 0 && !loading ? (
-              <Typography variant="body2" color="text.secondary">
-                Ask about SuperFetch, fairness, retries, deployment, or config knobs. Configure an OpenRouter key
-                under{' '}
-                <Link component={RouterLink} to="/ai" onClick={() => setOpen(false)}>
-                  AI Settings
-                </Link>
-                .
-              </Typography>
+              <Stack spacing={1.25}>
+                <Typography variant="body2" color="text.secondary">
+                  Ask about SuperFetch, fairness, retries, or live batch status. Configure an OpenRouter key
+                  under{' '}
+                  <Link component={RouterLink} to="/ai" onClick={() => setOpen(false)}>
+                    AI Settings
+                  </Link>
+                  .
+                </Typography>
+                {chips.length > 0 ? (
+                  <Stack direction="row" flexWrap="wrap" useFlexGap spacing={0.75}>
+                    {chips.map((chip) => (
+                      <Chip
+                        key={chip.id}
+                        size="small"
+                        label={chip.label}
+                        onClick={() => void send(chip.message, chip.context)}
+                        disabled={loading}
+                        variant="outlined"
+                      />
+                    ))}
+                  </Stack>
+                ) : null}
+              </Stack>
             ) : null}
             <Stack spacing={1.25}>
               {messages.map((m, idx) => (
@@ -201,6 +285,14 @@ export function ChatBubble({ enabled }: { enabled: boolean }) {
                   <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
                     {m.content}
                   </Typography>
+                  {m.role === 'assistant' && m.live_lookups && m.live_lookups.length > 0 ? (
+                    <Typography
+                      variant="caption"
+                      sx={{ display: 'block', mt: 0.75, opacity: 0.8 }}
+                    >
+                      Used live data: {m.live_lookups.map((l) => l.label).join(', ')}
+                    </Typography>
+                  ) : null}
                 </Box>
               ))}
               {loading ? (
@@ -214,6 +306,22 @@ export function ChatBubble({ enabled }: { enabled: boolean }) {
               <div ref={bottomRef} />
             </Stack>
           </Box>
+
+          {messages.length > 0 && chips.length > 0 && !loading ? (
+            <Box sx={{ px: 1.25, pb: 0.5 }}>
+              <Stack direction="row" flexWrap="wrap" useFlexGap spacing={0.5}>
+                {chips.slice(0, 3).map((chip) => (
+                  <Chip
+                    key={`footer-${chip.id}`}
+                    size="small"
+                    label={chip.label}
+                    onClick={() => void send(chip.message, chip.context)}
+                    variant="outlined"
+                  />
+                ))}
+              </Stack>
+            </Box>
+          ) : null}
 
           {error ? (
             <Typography variant="caption" color="error" sx={{ px: 1.5, pb: 0.5 }}>

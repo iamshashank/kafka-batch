@@ -111,6 +111,14 @@ module KafkaBatch
           audit_enabled: defined?(KafkaBatch::AuditLog) && KafkaBatch::AuditLog.enabled?,
           performance_metrics_enabled: defined?(KafkaBatch::PerformanceMetrics) && KafkaBatch::PerformanceMetrics.enabled?,
           ai_enabled: KafkaBatch.config.ai_knowledge_enabled,
+          ai_live_data_enabled: KafkaBatch.config.ai_knowledge_enabled && KafkaBatch.config.ai_live_data_enabled,
+          ai_suggested_prompts: (
+            if KafkaBatch.config.ai_knowledge_enabled && defined?(KafkaBatch::Ai::LiveData)
+              KafkaBatch::Ai::LiveData.suggested_prompts
+            else
+              []
+            end
+          ),
           fairness_types: fairness_types,
           version: KafkaBatch::VERSION
         )
@@ -1104,8 +1112,10 @@ module KafkaBatch
         message = @web.non_empty(body["message"])
         return Json.error(400, "message required") if message.nil?
 
+        context = body["context"].is_a?(Hash) ? body["context"] : nil
+
         begin
-          result = KafkaBatch::Ai::Chat.ask(message)
+          result = KafkaBatch::Ai::Chat.ask(message, context: context)
           Json.ok(result.merge("ok" => true))
         rescue ArgumentError => e
           Json.error(400, e.message)

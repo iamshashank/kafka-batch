@@ -575,8 +575,9 @@ module KafkaBatch
     #   - Knowledge chunks: rewritten only when packaged corpus_version changes
     #   - Config snapshot: refreshed at most every 24h on boot (config knobs change
     #     without a docs release). See lib/kafka_batch/ai/README.md.
-    # Assistant must never touch operational ledger/fairness/workset keys — only
-    # kafka_batch:ai:knowledge:* / ai:settings / ai:chat:*.
+    # Assistant knowledge/RAG uses only kafka_batch:ai:knowledge:* / ai:settings /
+    # ai:chat:*. Optional LiveData tools may perform allowlisted O(1) Redis READs
+    # of operational keys via Ai::LiveData::Executor — never writes or scans.
     attr_accessor :ai_knowledge_enabled          # Boolean – default true
     # Salt for AES-GCM encryption of OpenRouter API keys in Redis (AI Settings).
     # Required to save secrets. Prefer ENV KAFKA_BATCH_AI_ENCRYPTION_SALT.
@@ -587,6 +588,17 @@ module KafkaBatch
     attr_accessor :ai_chat_context_chunks
     # Default OpenRouter model id when UI has not overridden it.
     attr_accessor :ai_openrouter_default_model
+    # Allowlisted O(1) read-only Redis lookups for chat (batch status, fairness
+    # sizes, schedule depth, …). Prefetched server-side into the prompt.
+    # Default true; disable with KAFKA_BATCH_AI_LIVE_DATA_ENABLED=false.
+    attr_accessor :ai_live_data_enabled
+    # Max LiveData lookups per chat turn. Default 3.
+    attr_accessor :ai_live_data_max_calls
+    # When true, also advertise OpenAI-style tools to OpenRouter so the model
+    # can request extra lookups. Many OpenRouter providers return HTTP 400 for
+    # tool schemas — leave false (default) and rely on server-side prefetch.
+    # Env: KAFKA_BATCH_AI_LIVE_DATA_MODEL_TOOLS=true
+    attr_accessor :ai_live_data_model_tools
 
     # ── Logging ──────────────────────────────────────────────────────────────
     attr_accessor :logger
@@ -737,6 +749,14 @@ module KafkaBatch
       @ai_chat_history_max_lines  = env_positive_int("KAFKA_BATCH_AI_CHAT_HISTORY_MAX_LINES", 500)
       @ai_chat_context_chunks     = env_positive_int("KAFKA_BATCH_AI_CHAT_CONTEXT_CHUNKS", 6)
       @ai_openrouter_default_model = ENV["KAFKA_BATCH_AI_OPENROUTER_DEFAULT_MODEL"].to_s.strip
+      @ai_live_data_enabled =
+        if ENV.key?("KAFKA_BATCH_AI_LIVE_DATA_ENABLED")
+          truthy_env?("KAFKA_BATCH_AI_LIVE_DATA_ENABLED")
+        else
+          true
+        end
+      @ai_live_data_max_calls = env_positive_int("KAFKA_BATCH_AI_LIVE_DATA_MAX_CALLS", 3)
+      @ai_live_data_model_tools = truthy_env?("KAFKA_BATCH_AI_LIVE_DATA_MODEL_TOOLS")
       @logger                   = Logger.new($stdout).tap { |l| l.progname = "KafkaBatch" }
     end
 

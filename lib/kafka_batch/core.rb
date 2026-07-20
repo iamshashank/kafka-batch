@@ -320,6 +320,7 @@ module KafkaBatch
       Ai::KnowledgeIndex.reset_pool! if defined?(Ai::KnowledgeIndex)
       Ai::Settings.reset_pool! if defined?(Ai::Settings)
       Ai::ChatHistory.reset_pool! if defined?(Ai::ChatHistory)
+      Ai::LiveData.reset! if defined?(Ai::LiveData)
     end
 
     private

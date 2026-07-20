@@ -75,6 +75,7 @@ require_relative "ai/settings"
 require_relative "ai/chat_history"
 require_relative "ai/retriever"
 require_relative "ai/open_router"
+require_relative "ai/live_data"
 require_relative "ai/chat"
 require_relative "web"
 

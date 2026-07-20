@@ -67,17 +67,22 @@ KafkaBatch::Ai::KnowledgeIndex.sync!
 - Configure the key from the dashboard **AI Settings** page (`/ai`).
 - History is **one global thread** for all admins/pods (not per-user). Cap with
   `config.ai_chat_history_max_lines` (default **500**).
-- Chat flow: retrieve top knowledge chunks → OpenRouter → append user + assistant
-  to history. Never touches operational Redis namespaces.
+- Chat flow: retrieve top knowledge chunks → optional LiveData prefetch/tools →
+  OpenRouter → append user + assistant to history.
+- LiveData (`config.ai_live_data_enabled`, default true): named O(1) **read-only**
+  Redis lookups (batch HMGET, ZCARD/HLEN/LLEN/SISMEMBER/GET, …), **prefetched**
+  server-side into the prompt. Never KEYS/SCAN, never writes.
+  OpenRouter tool-calling is **off by default** (`ai_live_data_model_tools`) —
+  many providers return HTTP 400 for tool schemas.
 
 API (CSRF-protected mutations):
 
 - `GET/PUT/DELETE /api/ai/settings`
 - `GET/DELETE /api/ai/history`
-- `POST /api/ai/chat` `{ "message": "..." }`
+- `POST /api/ai/chat` `{ "message": "...", "context": { "batch_id": "…" } }`
 
 ## Safety
 
-Assistant / RAG code must only use `kafka_batch:ai:*` keys
-(`knowledge:*`, `settings`, `chat:history`). Never read or write operational
-ledger, fairness, workset, uniq, schedule, or liveness keys.
+- RAG / settings / history use only `kafka_batch:ai:*` keys.
+- Operational reads go **only** through `Ai::LiveData` allowlisted tools (no raw
+  Redis from the model). Tools never mutate Redis.

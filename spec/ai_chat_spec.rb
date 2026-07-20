@@ -124,12 +124,14 @@ RSpec.describe KafkaBatch::Ai::Chat do
   end
 
   it "retrieves context, calls OpenRouter, and appends global history" do
+    KafkaBatch.config.ai_live_data_enabled = false
     fake = instance_double(KafkaBatch::Ai::OpenRouter)
     expect(KafkaBatch::Ai::OpenRouter).to receive(:new).and_return(fake)
-    expect(fake).to receive(:chat) do |messages:|
+    expect(fake).to receive(:chat) do |messages:, tools: nil|
       expect(messages.any? { |m| m["role"] == "system" && m["content"].include?("Knowledge context") }).to eq(true)
       expect(messages.last).to eq("role" => "user", "content" => "What is SuperFetch?")
-      "SuperFetch leases work from Redis."
+      expect(tools).to be_nil
+      { "content" => "SuperFetch leases work from Redis.", "tool_calls" => nil }
     end
 
     result = described_class.ask("What is SuperFetch?")
@@ -138,6 +140,44 @@ RSpec.describe KafkaBatch::Ai::Chat do
     expect(result["history_size"]).to eq(2)
     chron = KafkaBatch::Ai::ChatHistory.list.reverse
     expect(chron.map { |m| m["role"] }).to eq(%w[user assistant])
+  end
+
+  it "prefetches live batch data without sending OpenRouter tools by default" do
+    KafkaBatch.config.ai_live_data_enabled = true
+    KafkaBatch.config.ai_live_data_model_tools = false
+    r = Redis.new(url: KafkaBatchSpec::RedisHelper::TEST_URL)
+    r.hset("kafka_batch:b:live1", "id", "live1", "status", "running", "total_jobs", "2")
+
+    fake = instance_double(KafkaBatch::Ai::OpenRouter)
+    expect(KafkaBatch::Ai::OpenRouter).to receive(:new).and_return(fake)
+    expect(fake).to receive(:chat) do |messages:, tools: nil|
+      expect(tools).to be_nil
+      live = messages.find { |m| m["role"] == "system" && m["content"].to_s.include?("LIVE REDIS LOOKUPS (authoritative") }
+      expect(live).not_to be_nil
+      expect(live["content"]).to include("running")
+      { "content" => "Batch live1 is running with 2 jobs.", "tool_calls" => nil }
+    end
+
+    result = described_class.ask("What is the status of batch live1?")
+    expect(result["reply"]).to include("running")
+    expect(result["live_lookups"].map { |l| l["tool"] }).to include("get_batch")
+  end
+
+  it "retries without tools when OpenRouter returns HTTP 400 for tool schemas" do
+    KafkaBatch.config.ai_live_data_enabled = true
+    KafkaBatch.config.ai_live_data_model_tools = true
+
+    fake = instance_double(KafkaBatch::Ai::OpenRouter)
+    expect(KafkaBatch::Ai::OpenRouter).to receive(:new).and_return(fake)
+    expect(fake).to receive(:chat).with(hash_including(tools: kind_of(Array))).and_raise(
+      KafkaBatch::Ai::OpenRouter::Error, "OpenRouter HTTP 400: Provider returned error"
+    )
+    expect(fake).to receive(:chat).with(hash_including(tools: nil)).and_return(
+      "content" => "Answer without tools.", "tool_calls" => nil
+    )
+
+    result = described_class.ask("What is SuperFetch?")
+    expect(result["reply"]).to eq("Answer without tools.")
   end
 
   it "rejects blank messages and missing API keys" do

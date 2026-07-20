@@ -1,3 +1,10 @@
+export type SuggestedPrompt = {
+  id: string
+  label: string
+  message: string
+  context?: Record<string, string>
+}
+
 export type Bootstrap = {
   ok: boolean
   csrf_token: string
@@ -5,6 +12,8 @@ export type Bootstrap = {
   audit_enabled: boolean
   performance_metrics_enabled: boolean
   ai_enabled: boolean
+  ai_live_data_enabled?: boolean
+  ai_suggested_prompts?: SuggestedPrompt[]
   fairness_types: string[]
   version: string
 }

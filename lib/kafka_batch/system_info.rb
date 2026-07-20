@@ -416,6 +416,9 @@ module KafkaBatch
           id: "ai", title: "AI assistant", icon: "✦", accent: "#be185d",
           rows: [
             row("Knowledge enabled", fmt_bool(config.ai_knowledge_enabled)),
+            row("Live Redis lookups", fmt_bool(config.ai_live_data_enabled)),
+            row("Live Redis max calls/turn", config.ai_live_data_max_calls),
+            row("Live Redis model tools", fmt_bool(config.ai_live_data_model_tools)),
             row("Encryption salt", salt.empty? ? "unset" : MASK, masked: !salt.empty?),
             row("Chat history max lines", config.ai_chat_history_max_lines),
             row("Chat context chunks", config.ai_chat_context_chunks),

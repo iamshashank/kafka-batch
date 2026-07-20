@@ -197,6 +197,11 @@ KafkaBatch.configure do |config|
   # config.ai_encryption_salt = ENV.fetch("KAFKA_BATCH_AI_ENCRYPTION_SALT")
   # config.ai_chat_history_max_lines = 500   # global shared history (Redis LIST)
   # config.ai_openrouter_default_model = "openai/gpt-4o-mini"
+  # Allowlisted O(1) read-only Redis lookups (batch status, fairness sizes, …):
+  # config.ai_live_data_enabled = true
+  # config.ai_live_data_max_calls = 3
+  # OpenRouter tool-calling (often 400 on some providers) — leave off; use prefetch:
+  # config.ai_live_data_model_tools = false
 
   # ── Metrics (StatsD / Datadog / custom proc) ────────────────────────────────
   # config.metrics_enabled = true
